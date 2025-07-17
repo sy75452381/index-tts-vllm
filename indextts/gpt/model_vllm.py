@@ -137,8 +137,7 @@ class UnifiedVoice(nn.Module):
             gpu_memory_utilization=gpu_memory_utilization,
             # Batch Processing Optimizations
             max_num_seqs=32,  # Increase concurrent sequences from default ~16
-            max_num_batched_tokens=8192,  # Optimize token batching capacity
-            max_length=32768
+            max_num_batched_tokens=8192
         )
         self.llm = AsyncLLMEngine.from_engine_args(engine_args)
         self.sampling_params = SamplingParams(
