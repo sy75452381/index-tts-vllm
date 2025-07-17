@@ -141,9 +141,7 @@ class UnifiedVoice(nn.Module):
             enable_chunked_prefill=True,  # Enable chunked prefill for better concurrency
             block_size=32,  # Memory block size optimization
             enable_prefix_caching=True,  # Enable prefix caching for repeated prompts
-            max_paddings=512,  # Control padding for batch efficiency
             # Performance optimizations
-            use_v2_block_manager=True,  # Use improved block manager
             preemption_mode="recompute",  # Better memory management
             enforce_eager=True,  # Uncomment if you want eager execution (for debugging)
         )
