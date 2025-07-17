@@ -135,7 +135,17 @@ class UnifiedVoice(nn.Module):
             tensor_parallel_size=1,
             dtype="auto",
             gpu_memory_utilization=gpu_memory_utilization,
-            # enforce_eager=True,
+            # Batch Processing Optimizations
+            max_num_seqs=32,  # Increase concurrent sequences from default ~16
+            max_num_batched_tokens=8192,  # Optimize token batching capacity
+            enable_chunked_prefill=True,  # Enable chunked prefill for better concurrency
+            block_size=32,  # Memory block size optimization
+            enable_prefix_caching=True,  # Enable prefix caching for repeated prompts
+            max_paddings=512,  # Control padding for batch efficiency
+            # Performance optimizations
+            use_v2_block_manager=True,  # Use improved block manager
+            preemption_mode="recompute",  # Better memory management
+            enforce_eager=True,  # Uncomment if you want eager execution (for debugging)
         )
         self.llm = AsyncLLMEngine.from_engine_args(engine_args)
         self.sampling_params = SamplingParams(
