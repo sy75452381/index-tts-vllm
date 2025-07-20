@@ -42,15 +42,14 @@ class LearnedPositionEmbeddings(nn.Module):
 
 
 class UnifiedVoice(nn.Module):
-    def __init__(self, layers=8, model_dim=512, heads=8, max_text_tokens=120, max_mel_tokens=250, max_conditioning_inputs=1,
+    def __init__(self, gpu_memory_utilization=0.25,
+                 layers=8, model_dim=512, heads=8, max_text_tokens=120, max_mel_tokens=250, max_conditioning_inputs=1,
                  mel_length_compression=1024, number_text_tokens=256,
                  start_text_token=0, stop_text_token=1, number_mel_codes=8194, start_mel_token=8192, stop_mel_token=8193,
                  types=1, activation_function=None,
-                 condition_num_latent=32, condition_module=None, 
-                 gpu_memory_utilization=0.9, model_dir="./", **kwargs):
+                 model_dir=None,
+                 condition_num_latent=32, condition_module=None, **kwargs):
         """
-        vLLM-optimized UnifiedVoice with FlashInfer integration
-        
         Args:
             layers: Number of layers in transformer stack.
             model_dim: Operating dimensions of the transformer
@@ -65,26 +64,8 @@ class UnifiedVoice(nn.Module):
             number_mel_codes:
             start_mel_token:
             stop_mel_token:
-            types:
-            activation_function:
-            condition_num_latent:
-            condition_module:
-            gpu_memory_utilization: vLLM GPU memory utilization (added for vLLM)
-            model_dir: Model directory path (added for vLLM)
+            checkpointing:
         """
-        # Set environment variables for FlashInfer optimizations
-        import os
-        # Enable FlashInfer optimizations
-        os.environ.setdefault("VLLM_USE_FLASHINFER", "1")
-        # Optimize memory allocation patterns for FlashInfer
-        os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASHINFER")
-        # Enable additional FlashInfer performance optimizations
-        os.environ.setdefault("FLASHINFER_ENABLE_BF16", "1")
-        # Optimize CUDA kernel selection for FlashInfer
-        os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
-        # Enable FlashInfer memory pooling for better performance
-        os.environ.setdefault("VLLM_USE_TRITON_FLASH_ATTN", "0")  # Prefer FlashInfer over Triton
-        
         super().__init__()
         self.number_text_tokens = number_text_tokens
         self.start_text_token = start_text_token
@@ -156,32 +137,7 @@ class UnifiedVoice(nn.Module):
             gpu_memory_utilization=gpu_memory_utilization,
             # Batch Processing Optimizations
             max_num_seqs=32,  # Increase concurrent sequences from default ~16
-            max_num_batched_tokens=8192,
-            # FlashInfer Optimizations - Use FlashInfer attention backend for better performance
-            # Note: FlashInfer provides significant performance improvements for attention computation
-            enable_chunked_prefill=True,  # Enable chunked prefill for better throughput
-            # Block size optimization for FlashInfer
-            block_size=16,  # Optimal block size for FlashInfer on most hardware
-            # Additional optimizations
-            enforce_eager=False,  # Allow CUDA graphs for better performance
-            max_seq_len_to_capture=8192,  # Capture longer sequences in CUDA graphs
-            # Memory optimizations
-            enable_prefix_caching=True,  # Enable prefix caching for repeated prompts
-            # KV cache optimizations
-            kv_cache_dtype="auto",  # Use optimal KV cache data type
-            # FlashInfer Advanced Optimizations for vLLM 0.9.0
-            # Performance tuning parameters
-            max_num_partial_prefills=2,  # Allow multiple partial prefills for better pipeline utilization
-            # Scheduler optimizations
-            num_scheduler_steps=1,  # Keep single step for stability, can increase for higher throughput
-            # CUDA Graph optimizations for FlashInfer
-            cuda_graph_sizes=[1, 2, 4, 8, 16, 32],  # Optimize CUDA graph capture sizes
-            # Advanced memory management
-            swap_space=4,  # CPU swap space in GiB for overflow handling
-            # Load balancing for better FlashInfer utilization
-            disable_custom_all_reduce=False,  # Keep custom all-reduce for better performance
-            # Additional FlashInfer-specific optimizations
-            use_v2_block_manager=True,  # Use V2 block manager for better memory efficiency
+            max_num_batched_tokens=8192
         )
         self.llm = AsyncLLMEngine.from_engine_args(engine_args)
         self.sampling_params = SamplingParams(
