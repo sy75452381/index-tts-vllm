@@ -42,16 +42,36 @@ class LearnedPositionEmbeddings(nn.Module):
 
 
 class UnifiedVoice(nn.Module):
-    def __init__(
-        self,
-        device,
-        task_cls,
-        model_dir="./",
-        model_name="index_tts",
-        model_dtype="auto",
-        gpu_memory_utilization=0.9,
-        eos_sample=False,
-    ):
+    def __init__(self, layers=8, model_dim=512, heads=8, max_text_tokens=120, max_mel_tokens=250, max_conditioning_inputs=1,
+                 mel_length_compression=1024, number_text_tokens=256,
+                 start_text_token=0, stop_text_token=1, number_mel_codes=8194, start_mel_token=8192, stop_mel_token=8193,
+                 types=1, activation_function=None,
+                 condition_num_latent=32, condition_module=None, 
+                 gpu_memory_utilization=0.9, model_dir="./", **kwargs):
+        """
+        vLLM-optimized UnifiedVoice with FlashInfer integration
+        
+        Args:
+            layers: Number of layers in transformer stack.
+            model_dim: Operating dimensions of the transformer
+            heads: Number of transformer heads. Must be divisible by model_dim. Recommend model_dim//64
+            max_text_tokens: Maximum number of text tokens that will be encountered by model.
+            max_mel_tokens: Maximum number of MEL tokens that will be encountered by model.
+            max_conditioning_inputs: Maximum number of conditioning inputs provided to the model. If (1), conditioning input can be of format (b,80,s), otherwise (b,n,80,s).
+            mel_length_compression: The factor between <number_input_samples> and <mel_tokens>. Used to compute MEL code padding given wav input length.
+            number_text_tokens:
+            start_text_token:
+            stop_text_token:
+            number_mel_codes:
+            start_mel_token:
+            stop_mel_token:
+            types:
+            activation_function:
+            condition_num_latent:
+            condition_module:
+            gpu_memory_utilization: vLLM GPU memory utilization (added for vLLM)
+            model_dir: Model directory path (added for vLLM)
+        """
         # Set environment variables for FlashInfer optimizations
         import os
         # Enable FlashInfer optimizations
