@@ -975,6 +975,14 @@ def _merge_short_speech_segments(
     min_duration_ms: int,
     max_merge_interval_ms: int = MAX_MERGE_INTERVAL_MS,
 ) -> List[Dict[str, Any]]:
+    max_merge_interval_ms = max(0, int(max_merge_interval_ms))
+    if max_merge_interval_ms == 0:
+        no_merge_segments: List[Dict[str, Any]] = []
+        for idx, segment in enumerate(segments):
+            clone = dict(segment)
+            clone["index"] = idx
+            no_merge_segments.append(clone)
+        return no_merge_segments
     merged_segments: List[Dict[str, Any]] = []
     i = 0
     total = len(segments)
@@ -2142,7 +2150,7 @@ class TranslateRequest(BaseModel):
     )
     max_merge_ms: Optional[int] = Field(
         default=None,
-        description="Override the maximum silence gap (ms) allowed when merging neighboring segments.",
+        description="Override the maximum silence gap (ms) allowed when merging neighboring segments; use 0 to skip merging.",
     )
     gemini_model: Optional[str] = Field(
         default=None,
@@ -2869,11 +2877,11 @@ async def home():
                                     </div>
                                     <div style="flex: 1 1 220px;">
                                         <label for="translateMaxMerge" style="font-weight: 500;">Max merge silence gap (ms):</label>
-                                        <input type="number" id="translateMaxMerge" min="50" step="50" placeholder="Default 300">
+                                        <input type="number" id="translateMaxMerge" min="0" step="50" placeholder="Default 300 (0 disables)">
                                     </div>
                                 </div>
                                 <small style="color: #666; margin-top: 5px; display: block;">
-                                    These values control Gemini segment stitching. Lower min duration keeps shorter phrases; higher max merge gap allows merging across longer silences.
+                                    These values control Gemini segment stitching. Lower min duration keeps shorter phrases; higher max merge gap allows merging across longer silences, and setting the max gap to 0 skips automatic merging entirely.
                                 </small>
                             </div>
                             <div class="form-group">
@@ -3052,7 +3060,7 @@ async def home():
                             <li><strong>POST /add_speaker</strong> - Register a new speaker with reference audio
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
                                     <li>Form data: <code>name</code> (string), <code>audio_file</code> (file upload)</li>
-                                    <li>Optional form data: <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) — toggles ClearVoice MossFormer2_SE_48K and MossFormer2_SR_48K (both default to <code>false</code>); <code>merge_backing_track</code> (bool) mixes regenerated speech onto the extracted instrumental (requires enhancement); <code>min_speech_ms</code>/<code>max_merge_ms</code> override the segment-merging heuristics; <code>segments_json</code> lets you supply Gemini-style JSON to skip inference.</li>
+                                    <li>Optional form data: <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) — toggles ClearVoice MossFormer2_SE_48K and MossFormer2_SR_48K (both default to <code>false</code>); <code>merge_backing_track</code> (bool) mixes regenerated speech onto the extracted instrumental (requires enhancement); <code>min_speech_ms</code>/<code>max_merge_ms</code> override the segment-merging heuristics (set <code>max_merge_ms</code> to 0 to skip merging entirely); <code>segments_json</code> lets you supply Gemini-style JSON to skip inference.</li>
                                     <li>Audio will be automatically trimmed to 3-15 seconds at silence points; when both toggles are enabled, enhancement runs before super-resolution</li>
                                 </ul>
                             </li>
@@ -3067,8 +3075,8 @@ async def home():
                         <ul style="margin-left: 20px; line-height: 1.6;">
                             <li><strong>POST /api/translate_audio</strong> - Translate speech audio and regenerate voice in the target language while preserving timing.
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
-                                    <li>Multipart form fields: <code>audio_file</code> (file), <code>dest_language</code> (string); optional <code>response_format</code> (mp3/wav/flac/aac/opus/ogg/webm), <code>prompt</code> (custom Gemini instructions), <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) to run ClearVoice preprocessing, <code>merge_backing_track</code> (bool) to blend the result with the extracted instrumental backing, plus <code>min_speech_ms</code>/<code>max_merge_ms</code> to override segment-merging heuristics and <code>segments_json</code> to supply pre-generated Gemini-like segments.</li>
-                                    <li>JSON alternative: <code>{"audio": "&lt;base64&gt;", "dest_language": "English", "audio_mime_type": "audio/wav", "response_format": "mp3", "enhance_voice": true, "super_resolution_voice": false, "merge_backing_track": true, "segments_json": "[...]","min_speech_ms": 3000, "max_merge_ms": 300}</code></li>
+                                    <li>Multipart form fields: <code>audio_file</code> (file), <code>dest_language</code> (string); optional <code>response_format</code> (mp3/wav/flac/aac/opus/ogg/webm), <code>prompt</code> (custom Gemini instructions), <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) to run ClearVoice preprocessing, <code>merge_backing_track</code> (bool) to blend the result with the extracted instrumental backing, plus <code>min_speech_ms</code>/<code>max_merge_ms</code> to override segment-merging heuristics (set <code>max_merge_ms</code> to 0 to keep Gemini's original segmentation) and <code>segments_json</code> to supply pre-generated Gemini-like segments.</li>
+                                    <li>JSON alternative: <code>{"audio": "&lt;base64&gt;", "dest_language": "English", "audio_mime_type": "audio/wav", "response_format": "mp3", "enhance_voice": true, "super_resolution_voice": false, "merge_backing_track": true, "segments_json": "[...]","min_speech_ms": 3000, "max_merge_ms": 0}</code></li>
                                     <li>Response: Audio stream. Inspect headers like <code>X-Translation-Model</code> and <code>X-Translation-Segments</code> for run metadata.</li>
                                 </ul>
                             </li>
@@ -5146,7 +5154,7 @@ async def api_translate_segments(
         max_merge_interval = _coerce_positive_int(
             max_merge_interval_value,
             MAX_MERGE_INTERVAL_MS,
-            min_value=50,
+            min_value=0,
         )
         generated_volume_percent_value = _coerce_volume_percent(
             generated_volume_percent_value,
@@ -5864,7 +5872,7 @@ async def api_translate_audio(
         max_merge_interval = _coerce_positive_int(
             max_merge_interval_value,
             MAX_MERGE_INTERVAL_MS,
-            min_value=50,
+            min_value=0,
         )
         allowed_gemini_models = {"gemini-flash-latest", "gemini-2.5-pro"}
         gemini_model_value = (gemini_model_value or "").strip()
