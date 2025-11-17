@@ -38,6 +38,7 @@ import re
 import shutil
 import subprocess
 import urllib.request
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 import copy
 from dataclasses import dataclass, field
@@ -65,6 +66,7 @@ except ImportError:
 from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks, HTTPException, Depends
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from urllib.parse import quote
 
 # IndexTTS v2 and speaker management
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -90,34 +92,44 @@ GOOGLE_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
 GEMINI_MODEL_ENV_VAR = "GEMINI_MODEL_NAME"
 DEFAULT_GEMINI_MODEL_NAME = "gemini-2.5-pro"
 JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+COERCE_SPEAKER_SEGMENTS_PATTERN = re.compile(
+    r'^\s*(\[[\s\S]*?\])\s*,\s*"segments"\s*:\s*(\[[\s\S]*\])\s*$',
+    re.DOTALL,
+)
 TRANSLATION_PROMPT_TEMPLATE = (
-    "You are a professional interpreter. "
+    "You are a professional interpreter and diarization analyst. "
     "Transcribe the speech from the provided audio and translate it into {dest_language} using natural, conversational wording. "
     "{non_speech_instruction}"
-    "CRITICAL: In continuous multi-speaker scenarios, speakers may transition rapidly without pauses. "
-    "You must identify speaker changes by analyzing voice characteristics (pitch, timbre, accent, speaking rate) and create separate JSON segments for each speaker, even when transitions occur without gaps. "
-    "Each speaker's speech should be in its own array item with distinct timestamps. "
-    "Return a JSON array where each item contains exactly the keys: "
-    "\"start\" (timestamp in mm:ss or mm:ss.xxx), "
+    "CRITICAL: Conversations may contain rapid handoffs without pauses. Detect every speaker change by listening for voice characteristics (pitch, timbre, accent, cadence) and never merge two speakers into one segment. "
+    "Return JSON with exactly two top-level keys: \"speakers\" and \"segments\". "
+    "\"speakers\" must be an array ordered by first appearance where every entry has "
+    "\"id\" (deterministic labels \"speaker1\", \"speaker2\", ...), "
+    "and \"description\" (≤12 words highlighting gender, approximate age range, and personality or tone). "
+    "\"segments\" must be an array where each item represents a contiguous utterance with the keys "
+    "\"start\" (timestamp mm:ss or mm:ss.xxx), "
     "\"end\" (same format), "
+    "\"speaker\" (one of the ids from the speakers list), "
     "\"source_text\" (original-language transcript), "
     "\"translated_text\" (translation in {dest_language}). "
-    "Ensure timestamps align closely with the audio and segments remain coherent per speaker. "
-    "Respond with JSON only—no explanations, markdown, or additional text."
+    "Ensure timestamps align with the audio, keep segments coherent, and add a new speaker entry whenever a new voice appears. "
+    "Respond with JSON only—no explanations, markdown, or additional prose."
 )
 TRANSCRIPTION_PROMPT_TEMPLATE = (
-    "You are a meticulous transcription expert. "
+    "You are a meticulous transcription and diarization expert. "
     "Transcribe the provided speech audio in its original language without translating it. "
     "{non_speech_instruction}"
-    "CRITICAL: In continuous multi-speaker scenarios, speakers may transition rapidly without pauses. "
-    "You must identify speaker changes by analyzing voice characteristics (pitch, timbre, accent, speaking rate) and create separate JSON segments for each speaker, even when transitions occur without gaps. "
-    "Each speaker's speech should be in its own array item with distinct timestamps. "
-    "Return a JSON array where each item contains the keys: "
-    "\"start\" (timestamp in mm:ss or mm:ss.xxx), "
-    "\"end\" (same format), "
-    "\"source_text\" (the transcript in the original language), "
-    "\"translated_text\" (leave this empty string to indicate no translation). "
-    "Ensure timestamps align with the audio and segments remain coherent per speaker. "
+    "CRITICAL: Conversations may contain rapid speaker transitions without pauses. Detect every speaker change by voice characteristics and never mix two speakers in one segment. "
+    "Return JSON with the top-level keys \"speakers\" and \"segments\". "
+    "\"speakers\" is an ordered array of objects containing "
+    "\"id\" (speaker1, speaker2, ... in order of first appearance) "
+    "and \"description\" (short summary focusing on gender, approximate age, and personality/tone). "
+    "\"segments\" is an array where each entry contains "
+    "\"start\" (timestamp mm:ss or mm:ss.xxx), "
+    "\"end\" (same), "
+    "\"speaker\" (speaker id), "
+    "\"source_text\" (transcript in the original language), "
+    "\"translated_text\" (use empty string \"\" because no translation is requested). "
+    "Make sure timestamps are accurate and segments remain speaker-homogeneous. "
     "Respond with JSON only—no markdown or commentary."
 )
 IGNORE_NON_SPEECH_PROMPT_SUFFIX = (
@@ -135,9 +147,12 @@ MAX_MERGE_INTERVAL_MS = 0
 DEFAULT_GENERATED_VOLUME_PERCENT = 100.0
 MIN_GENERATED_VOLUME_PERCENT = 10.0
 MAX_GENERATED_VOLUME_PERCENT = 300.0
+DEFAULT_EMOTION_WEIGHT = 0.6
 ALLOWED_TRANSLATE_FORMATS = {"mp3", "wav", "flac", "aac", "opus", "ogg", "webm"}
 ALLOWED_GEMINI_MODELS = {"gemini-flash-latest", "gemini-2.5-pro"}
 GEMINI_AUDIO_EXPORT_BITRATE = "128k"
+SPEAKER_PREVIEW_DIR = Path("speaker_presets") / "previews"
+SPEAKER_PREVIEW_BITRATE = "128k"
 
 
 async def _run_blocking(func: Callable, *args, **kwargs):
@@ -453,6 +468,8 @@ class SegmentBuildResult:
     segments: List[Dict[str, Any]]
     ui_segments: List[Dict[str, Any]]
     gemini_chunks: List[Dict[str, Any]]
+    speaker_profiles: List[Dict[str, Any]]
+    gemini_raw_text: Optional[str]
     metadata: Dict[str, Any]
     manual_segments_used: bool
 
@@ -483,11 +500,17 @@ async def _build_translation_segments(
     emit_status: Optional[Callable[..., Awaitable[None]]] = None,
 ) -> SegmentBuildResult:
     manual_chunk_data = None
+    manual_speaker_profiles: List[Dict[str, Any]] = []
     manual_segments_used = False
+    raw_gemini_response_text: Optional[str] = None
+    manual_raw_input = (segments_override_value or "").strip() if segments_override_value else None
     if segments_override_value:
         try:
-            manual_chunk_data = _parse_manual_segments_input(segments_override_value)
-            manual_segments_used = True
+            parsed_override = _parse_manual_segments_input(segments_override_value)
+            if parsed_override is not None:
+                manual_chunk_data, manual_speaker_profiles = parsed_override
+                manual_segments_used = True
+                raw_gemini_response_text = manual_raw_input
         except ValueError as exc:
             raise TranslateWorkflowHttpError(
                 400,
@@ -500,10 +523,12 @@ async def _build_translation_segments(
             message=f"Analyzing audio with Gemini model '{resolved_gemini_model}'...",
         )
 
+    speaker_profiles: List[Dict[str, Any]] = []
     if manual_chunk_data is not None:
         gemini_chunks = manual_chunk_data
+        speaker_profiles = manual_speaker_profiles or []
     else:
-        gemini_chunks = await _gemini_transcribe_translate(
+        gemini_chunks, speaker_profiles, raw_gemini_response_text = await _gemini_transcribe_translate(
             processed_audio_bytes,
             gemini_mime_type,
             dest_language,
@@ -511,6 +536,8 @@ async def _build_translation_segments(
             model_name=resolved_gemini_model,
             api_key_override=gemini_api_key_value,
         )
+    if raw_gemini_response_text is None and manual_raw_input:
+        raw_gemini_response_text = manual_raw_input
 
     if emit_status:
         await emit_status(
@@ -522,6 +549,7 @@ async def _build_translation_segments(
         original_audio,
         gemini_chunks,
         dest_language,
+        speaker_profiles=speaker_profiles,
         min_speech_duration_ms=min_speech_duration,
         max_merge_interval_ms=max_merge_interval,
     )
@@ -556,6 +584,8 @@ async def _build_translation_segments(
         ignore_non_speech=ignore_non_speech_flag,
         preserve_silence_audio=preserve_silence_audio_flag,
         generated_volume_percent=generated_volume_percent_value,
+        speaker_profiles=speaker_profiles,
+        gemini_raw_text=raw_gemini_response_text,
     )
     ui_segments = _serialize_segments_for_ui(segments, original_audio)
 
@@ -574,6 +604,9 @@ async def _build_translation_segments(
         "preserve_silence_audio": preserve_silence_audio_flag,
         "generated_volume_percent": generated_volume_percent_value,
         "gemini_raw_segments": gemini_chunks,
+        "speaker_profiles": copy.deepcopy(speaker_profiles),
+        "speaker_overrides": copy.deepcopy(getattr(session, "speaker_overrides", {})),
+        "gemini_raw_text": raw_gemini_response_text,
         "clearvoice": {
             "enhancement": apply_enhancement,
             "super_resolution": apply_super_resolution,
@@ -608,6 +641,8 @@ async def _build_translation_segments(
         segments=segments,
         ui_segments=ui_segments,
         gemini_chunks=gemini_chunks,
+        speaker_profiles=speaker_profiles,
+        gemini_raw_text=raw_gemini_response_text,
         metadata=metadata,
         manual_segments_used=manual_segments_used,
     )
@@ -633,6 +668,9 @@ class TranslateSessionData:
     ignore_non_speech: bool = False
     preserve_silence_audio: bool = False
     generated_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT
+    speaker_profiles: List[Dict[str, Any]] = field(default_factory=list)
+    speaker_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    gemini_raw_text: Optional[str] = None
     created_at: float = field(default_factory=lambda: time.time())
 
 
@@ -795,6 +833,55 @@ def _remove_file_sync(file_path: str) -> None:
         os.unlink(file_path)
     except Exception:
         pass  # Ignore errors when removing temporary files
+
+
+def _sanitize_preview_basename(speaker_name: str) -> str:
+    sanitized = re.sub(r"[^0-9A-Za-z_-]+", "_", speaker_name.strip())
+    sanitized = sanitized.strip("_") or "speaker"
+    digest = hashlib.md5(speaker_name.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized}_{digest}"
+
+
+def _get_speaker_preview_path(speaker_name: str) -> Path:
+    return SPEAKER_PREVIEW_DIR / f"{_sanitize_preview_basename(speaker_name)}.mp3"
+
+
+def _speaker_preview_url(speaker_name: str) -> str:
+    return f"/api/speaker_preview/{quote(speaker_name, safe='')}"
+
+
+def _speaker_preview_exists(speaker_name: str) -> bool:
+    return _get_speaker_preview_path(speaker_name).exists()
+
+
+async def _remove_speaker_preview(speaker_name: str) -> None:
+    preview_path = _get_speaker_preview_path(speaker_name)
+    if preview_path.exists():
+        await async_remove_file(str(preview_path))
+
+
+async def _create_speaker_preview_mp3(
+    source_audio_path: str,
+    speaker_name: str,
+    *,
+    bitrate: str = SPEAKER_PREVIEW_BITRATE,
+) -> Optional[str]:
+    """Create/overwrite a speaker preview MP3 derived from the processed reference audio."""
+    loop = asyncio.get_event_loop()
+    preview_path = _get_speaker_preview_path(speaker_name)
+
+    def _export_preview() -> str:
+        SPEAKER_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        audio = AudioSegment.from_file(source_audio_path)
+        audio.export(preview_path, format="mp3", bitrate=bitrate)
+        return str(preview_path)
+
+    try:
+        return await loop.run_in_executor(executor, _export_preview)
+    except Exception as exc:
+        print(f"⚠️ Failed to create preview MP3 for speaker '{speaker_name}': {exc}")
+        return None
+
 
 async def async_audio_read(file_path: str):
     """Async wrapper for soundfile.read()"""
@@ -1173,15 +1260,128 @@ def _strip_code_fences(text: str) -> str:
     return text
 
 
-def _parse_gemini_json(text: str) -> List[Dict[str, Any]]:
+def _coerce_gemini_json_payload(raw: str) -> Optional[str]:
+    trimmed = (raw or "").strip()
+    if not trimmed:
+        return None
+    match = COERCE_SPEAKER_SEGMENTS_PATTERN.match(trimmed)
+    if match:
+        speakers_part, segments_part = match.groups()
+        return f'{{"speakers": {speakers_part}, "segments": {segments_part}}}'
+    return None
+
+
+SPEAKER_ID_PATTERN = re.compile(r"^speaker\s*(\d+)$", re.IGNORECASE)
+
+
+def _canonicalize_speaker_id(raw_value: Any, fallback_index: int) -> str:
+    fallback_index = max(1, int(fallback_index))
+    if isinstance(raw_value, (int, float)) and raw_value >= 1:
+        return f"speaker{int(raw_value)}"
+    if isinstance(raw_value, str):
+        candidate = raw_value.strip()
+        if not candidate:
+            return f"speaker{fallback_index}"
+        match = SPEAKER_ID_PATTERN.match(candidate)
+        if match:
+            return f"speaker{int(match.group(1))}"
+        digits = re.findall(r"\d+", candidate)
+        if digits:
+            return f"speaker{int(digits[0])}"
+    return f"speaker{fallback_index}"
+
+
+def _normalize_speaker_profiles(raw_profiles: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_profiles, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    used_ids: Set[str] = set()
+    for idx, entry in enumerate(raw_profiles, start=1):
+        entry_dict: Dict[str, Any]
+        if isinstance(entry, dict):
+            entry_dict = entry
+        else:
+            entry_dict = {"description": str(entry)}
+        candidate_id = entry_dict.get("id") or entry_dict.get("speaker") or entry_dict.get("label") or entry_dict.get("name")
+        speaker_id = _canonicalize_speaker_id(candidate_id, idx)
+        while speaker_id in used_ids:
+            idx += 1
+            speaker_id = _canonicalize_speaker_id(None, idx)
+        used_ids.add(speaker_id)
+        description = str(
+            entry_dict.get("description")
+            or entry_dict.get("summary")
+            or entry_dict.get("traits")
+            or entry_dict.get("role")
+            or ""
+        ).strip()
+        if not description:
+            description = f"{speaker_id.title()} voice"
+        display_name = str(entry_dict.get("label") or entry_dict.get("name") or speaker_id.title()).strip()
+        normalized.append(
+            {
+                "id": speaker_id,
+                "label": display_name or speaker_id.title(),
+                "description": description,
+            }
+        )
+    return normalized
+
+
+def _normalize_speaker_overrides(
+    raw_overrides: Optional[Dict[str, Any]],
+    speaker_profiles: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(raw_overrides, dict):
+        return {}
+    valid_ids = {profile.get("id") for profile in (speaker_profiles or []) if profile.get("id")}
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for key, value in raw_overrides.items():
+        if not isinstance(key, str):
+            continue
+        speaker_id = _canonicalize_speaker_id(key, fallback_index=1).lower()
+        if valid_ids and speaker_id not in valid_ids:
+            continue
+        if not isinstance(value, dict):
+            continue
+        preset_name = str(value.get("preset_name") or "").strip()
+        if not preset_name:
+            continue
+        emotion_weight = _coerce_emotion_weight(value.get("emotion_weight"), DEFAULT_EMOTION_WEIGHT)
+        normalized[speaker_id] = {
+            "preset_name": preset_name,
+            "use_emotion_prompt": bool(value.get("use_emotion_prompt")),
+            "emotion_weight": emotion_weight,
+        }
+    return normalized
+
+
+def _parse_gemini_json(text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     cleaned = _strip_code_fences(text)
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Gemini returned invalid JSON: {exc}") from exc
-    if not isinstance(data, list):
-        raise ValueError("Gemini response must be a JSON array of segments.")
-    return data
+        coerced_payload = _coerce_gemini_json_payload(cleaned)
+        if coerced_payload:
+            try:
+                data = json.loads(coerced_payload)
+            except json.JSONDecodeError as coerced_exc:
+                preview = cleaned if len(cleaned) <= 4000 else f"{cleaned[:4000]}...<truncated>"
+                print("❌ Gemini JSON parse error (after coercion). Raw response preview:\n", preview)
+                raise ValueError(f"Gemini returned invalid JSON: {coerced_exc}") from coerced_exc
+        else:
+            preview = cleaned if len(cleaned) <= 4000 else f"{cleaned[:4000]}...<truncated>"
+            print("❌ Gemini JSON parse error. Raw response preview:\n", preview)
+            raise ValueError(f"Gemini returned invalid JSON: {exc}") from exc
+    if isinstance(data, list):
+        return data, []
+    if isinstance(data, dict):
+        segments = data.get("segments")
+        if not isinstance(segments, list):
+            raise ValueError("Gemini response must include a 'segments' array.")
+        speaker_profiles = _normalize_speaker_profiles(data.get("speakers"))
+        return segments, speaker_profiles
+    raise ValueError("Gemini response must be a JSON object or array.")
 
 
 def _extract_text_from_gemini_response(response: Any) -> str:
@@ -1423,10 +1623,28 @@ def _coerce_volume_percent(
     return parsed
 
 
-def _parse_manual_segments_input(raw: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+def _coerce_emotion_weight(value: Any, default: float = DEFAULT_EMOTION_WEIGHT) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    if parsed < 0.0:
+        return 0.0
+    if parsed > 1.0:
+        return 1.0
+    return parsed
+
+
+def _parse_manual_segments_input(
+    raw: Optional[str],
+) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
     """
     Parse user-supplied Gemini segment JSON.
-    Accepts either a JSON array or an object with a top-level "segments" array.
+    Accepts either a JSON array or an object with "segments" and optional "speakers".
     """
     if raw is None:
         return None
@@ -1438,8 +1656,10 @@ def _parse_manual_segments_input(raw: Optional[str]) -> Optional[List[Dict[str, 
     except json.JSONDecodeError as exc:
         raise ValueError(f"segments_json is not valid JSON: {exc}") from exc
 
-    if isinstance(parsed, dict) and "segments" in parsed:
-        parsed = parsed["segments"]
+    speaker_profiles: List[Dict[str, Any]] = []
+    if isinstance(parsed, dict):
+        speaker_profiles = _normalize_speaker_profiles(parsed.get("speakers"))
+        parsed = parsed.get("segments")
 
     if not isinstance(parsed, list):
         raise ValueError("segments_json must be a JSON array of segment objects.")
@@ -1451,7 +1671,7 @@ def _parse_manual_segments_input(raw: Optional[str]) -> Optional[List[Dict[str, 
         if not isinstance(entry, dict):
             raise ValueError(f"segments_json[{idx}] is not an object.")
         cleaned.append(entry)
-    return cleaned
+    return cleaned, speaker_profiles
 
 
 def _merge_short_speech_segments(
@@ -1488,6 +1708,7 @@ def _merge_short_speech_segments(
         translated_text = segment.get("translated_text", "")
         raw_chunks: List[Any] = [segment.get("raw_chunk")]
         raw_indices: List[Any] = [segment.get("raw_chunk_index")]
+        current_speaker = str(segment.get("speaker") or "").strip().lower() or None
 
         j = i + 1
 
@@ -1507,6 +1728,9 @@ def _merge_short_speech_segments(
                     # Silence gap too long, stop merging forward
                     break
             if seg_type == "speech":
+                next_speaker = str(next_segment.get("speaker") or "").strip().lower() or None
+                if current_speaker and next_speaker and next_speaker != current_speaker:
+                    break
                 end_ms = int(next_segment.get("end_ms", end_ms))
                 source_text = _concat_text(source_text, next_segment.get("source_text"))
                 translated_text = _concat_text(translated_text, next_segment.get("translated_text"))
@@ -1530,7 +1754,12 @@ def _merge_short_speech_segments(
                 prev_end_ms = int(prev_segment.get("end_ms", 0))
                 gap_ms = start_ms - prev_end_ms
                 # Only merge backward if gap is short enough
-                if gap_ms <= max_merge_interval_ms:
+                prev_speaker = str(prev_segment.get("speaker") or "").strip().lower() or None
+                if gap_ms <= max_merge_interval_ms and (
+                    not current_speaker
+                    or not prev_speaker
+                    or prev_speaker == current_speaker
+                ):
                     prev_segment["end_ms"] = end_ms
                     prev_segment["duration_ms"] = end_ms - int(prev_segment.get("start_ms", start_ms))
                     prev_segment["end"] = _format_ms_to_timestamp(end_ms)
@@ -1634,6 +1863,7 @@ def _serialize_segments_for_ui(
             "source_text": segment.get("source_text", ""),
             "translated_text": segment.get("translated_text", ""),
             "text_keys": segment.get("text_keys", {}),
+            "speaker": segment.get("speaker"),
         }
         if seg_type == "speech":
             base_payload["generate"] = True
@@ -1676,6 +1906,9 @@ async def _create_translate_session(
     ignore_non_speech: bool = False,
     preserve_silence_audio: bool = False,
     generated_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT,
+    speaker_profiles: Optional[List[Dict[str, Any]]] = None,
+    speaker_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    gemini_raw_text: Optional[str] = None,
 ) -> TranslateSessionData:
     session_id = uuid.uuid4().hex
     session = TranslateSessionData(
@@ -1697,6 +1930,9 @@ async def _create_translate_session(
         ignore_non_speech=ignore_non_speech,
         preserve_silence_audio=preserve_silence_audio,
         generated_volume_percent=generated_volume_percent,
+        speaker_profiles=copy.deepcopy(speaker_profiles or []),
+        speaker_overrides=copy.deepcopy(speaker_overrides or {}),
+        gemini_raw_text=gemini_raw_text,
     )
     async with ADVANCED_TRANSLATE_SESSION_LOCK:
         _cleanup_expired_translate_sessions_locked()
@@ -1720,6 +1956,16 @@ async def _update_translate_session_segments(
         session = ADVANCED_TRANSLATE_SESSIONS.get(session_id)
         if session:
             session.base_segments = copy.deepcopy(segments)
+            session.created_at = time.time()
+
+
+async def _update_translate_session_speaker_overrides(
+    session_id: str, overrides: Dict[str, Dict[str, Any]]
+) -> None:
+    async with ADVANCED_TRANSLATE_SESSION_LOCK:
+        session = ADVANCED_TRANSLATE_SESSIONS.get(session_id)
+        if session:
+            session.speaker_overrides = copy.deepcopy(overrides)
             session.created_at = time.time()
 
 
@@ -1774,12 +2020,14 @@ def _prepare_translation_segments(
     chunk_data: List[Dict[str, Any]],
     dest_language: str,
     *,
+    speaker_profiles: Optional[List[Dict[str, Any]]] = None,
     min_speech_duration_ms: int = MIN_SPEECH_DURATION_MS,
     max_merge_interval_ms: int = MAX_MERGE_INTERVAL_MS,
 ) -> List[Dict[str, Any]]:
     total_duration_ms = len(original_audio)
     segments: List[Dict[str, Any]] = []
     current_ms = 0
+    normalized_profiles = speaker_profiles or []
 
     def _get_timestamp(entry: Dict[str, Any], keys: List[str]) -> Optional[int]:
         for key in keys:
@@ -1804,6 +2052,21 @@ def _prepare_translation_segments(
             "position": position,
         }
         return segment_payload
+
+    def _resolve_speaker_label(entry: Dict[str, Any], index: int) -> Optional[str]:
+        fallback_index = index + 1
+        candidate_keys = ["speaker", "speaker_id", "speaker_label", "voice", "speaker_name"]
+        for key in candidate_keys:
+            if key in entry and entry[key] not in (None, ""):
+                return _canonicalize_speaker_id(entry[key], fallback_index).lower()
+        speaker_idx = entry.get("speaker_index")
+        if isinstance(speaker_idx, int):
+            return f"speaker{max(1, speaker_idx + 1)}"
+        if normalized_profiles and index < len(normalized_profiles):
+            profile_id = normalized_profiles[index].get("id")
+            if profile_id:
+                return str(profile_id).strip().lower()
+        return None
 
     if not chunk_data:
         raise ValueError("Gemini returned no transcription segments.")
@@ -1901,6 +2164,9 @@ def _prepare_translation_segments(
             "raw_chunk_index": idx,
             "raw_chunk": entry,
         }
+        speaker_label = _resolve_speaker_label(entry, idx)
+        if speaker_label:
+            segment_payload["speaker"] = speaker_label
         segment_payload["index"] = len(segments)
         segments.append(segment_payload)
         current_ms = end_ms
@@ -2026,6 +2292,7 @@ async def _synthesize_translated_audio(
     merge_with_backing: bool = False,
     preserve_silence_audio: bool = False,
     generated_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT,
+    speaker_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[bytes, str, Dict[str, Any]]:
     tts = tts_manager.get_tts()
     frame_rate = int(original_audio.frame_rate or 22050)
@@ -2035,6 +2302,9 @@ async def _synthesize_translated_audio(
     combined_audio = _create_silence_segment(0, frame_rate, sample_width, channels)
     generation_log: List[Dict[str, Any]] = []
     semaphore = asyncio.Semaphore(TRANSLATION_TTS_CONCURRENCY)
+    override_map: Dict[str, Dict[str, Any]] = {
+        str(key).lower(): value for key, value in (speaker_overrides or {}).items()
+    }
 
     async def process_segment(index: int, segment: Dict[str, Any]):
         seg_type = segment.get("type")
@@ -2071,6 +2341,20 @@ async def _synthesize_translated_audio(
         keep_original = segment.get("keep_original", False) or (not generate_segment)
 
         chunk_audio = original_audio[start_ms:end_ms]
+        speaker_label = str(segment.get("speaker") or "").strip().lower()
+        override_config = override_map.get(speaker_label) if speaker_label else None
+        preset_name = None
+        use_emotion_prompt = False
+        emotion_weight = DEFAULT_EMOTION_WEIGHT
+        if override_config:
+            preset_candidate = override_config.get("preset_name")
+            if isinstance(preset_candidate, str) and preset_candidate.strip():
+                preset_name = preset_candidate.strip()
+                use_emotion_prompt = bool(override_config.get("use_emotion_prompt"))
+                emotion_weight = _coerce_emotion_weight(
+                    override_config.get("emotion_weight"),
+                    DEFAULT_EMOTION_WEIGHT,
+                )
 
         if keep_original:
             audio_seg = _match_segment_duration(chunk_audio, duration_ms, frame_rate, sample_width, channels)
@@ -2106,17 +2390,22 @@ async def _synthesize_translated_audio(
         status = "success"
         error_message = None
         generated_audio: Optional[AudioSegment] = None
+        spk_prompt_value = chunk_path if not preset_name else ""
+        emo_prompt_value = chunk_path if preset_name and use_emotion_prompt else None
 
         try:
             async with semaphore:
                 inference_path = await tts.infer(
-                    spk_audio_prompt=chunk_path,
+                    spk_audio_prompt=spk_prompt_value,
                     text=translated_text,
                     output_path=generated_path,
                     interval_silence=0,
                     speech_length=generation_target_ms,
                     diffusion_steps=10,
                     verbose=cmd_args.verbose,
+                    speaker_preset=preset_name,
+                    emo_audio_prompt=emo_prompt_value,
+                    emo_alpha=emotion_weight,
                 )
             generated_audio = AudioSegment.from_file(inference_path)
             if abs(generated_volume_percent - DEFAULT_GENERATED_VOLUME_PERCENT) >= 0.01:
@@ -2147,6 +2436,12 @@ async def _synthesize_translated_audio(
             "source_text": source_text,
             "translated_text": translated_text,
         }
+        if speaker_label:
+            log_entry["speaker"] = speaker_label
+        if preset_name:
+            log_entry["speaker_preset"] = preset_name
+            log_entry["emotion_prompt"] = use_emotion_prompt
+            log_entry["emotion_weight"] = emotion_weight
         if status == "error" and error_message:
             log_entry["error"] = error_message
 
@@ -2235,7 +2530,7 @@ async def _gemini_transcribe_translate(
     *,
     model_name: Optional[str] = None,
     api_key_override: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
     if genai is None:
         raise RuntimeError(
             "The google-genai package is required for translation. Install it with `pip install google-genai`."
@@ -2306,7 +2601,8 @@ async def _gemini_transcribe_translate(
     else:
         raise RuntimeError(f"Gemini request failed after {max_attempts} attempts: {last_error}")
 
-    return _parse_gemini_json(raw_text)
+    segments, speaker_profiles = _parse_gemini_json(raw_text)
+    return segments, speaker_profiles, raw_text
 
 # Global TTS manager
 class TTSManager:
@@ -2416,13 +2712,19 @@ class SpeakerAPIWrapper:
             
             if speaker_name in existing_presets:
                 preset_info = existing_presets[speaker_name]
+                if not _speaker_preview_exists(speaker_name):
+                    audio_path = preset_info.get("audio_path")
+                    if audio_path and os.path.exists(audio_path):
+                        await _create_speaker_preview_mp3(audio_path, speaker_name)
+                preview_available = _speaker_preview_exists(speaker_name)
                 return {
                     "status": "success", 
                     "message": f"Speaker '{speaker_name}' already exists",
                     "info": "already_exists",
                     "audio_count": 1,  # SpeakerPresetManager uses single audio file
                     "description": preset_info.get("description", ""),
-                    "created_at": preset_info.get("created_at", 0)
+                    "created_at": preset_info.get("created_at", 0),
+                    "preview_url": _speaker_preview_url(speaker_name) if preview_available else None,
                 }
             
             # Save the first audio file (SpeakerPresetManager expects single file)
@@ -2498,6 +2800,9 @@ class SpeakerAPIWrapper:
                             "enhancement": apply_enhancement,
                             "super_resolution": apply_super_resolution
                         }
+                    preview_result = await _create_speaker_preview_mp3(final_audio_path, speaker_name)
+                    if preview_result:
+                        response["preview_url"] = _speaker_preview_url(speaker_name)
                     return response
                 else:
                     return {"status": "error", "message": f"Failed to add speaker '{speaker_name}'"}
@@ -2521,6 +2826,7 @@ class SpeakerAPIWrapper:
             success = await loop.run_in_executor(executor, self.preset_manager.delete_preset, speaker_name)
             
             if success:
+                await _remove_speaker_preview(speaker_name)
                 return {
                     "status": "success",
                     "message": f"Speaker '{speaker_name}' deleted successfully"
@@ -2550,13 +2856,18 @@ class SpeakerAPIWrapper:
                         return 0
                     total_size = await loop.run_in_executor(executor, get_file_size, cache_file)
                 
+                preview_available = _speaker_preview_exists(speaker_name)
+                preview_url = _speaker_preview_url(speaker_name) if preview_available else None
+
                 speaker_info[speaker_name] = {
                     "audio_count": 1,  # SpeakerPresetManager uses single audio file
                     "audio_files": [os.path.basename(preset_data.get('audio_path', ''))],
                     "total_size_mb": total_size / (1024 * 1024),
                     "description": preset_data.get('description', ''),
                     "created_at": preset_data.get('created_at', 0),
-                    "last_used": preset_data.get('last_used', 0)
+                    "last_used": preset_data.get('last_used', 0),
+                    "preview_available": preview_available,
+                    "preview_url": preview_url,
                 }
             
             return {
@@ -2658,6 +2969,21 @@ class TranslateRequest(BaseModel):
     )
 
 
+class SpeakerOverrideInput(BaseModel):
+    preset_name: Optional[str] = Field(
+        default=None,
+        description="Speaker preset to use for the detected speaker label; leave empty to clone the original voice.",
+    )
+    use_emotion_prompt: Optional[bool] = Field(
+        default=False,
+        description="When True, feed the original segment audio as an emotion/style prompt while using the preset.",
+    )
+    emotion_weight: Optional[float] = Field(
+        default=DEFAULT_EMOTION_WEIGHT,
+        description="Emotion control weight (0.0 - 1.0) when using the original emotion prompt.",
+    )
+
+
 class TranslateSegmentInput(BaseModel):
     index: int
     type: Literal["speech", "silence"] = "speech"
@@ -2666,6 +2992,7 @@ class TranslateSegmentInput(BaseModel):
     translated_text: Optional[str] = ""
     source_text: Optional[str] = ""
     generate: Optional[bool] = True
+    speaker: Optional[str] = Field(default=None, description="Detected speaker label")
 
 
 class TranslateGenerateRequest(BaseModel):
@@ -2682,6 +3009,10 @@ class TranslateGenerateRequest(BaseModel):
     generated_volume_percent: Optional[float] = Field(
         default=None,
         description="Override regenerated speech loudness before merging (percentage, default 100%).",
+    )
+    speaker_overrides: Optional[Dict[str, SpeakerOverrideInput]] = Field(
+        default=None,
+        description="Optional mapping from detected speaker ids (speaker1, speaker2, …) to preset overrides.",
     )
 
 
@@ -3070,6 +3401,107 @@ async def home():
             }
             .speaker-info h4 { margin: 0; color: #333; }
             .speaker-info small { color: #666; }
+            .speaker-preview {
+                margin-top: 12px;
+            }
+            .speaker-preview label {
+                font-weight: 600;
+                color: #444;
+                display: block;
+                margin-bottom: 4px;
+            }
+            .speaker-preview audio {
+                width: 220px;
+                max-width: 100%;
+                outline: none;
+                border-radius: 6px;
+                background: #f3f4ff;
+                padding: 4px;
+            }
+            .speaker-assignment-panel {
+                border: 1px solid #dce1fa;
+                border-radius: 12px;
+                padding: 16px;
+                margin-bottom: 16px;
+                background: #f9f9ff;
+            }
+            .speaker-assignment-panel h4 {
+                margin: 0 0 12px 0;
+                color: #333;
+            }
+            .speaker-assignment-item {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                padding: 12px;
+                border-radius: 10px;
+                border: 1px solid #e3e6fb;
+                background: white;
+                margin-bottom: 10px;
+            }
+            .speaker-assignment-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 12px;
+            }
+            .speaker-assignment-controls {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 12px;
+                align-items: center;
+            }
+            .speaker-emo-toggle {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                font-size: 0.9em;
+                color: #555;
+            }
+            .speaker-emo-settings {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 12px;
+                align-items: center;
+                margin-top: 6px;
+            }
+            .speaker-emo-weight {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                font-size: 0.85em;
+                color: #555;
+            }
+            .speaker-emo-weight input {
+                width: 110px;
+            }
+            .speaker-assignment-preview {
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                margin-top: 4px;
+            }
+            .speaker-assignment-preview small {
+                color: #777;
+            }
+            .speaker-assignment-preview audio {
+                width: 240px;
+                max-width: 100%;
+                outline: none;
+                border-radius: 6px;
+                background: #f3f4ff;
+                padding: 4px;
+            }
+            .segment-speaker-pill {
+                display: inline-flex;
+                align-items: center;
+                background: #eef0ff;
+                color: #4b50c1;
+                border-radius: 999px;
+                padding: 2px 10px;
+                font-size: 0.8em;
+                font-weight: 600;
+            }
             .loading {
                 display: inline-block;
                 width: 20px;
@@ -3361,7 +3793,7 @@ async def home():
                                     </div>
                                     <div style="flex: 1 1 220px;">
                                         <label for="translateMaxMerge" style="font-weight: 500;">Max merge silence gap (ms):</label>
-                                        <input type="number" id="translateMaxMerge" min="0" step="50" placeholder="Default 300 (0 disables)">
+                                        <input type="number" id="translateMaxMerge" min="0" step="50" placeholder="Default 0 (0 disables)">
                                     </div>
                                 </div>
                                 <small style="color: #666; margin-top: 5px; display: block;">
@@ -3453,6 +3885,7 @@ async def home():
                         </form>
                         <div id="translateStatus" class="status"></div>
                         <div id="translateAdvancedPanel" class="segment-panel" style="display: none;">
+                            <div id="translateSpeakerAssignments" class="speaker-assignment-panel" style="display: none;"></div>
                             <div class="segment-controls">
                                 <label class="segment-checkbox">
                                     <input type="checkbox" id="translateSegmentsSelectAll" checked>
@@ -3851,13 +4284,18 @@ async def home():
                     // Clear existing options except first
                     select.innerHTML = '<option value="">Select a speaker...</option>';
                     
-                    if (data.success && data.roles) {
-                        data.roles.forEach(speaker => {
+                    if (data.success) {
+                        const speakerMeta = data.speakers || {};
+                        speakerPresetMeta = speakerMeta;
+                        const roles = data.roles && data.roles.length ? data.roles : Object.keys(speakerMeta || {});
+                        availableSpeakerPresets = roles || [];
+                        (roles || []).forEach(speaker => {
                             const option = document.createElement('option');
                             option.value = speaker;
                             option.textContent = speaker;
                             select.appendChild(option);
                         });
+                        renderSpeakerAssignments();
                     }
                 } catch (error) {
                     console.error('Failed to load speakers:', error);
@@ -3870,18 +4308,37 @@ async def home():
                     const data = await response.json();
                     const listDiv = document.getElementById('speakerList');
                     
-                    if (data.success && data.roles) {
-                        const speakers = data.roles;
+                    if (data.success) {
+                        const speakerMeta = data.speakers || {};
+                        const speakers = data.roles && data.roles.length ? data.roles : Object.keys(speakerMeta);
+                        
+                        if (!speakers.length) {
+                            listDiv.innerHTML = '<p>No speakers found.</p>';
+                            return;
+                        }
+                        
                         let html = `<h4>📊 ${speakers.length} Speakers Available</h4>`;
                         
                         for (const name of speakers) {
+                            const info = speakerMeta[name] || {};
+                            const description = info.description && info.description.trim() !== '' ? info.description : 'Speaker preset';
+                            const previewUrl = info.preview_url;
+                            const previewSection = previewUrl
+                                ? `<audio controls src="${previewUrl}" preload="metadata"></audio>`
+                                : `<small style="color: #888;">No preview available</small>`;
+                            const safeName = JSON.stringify(name);
+                            
                             html += `
                                 <div class="speaker-item">
                                     <div class="speaker-info">
                                         <h4>🎭 ${name}</h4>
-                                        <small>Speaker preset</small>
+                                        <small>${description}</small>
+                                        <div class="speaker-preview">
+                                            <label>Preview</label>
+                                            ${previewSection}
+                                        </div>
                                     </div>
-                                    <button class="btn btn-danger" onclick="deleteSpeaker('${name}')">🗑️ Delete</button>
+                                    <button class="btn btn-danger" onclick='deleteSpeaker(${safeName})'>🗑️ Delete</button>
                                 </div>
                             `;
                         }
@@ -4082,9 +4539,17 @@ async def home():
             const translatePromptTranslation = document.getElementById('translatePromptTranslation');
             const translatePromptTranscription = document.getElementById('translatePromptTranscription');
             const translatePromptTemplates = document.getElementById('translatePromptTemplates');
+            const DEFAULT_EMOTION_WEIGHT = 0.6;
             const translateVolumeInput = document.getElementById('translateVolumePercent');
+            const translateSpeakerAssignments = document.getElementById('translateSpeakerAssignments');
             let currentTranslateSessionId = null;
             let currentTranslateSegments = [];
+            let translateSpeakerProfiles = [];
+            let translateSpeakerProfileMap = {};
+            let translateSpeakerOverrides = {};
+            let speakerOverridesDirty = false;
+            let availableSpeakerPresets = [];
+            let speakerPresetMeta = {};
             let promptTemplates = {
                 translation: '',
                 transcription: '',
@@ -4265,11 +4730,19 @@ async def home():
                     currentTranslateSessionId = null;
                 }
                 currentTranslateSegments = [];
+                translateSpeakerProfiles = [];
+                translateSpeakerProfileMap = {};
+                translateSpeakerOverrides = {};
+                speakerOverridesDirty = false;
                 if (translateAdvancedPanel) {
                     translateAdvancedPanel.style.display = 'none';
                 }
                 if (translateSegmentsList) {
                     translateSegmentsList.innerHTML = '';
+                }
+                if (translateSpeakerAssignments) {
+                    translateSpeakerAssignments.style.display = 'none';
+                    translateSpeakerAssignments.innerHTML = '';
                 }
                 if (translateSeparationPreview) {
                     translateSeparationPreview.style.display = 'none';
@@ -4339,6 +4812,9 @@ async def home():
                     card.className = `segment-card ${segment.type}`;
                     card.dataset.index = segment.index;
                     card.dataset.type = segment.type;
+                    if (segment.speaker) {
+                        card.dataset.speaker = segment.speaker;
+                    }
 
                     const header = document.createElement('div');
                     header.className = 'segment-header';
@@ -4346,6 +4822,14 @@ async def home():
                     const title = document.createElement('div');
                     title.innerHTML = `<strong>#${segment.index}</strong> ${segment.type === 'speech' ? 'Speech Segment' : 'Silence Segment'}`;
                     header.appendChild(title);
+                    if (segment.speaker) {
+                        const speakerInfo = translateSpeakerProfileMap[segment.speaker] || {};
+                        const speakerLabel = speakerInfo.label || segment.speaker;
+                        const speakerPill = document.createElement('span');
+                        speakerPill.className = 'segment-speaker-pill';
+                        speakerPill.textContent = speakerLabel;
+                        header.appendChild(speakerPill);
+                    }
 
                     if (segment.type === 'speech') {
                         const checkboxLabel = document.createElement('label');
@@ -4478,6 +4962,271 @@ async def home():
                 translateSeparationPreview.style.display = 'block';
             }
 
+            function setSpeakerProfiles(profiles) {
+                translateSpeakerProfiles = Array.isArray(profiles) ? profiles : [];
+                translateSpeakerProfileMap = {};
+                translateSpeakerProfiles.forEach(profile => {
+                    if (profile && profile.id) {
+                        translateSpeakerProfileMap[String(profile.id)] = profile;
+                    }
+                });
+            }
+
+            function setSpeakerOverrides(overrides) {
+                translateSpeakerOverrides = {};
+                if (overrides && typeof overrides === 'object') {
+                    Object.entries(overrides).forEach(([key, value]) => {
+                        if (!value || typeof value !== 'object') {
+                            return;
+                        }
+                        const normalizedId = String(key || '').toLowerCase();
+                        translateSpeakerOverrides[normalizedId] = {
+                            preset_name: value.preset_name || '',
+                            use_emotion_prompt: Boolean(value.use_emotion_prompt),
+                            emotion_weight:
+                                typeof value.emotion_weight === 'number'
+                                    ? Math.min(1, Math.max(0, value.emotion_weight))
+                                    : DEFAULT_EMOTION_WEIGHT,
+                        };
+                    });
+                }
+            }
+
+            function renderSpeakerAssignments() {
+                if (!translateSpeakerAssignments) {
+                    return;
+                }
+                if (!translateSpeakerProfiles.length) {
+                    translateSpeakerAssignments.style.display = 'none';
+                    translateSpeakerAssignments.innerHTML = '';
+                    return;
+                }
+                let html = '<h4>Detected Speakers</h4>';
+                translateSpeakerProfiles.forEach((profile, idx) => {
+                    if (!profile) {
+                        return;
+                    }
+                    const fallbackId = profile.id ? String(profile.id) : `speaker${idx + 1}`;
+                    const speakerId = fallbackId.toLowerCase();
+                    const override = translateSpeakerOverrides[speakerId] || {};
+                    const selectedPreset = override.preset_name || '';
+                    const useEmotionPrompt = Boolean(override.use_emotion_prompt) && Boolean(selectedPreset);
+                    const checkboxDisabled = !selectedPreset;
+                    const weightValue =
+                        typeof override.emotion_weight === 'number'
+                            ? override.emotion_weight
+                            : DEFAULT_EMOTION_WEIGHT;
+                    let optionsHtml = '<option value="">Auto (clone original voice)</option>';
+                    availableSpeakerPresets.forEach(name => {
+                        const safeName = String(name || '');
+                        const selectedAttr = safeName === selectedPreset ? 'selected' : '';
+                        optionsHtml += `<option value="${safeName}" ${selectedAttr}>${safeName}</option>`;
+                    });
+                    const displayName = profile.label || fallbackId.toUpperCase();
+                    const description = profile.description || 'No description';
+                    html += `
+                        <div class="speaker-assignment-item">
+                            <div class="speaker-assignment-header">
+                                <div>
+                                    <strong>${displayName}</strong>
+                                    <div style="font-size:0.85em;color:#666;">${description}</div>
+                                </div>
+                            </div>
+                            <div class="speaker-assignment-controls">
+                                <select class="speaker-override-select" data-speaker-id="${speakerId}">
+                                    ${optionsHtml}
+                                </select>
+                                <div class="speaker-emo-settings">
+                                    <label class="speaker-emo-toggle">
+                                        <input type="checkbox" class="speaker-emo-checkbox" data-speaker-id="${speakerId}" ${checkboxDisabled ? 'disabled' : ''} ${useEmotionPrompt ? 'checked' : ''}>
+                                        Use original emotion prompt
+                                    </label>
+                                    <label class="speaker-emo-weight">
+                                        <span>Emotion weight</span>
+                                        <input type="number" min="0" max="1" step="0.05" value="${weightValue}" class="speaker-emo-weight-input" data-speaker-id="${speakerId}" ${useEmotionPrompt ? '' : 'disabled'}>
+                                    </label>
+                                </div>
+                            </div>
+                            <div class="speaker-assignment-preview" data-speaker-id="${speakerId}">
+                                <small class="speaker-preview-message"></small>
+                                <audio controls class="speaker-preview-audio" style="display:none"></audio>
+                            </div>
+                        </div>
+                    `;
+                });
+                translateSpeakerAssignments.innerHTML = html;
+                translateSpeakerAssignments.style.display = 'block';
+                translateSpeakerAssignments.querySelectorAll('.speaker-override-select').forEach(select => {
+                    select.addEventListener('change', onSpeakerPresetChange);
+                });
+                translateSpeakerAssignments.querySelectorAll('.speaker-emo-checkbox').forEach(checkbox => {
+                    checkbox.addEventListener('change', onSpeakerEmotionToggle);
+                });
+                translateSpeakerAssignments.querySelectorAll('.speaker-emo-weight-input').forEach(input => {
+                    input.addEventListener('input', onSpeakerEmotionWeightChange);
+                    input.addEventListener('change', onSpeakerEmotionWeightChange);
+                });
+                translateSpeakerProfiles.forEach((profile, idx) => {
+                    const fallbackId = profile.id ? String(profile.id) : `speaker${idx + 1}`;
+                    const speakerId = fallbackId.toLowerCase();
+                    updateSpeakerPreviewForId(speakerId);
+                    updateSpeakerEmotionWeightInput(speakerId);
+                });
+            }
+
+            function onSpeakerPresetChange(event) {
+                const select = event.target;
+                const speakerId = select.dataset.speakerId;
+                if (!speakerId) {
+                    return;
+                }
+                const newPreset = select.value;
+                if (!newPreset) {
+                    delete translateSpeakerOverrides[speakerId];
+                } else {
+                    const existing = translateSpeakerOverrides[speakerId] || {};
+                    translateSpeakerOverrides[speakerId] = {
+                        preset_name: newPreset,
+                        use_emotion_prompt: Boolean(existing.use_emotion_prompt),
+                        emotion_weight:
+                            typeof existing.emotion_weight === 'number'
+                                ? existing.emotion_weight
+                                : DEFAULT_EMOTION_WEIGHT,
+                    };
+                }
+                const emoToggle = translateSpeakerAssignments.querySelector(`.speaker-emo-checkbox[data-speaker-id="${speakerId}"]`);
+                if (emoToggle) {
+                    if (newPreset) {
+                        emoToggle.disabled = false;
+                        emoToggle.checked = Boolean(translateSpeakerOverrides[speakerId]?.use_emotion_prompt);
+                    } else {
+                        emoToggle.disabled = true;
+                        emoToggle.checked = false;
+                    }
+                }
+                speakerOverridesDirty = true;
+                updateSpeakerPreviewForId(speakerId);
+                updateSpeakerEmotionWeightInput(speakerId);
+            }
+
+            function onSpeakerEmotionToggle(event) {
+                const checkbox = event.target;
+                const speakerId = checkbox.dataset.speakerId;
+                if (!speakerId) {
+                    return;
+                }
+                const override = translateSpeakerOverrides[speakerId];
+                if (!override) {
+                    checkbox.checked = false;
+                    return;
+                }
+                override.use_emotion_prompt = checkbox.checked;
+                speakerOverridesDirty = true;
+                updateSpeakerEmotionWeightInput(speakerId);
+            }
+
+            function buildSpeakerOverridesPayload() {
+                const payload = {};
+                Object.entries(translateSpeakerOverrides).forEach(([speakerId, config]) => {
+                    if (!config || !config.preset_name) {
+                        return;
+                    }
+                    payload[speakerId] = {
+                        preset_name: config.preset_name,
+                        use_emotion_prompt: Boolean(config.use_emotion_prompt),
+                        emotion_weight:
+                            typeof config.emotion_weight === 'number'
+                                ? Math.min(1, Math.max(0, config.emotion_weight))
+                                : DEFAULT_EMOTION_WEIGHT,
+                    };
+                });
+                return payload;
+            }
+
+            function getPresetPreviewUrl(presetName) {
+                if (!presetName) {
+                    return null;
+                }
+                const meta = speakerPresetMeta[presetName];
+                if (meta && meta.preview_url) {
+                    return meta.preview_url;
+                }
+                return null;
+            }
+
+            function updateSpeakerPreviewForId(speakerId) {
+                if (!translateSpeakerAssignments) {
+                    return;
+                }
+                const select = translateSpeakerAssignments.querySelector(`.speaker-override-select[data-speaker-id="${speakerId}"]`);
+                const previewContainer = translateSpeakerAssignments.querySelector(`.speaker-assignment-preview[data-speaker-id="${speakerId}"]`);
+                if (!select || !previewContainer) {
+                    return;
+                }
+                const messageEl = previewContainer.querySelector('.speaker-preview-message');
+                const audioEl = previewContainer.querySelector('.speaker-preview-audio');
+                const override = translateSpeakerOverrides[speakerId];
+                const presetName = override && override.preset_name ? override.preset_name : '';
+                const previewUrl = getPresetPreviewUrl(presetName);
+
+                if (presetName && previewUrl) {
+                    const cacheBustedUrl = `${previewUrl}?t=${Date.now()}`;
+                    audioEl.src = cacheBustedUrl;
+                    audioEl.style.display = 'block';
+                    if (messageEl) {
+                        messageEl.textContent = `Preview: ${presetName}`;
+                    }
+                } else {
+                    audioEl.removeAttribute('src');
+                    audioEl.style.display = 'none';
+                    if (messageEl) {
+                        if (!presetName) {
+                            messageEl.textContent = 'Select a preset to preview.';
+                        } else {
+                            messageEl.textContent = 'No preview available for this preset.';
+                        }
+                    }
+                }
+            }
+
+            function updateSpeakerEmotionWeightInput(speakerId) {
+                if (!translateSpeakerAssignments) {
+                    return;
+                }
+                const weightInput = translateSpeakerAssignments.querySelector(`.speaker-emo-weight-input[data-speaker-id="${speakerId}"]`);
+                if (!weightInput) {
+                    return;
+                }
+                const override = translateSpeakerOverrides[speakerId];
+                const weightValue =
+                    typeof override?.emotion_weight === 'number'
+                        ? Math.min(1, Math.max(0, override.emotion_weight))
+                        : DEFAULT_EMOTION_WEIGHT;
+                weightInput.value = weightValue;
+                const canUseEmotion = Boolean(override && override.preset_name && override.use_emotion_prompt);
+                weightInput.disabled = !canUseEmotion;
+            }
+
+            function onSpeakerEmotionWeightChange(event) {
+                const input = event.target;
+                const speakerId = input.dataset.speakerId;
+                if (!speakerId) {
+                    return;
+                }
+                if (!translateSpeakerOverrides[speakerId]) {
+                    translateSpeakerOverrides[speakerId] = {
+                        preset_name: '',
+                        use_emotion_prompt: false,
+                        emotion_weight: DEFAULT_EMOTION_WEIGHT,
+                    };
+                }
+                const value = parseFloat(input.value);
+                const normalized = Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : DEFAULT_EMOTION_WEIGHT;
+                translateSpeakerOverrides[speakerId].emotion_weight = normalized;
+                speakerOverridesDirty = true;
+                input.value = normalized;
+            }
+
             function autoApplyTranslateMetadata(metadata, sessionIdOverride = null) {
                 if (!metadata || typeof metadata !== 'object') {
                     return;
@@ -4488,20 +5237,20 @@ async def home():
                 ) {
                     translateVolumeInput.value = metadata.generated_volume_percent;
                 }
-                if (
-                    Array.isArray(metadata.gemini_raw_segments) &&
-                    translateManualSegmentsToggle &&
-                    translateManualSegmentsInput
-                ) {
-                    translateManualSegmentsToggle.checked = true;
-                    if (typeof updateManualSegmentsVisibility === 'function') {
-                        updateManualSegmentsVisibility();
+                if (translateManualSegmentsToggle && translateManualSegmentsInput) {
+                    let manualText = '';
+                    if (typeof metadata.gemini_raw_text === 'string' && metadata.gemini_raw_text.trim()) {
+                        manualText = metadata.gemini_raw_text.trim();
+                    } else if (Array.isArray(metadata.gemini_raw_segments)) {
+                        manualText = JSON.stringify(metadata.gemini_raw_segments, null, 2);
                     }
-                    translateManualSegmentsInput.value = JSON.stringify(
-                        metadata.gemini_raw_segments,
-                        null,
-                        2
-                    );
+                    if (manualText) {
+                        translateManualSegmentsToggle.checked = true;
+                        if (typeof updateManualSegmentsVisibility === 'function') {
+                            updateManualSegmentsVisibility();
+                        }
+                        translateManualSegmentsInput.value = manualText;
+                    }
                 }
                 const derivedSessionId =
                     sessionIdOverride ||
@@ -4512,6 +5261,18 @@ async def home():
                     currentTranslateSessionId = derivedSessionId;
                 }
                 renderSeparationPreview(currentTranslateSessionId, metadata);
+                if (Array.isArray(metadata.speaker_profiles)) {
+                    setSpeakerProfiles(metadata.speaker_profiles);
+                }
+                if (metadata.speaker_overrides !== undefined) {
+                    if (metadata.speaker_overrides && typeof metadata.speaker_overrides === 'object') {
+                        setSpeakerOverrides(metadata.speaker_overrides);
+                    } else {
+                        setSpeakerOverrides({});
+                    }
+                    speakerOverridesDirty = false;
+                }
+                renderSpeakerAssignments();
             }
 
             function syncSegmentRulesFromMetadata(rules) {
@@ -4756,6 +5517,7 @@ async def home():
                             generate,
                             source_text: sourceText,
                             translated_text: translatedText,
+                            speaker: card.dataset.speaker || null,
                         });
                     });
 
@@ -4777,6 +5539,9 @@ async def home():
                         if (!Number.isNaN(volumeValue)) {
                             payload.generated_volume_percent = volumeValue;
                         }
+                    }
+                    if (speakerOverridesDirty) {
+                        payload.speaker_overrides = buildSpeakerOverridesPayload();
                     }
 
                     try {
@@ -5915,6 +6680,8 @@ async def api_translate_segments(
                     )
 
                     metadata = segment_result.metadata
+                    if segment_result.gemini_raw_text is not None:
+                        metadata["gemini_raw_text"] = segment_result.gemini_raw_text
                     if reuse_source_session is not None:
                         metadata["reuse_source_session_id"] = reuse_session_id_value
 
@@ -6044,6 +6811,21 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                     final_segments: List[Dict[str, Any]] = []
                     sanitized_segments: List[Dict[str, Any]] = []
 
+                    if payload.speaker_overrides is not None:
+                        raw_override_input = {
+                            key: value.dict(exclude_none=True)
+                            for key, value in payload.speaker_overrides.items()
+                        }
+                        normalized_overrides = _normalize_speaker_overrides(
+                            raw_override_input,
+                            session.speaker_profiles,
+                        )
+                        session.speaker_overrides = normalized_overrides
+                        await _update_translate_session_speaker_overrides(
+                            session.session_id,
+                            normalized_overrides,
+                        )
+
                     for seg_input in payload.segments:
                         start_ms = max(0, int(seg_input.start_ms))
                         end_ms = max(0, int(seg_input.end_ms))
@@ -6082,6 +6864,13 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                         }
 
                         base_info = base_segment_map.get(seg_input.index)
+                        speaker_label = None
+                        if base_info and base_info.get("speaker"):
+                            speaker_label = base_info["speaker"]
+                        elif seg_input.speaker:
+                            speaker_label = seg_input.speaker
+                        if speaker_label:
+                            segment_payload["speaker"] = speaker_label
                         if base_info and base_info.get("text_keys"):
                             segment_payload["text_keys"] = base_info["text_keys"]
 
@@ -6100,6 +6889,8 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                         }
                         if base_info and base_info.get("text_keys"):
                             sanitized_segment["text_keys"] = base_info["text_keys"]
+                        if speaker_label:
+                            sanitized_segment["speaker"] = speaker_label
                         sanitized_segments.append(sanitized_segment)
 
                     final_segments.sort(key=lambda seg: (int(seg.get("start_ms", 0)), int(seg.get("index", 0))))
@@ -6123,11 +6914,15 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                         merge_with_backing=merge_with_backing,
                         preserve_silence_audio=session.preserve_silence_audio,
                         generated_volume_percent=volume_percent,
+                        speaker_overrides=session.speaker_overrides,
                     )
 
                     metadata.setdefault("backing_track", {})["requested"] = session.merge_with_backing
                     metadata["ignore_non_speech"] = session.ignore_non_speech
                     metadata["preserve_silence_audio"] = session.preserve_silence_audio
+                    metadata["speaker_overrides"] = copy.deepcopy(session.speaker_overrides)
+                    if session.gemini_raw_text is not None:
+                        metadata["gemini_raw_text"] = session.gemini_raw_text
                     generated_count = sum(
                         1 for seg in final_segments if seg.get("type") == "speech" and not seg.get("keep_original", False)
                     )
@@ -6603,6 +7398,12 @@ async def api_translate_audio(
                     metadata["preserve_silence_audio"] = preserve_silence_audio_flag
                     metadata["generated_volume_percent"] = generated_volume_percent_value
                     metadata["gemini_raw_segments"] = segment_result.gemini_chunks
+                    if segment_result.gemini_raw_text is not None:
+                        metadata["gemini_raw_text"] = segment_result.gemini_raw_text
+                    if session is not None:
+                        metadata["speaker_overrides"] = copy.deepcopy(session.speaker_overrides)
+                    else:
+                        metadata["speaker_overrides"] = {}
                     metadata.setdefault("backing_track", {}).update(
                         {
                             "requested": requested_merge_backing,
@@ -6881,15 +7682,23 @@ async def audio_roles():
         print("📋 API: Listing audio roles")
         
         if not speaker_api:
-            return JSONResponse(content={"success": False, "roles": []})
+            return JSONResponse(content={"success": False, "roles": [], "speakers": {}})
         
         speakers_data = await speaker_api.list_speakers()
         
         if speakers_data["status"] == "success":
-            roles = list(speakers_data["speakers"].keys())
-            return JSONResponse(content={"success": True, "roles": roles})
+            speakers = speakers_data.get("speakers", {})
+            roles = list(speakers.keys())
+            return JSONResponse(
+                content={
+                    "success": True,
+                    "roles": roles,
+                    "speakers": speakers,
+                    "total_speakers": speakers_data.get("total_speakers", len(roles)),
+                }
+            )
         else:
-            return JSONResponse(content={"success": False, "roles": []})
+            return JSONResponse(content={"success": False, "roles": [], "speakers": {}})
             
     except Exception as e:
         error_msg = f"Failed to list audio roles: {str(e)}"
@@ -6898,6 +7707,21 @@ async def audio_roles():
             status_code=500,
             content={"success": False, "error": error_msg}
         )
+
+
+@app.get("/api/speaker_preview/{speaker_name}")
+async def api_speaker_preview(speaker_name: str):
+    """API: Return stored MP3 preview for a speaker."""
+    preview_path = _get_speaker_preview_path(speaker_name)
+    if not preview_path.exists():
+        raise HTTPException(status_code=404, detail="Speaker preview not found")
+    return FileResponse(
+        preview_path,
+        media_type="audio/mpeg",
+        filename=f"{speaker_name}_preview.mp3",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
 
 @app.post("/speak")
 async def speak(req: SpeakRequest):
