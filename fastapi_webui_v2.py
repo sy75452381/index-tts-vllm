@@ -175,11 +175,17 @@ def _normalize_gemini_model_name(gemini_model_value: Optional[str]) -> str:
     return sanitized or _get_gemini_model_name()
 
 
-def _coerce_merge_backing_flag(requested: bool, apply_enhancement: bool) -> bool:
-    if requested and not apply_enhancement:
-        print("⚠️ Merge-back requested without MossFormer2_SE_48K enhancement; ignoring request.")
+def _coerce_merge_backing_flag(
+    requested: bool,
+    apply_enhancement: bool,
+    alternate_backing_available: bool = False,
+) -> bool:
+    if not requested:
         return False
-    return requested
+    if apply_enhancement or alternate_backing_available:
+        return True
+    print("⚠️ Merge-back requested without MossFormer2_SE_48K enhancement or custom/reused backing; ignoring request.")
+    return False
 
 
 def _resolve_final_prompt(
@@ -347,8 +353,47 @@ async def _prepare_audio_assets(
     apply_enhancement: bool,
     apply_super_resolution: bool,
     requested_merge_backing: bool,
+    custom_backing_audio_file: Optional[UploadFile] = None,
+    custom_backing_audio_reference: Optional[str] = None,
+    custom_backing_mime_type_value: Optional[str] = None,
     emit_status: Optional[Callable[..., Awaitable[None]]] = None,
-) -> Tuple[AudioSegment, str, bytes, str, Optional[AudioSegment], bool]:
+) -> Tuple[AudioSegment, str, bytes, str, Optional[AudioSegment], bool, str]:
+    custom_backing_audio: Optional[AudioSegment] = None
+    backing_track_source = "none"
+    custom_backing_ref = (custom_backing_audio_reference or "").strip()
+    custom_backing_requested = bool(custom_backing_audio_file) or bool(custom_backing_ref)
+    if custom_backing_requested:
+        if emit_status:
+            await emit_status(stage="backing", message="Loading custom backing track...")
+        custom_audio_io = await load_audio_bytes_from_request(custom_backing_audio_file, custom_backing_audio_reference)
+        if custom_audio_io is None:
+            raise TranslateWorkflowHttpError(
+                400,
+                {"status": "error", "message": "Custom backing track not provided."},
+            )
+        custom_audio_bytes = custom_audio_io.read()
+        if not custom_audio_bytes:
+            raise TranslateWorkflowHttpError(
+                400,
+                {"status": "error", "message": "Custom backing track data is empty."},
+            )
+        custom_mime_type = (
+            custom_backing_mime_type_value
+            or (custom_backing_audio_file.content_type if custom_backing_audio_file else None)
+            or "audio/wav"
+        )
+        custom_audio_format = _guess_audio_format_from_mime(custom_mime_type)
+        try:
+            custom_backing_audio = await _decode_audio_segment(custom_audio_bytes, custom_audio_format)
+        except Exception as exc:
+            raise TranslateWorkflowHttpError(
+                400,
+                {"status": "error", "message": f"Failed to decode custom backing track: {str(exc)}"},
+            ) from exc
+        backing_track_source = "custom"
+        if emit_status:
+            await emit_status(stage="backing", message="Custom backing track loaded.")
+
     if reuse_source_session is not None:
         original_audio = reuse_source_session.original_audio
         if original_audio is None:
@@ -370,7 +415,13 @@ async def _prepare_audio_assets(
             fmt="mp3",
             bitrate=GEMINI_AUDIO_EXPORT_BITRATE,
         )
-        backing_track_audio = reuse_source_session.backing_track_audio
+        backing_track_audio = custom_backing_audio or reuse_source_session.backing_track_audio
+        if custom_backing_audio is not None:
+            backing_track_source = "custom"
+        elif reuse_source_session.backing_track_audio is not None:
+            backing_track_source = reuse_source_session.backing_track_source or "reuse"
+        else:
+            backing_track_source = "none"
         merge_with_backing = requested_merge_backing and backing_track_audio is not None
         if requested_merge_backing and backing_track_audio is None:
             print("⚠️ Unable to merge with backing track because no instrumental was derived.")
@@ -381,6 +432,7 @@ async def _prepare_audio_assets(
             "audio/mpeg",
             backing_track_audio,
             merge_with_backing,
+            backing_track_source,
         )
 
     if preloaded_audio_bytes is not None:
@@ -425,6 +477,11 @@ async def _prepare_audio_assets(
         pre_clearvoice_mix_audio=pre_clearvoice_mix_audio,
         emit_status=emit_status,
     )
+    if backing_track_audio is not None:
+        backing_track_source = "extracted"
+    if custom_backing_audio is not None:
+        backing_track_audio = custom_backing_audio
+        backing_track_source = "custom"
 
     processed_audio_bytes = await _export_audio_segment_bytes(
         processed_audio,
@@ -459,6 +516,7 @@ async def _prepare_audio_assets(
         "audio/mpeg",
         backing_track_audio,
         merge_with_backing,
+        backing_track_source,
     )
 
 
@@ -490,7 +548,9 @@ async def _build_translation_segments(
     ignore_non_speech_flag: bool,
     preserve_silence_audio_flag: bool,
     generated_volume_percent_value: float,
+    backing_volume_percent_value: float,
     backing_track_audio: Optional[AudioSegment],
+    backing_track_source: str,
     merge_with_backing: bool,
     segments_override_value: Optional[str],
     min_speech_duration: int,
@@ -584,8 +644,10 @@ async def _build_translation_segments(
         ignore_non_speech=ignore_non_speech_flag,
         preserve_silence_audio=preserve_silence_audio_flag,
         generated_volume_percent=generated_volume_percent_value,
+        backing_volume_percent=backing_volume_percent_value,
         speaker_profiles=speaker_profiles,
         gemini_raw_text=raw_gemini_response_text,
+        backing_track_source=backing_track_source,
     )
     ui_segments = _serialize_segments_for_ui(segments, original_audio)
 
@@ -603,6 +665,7 @@ async def _build_translation_segments(
         "ignore_non_speech": ignore_non_speech_flag,
         "preserve_silence_audio": preserve_silence_audio_flag,
         "generated_volume_percent": generated_volume_percent_value,
+        "backing_volume_percent": backing_volume_percent_value,
         "gemini_raw_segments": gemini_chunks,
         "speaker_profiles": copy.deepcopy(speaker_profiles),
         "speaker_overrides": copy.deepcopy(getattr(session, "speaker_overrides", {})),
@@ -618,6 +681,8 @@ async def _build_translation_segments(
             "preview_url": f"/api/translate_backing_track/{session.session_id}"
             if backing_track_audio is not None
             else None,
+            "volume_percent": backing_volume_percent_value,
+            "source": backing_track_source,
         },
         "segment_rules": {
             "min_speech_ms": min_speech_duration,
@@ -632,6 +697,7 @@ async def _build_translation_segments(
         "vocals_url": f"/api/translate_vocals/{session.session_id}",
         "backing_available": backing_track_audio is not None,
         "backing_url": metadata["backing_track"]["preview_url"] if backing_track_audio is not None else None,
+        "backing_source": backing_track_source,
         "session_id": session.session_id,
     }
     metadata["separation"] = separation_info
@@ -664,10 +730,12 @@ class TranslateSessionData:
     gemini_model: str
     gemini_api_key: Optional[str]
     backing_track_audio: Optional[AudioSegment] = None
+    backing_track_source: str = "none"
     merge_with_backing: bool = False
     ignore_non_speech: bool = False
     preserve_silence_audio: bool = False
     generated_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT
+    backing_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT
     speaker_profiles: List[Dict[str, Any]] = field(default_factory=list)
     speaker_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     gemini_raw_text: Optional[str] = None
@@ -1345,14 +1413,24 @@ def _normalize_speaker_overrides(
         if not isinstance(value, dict):
             continue
         preset_name = str(value.get("preset_name") or "").strip()
-        if not preset_name:
+        volume_value = value.get("volume_percent")
+        has_volume_override = volume_value is not None
+        if not preset_name and not has_volume_override:
             continue
-        emotion_weight = _coerce_emotion_weight(value.get("emotion_weight"), DEFAULT_EMOTION_WEIGHT)
-        normalized[speaker_id] = {
-            "preset_name": preset_name,
-            "use_emotion_prompt": bool(value.get("use_emotion_prompt")),
-            "emotion_weight": emotion_weight,
-        }
+        entry: Dict[str, Any] = {}
+        if preset_name:
+            entry["preset_name"] = preset_name
+            entry["use_emotion_prompt"] = bool(value.get("use_emotion_prompt"))
+            entry["emotion_weight"] = _coerce_emotion_weight(
+                value.get("emotion_weight"),
+                DEFAULT_EMOTION_WEIGHT,
+            )
+        if has_volume_override:
+            entry["volume_percent"] = _coerce_volume_percent(
+                volume_value,
+                DEFAULT_GENERATED_VOLUME_PERCENT,
+            )
+        normalized[speaker_id] = entry
     return normalized
 
 
@@ -1864,6 +1942,8 @@ def _serialize_segments_for_ui(
             "translated_text": segment.get("translated_text", ""),
             "text_keys": segment.get("text_keys", {}),
             "speaker": segment.get("speaker"),
+            "volume_percent": segment.get("volume_percent"),
+            "emotion_weight": segment.get("emotion_weight"),
         }
         if seg_type == "speech":
             base_payload["generate"] = True
@@ -1902,10 +1982,12 @@ async def _create_translate_session(
     gemini_model: str,
     gemini_api_key: Optional[str],
     backing_track_audio: Optional[AudioSegment] = None,
+    backing_track_source: str = "none",
     merge_with_backing: bool = False,
     ignore_non_speech: bool = False,
     preserve_silence_audio: bool = False,
     generated_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT,
+    backing_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT,
     speaker_profiles: Optional[List[Dict[str, Any]]] = None,
     speaker_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     gemini_raw_text: Optional[str] = None,
@@ -1926,10 +2008,12 @@ async def _create_translate_session(
         gemini_model=gemini_model,
         gemini_api_key=gemini_api_key,
         backing_track_audio=backing_track_audio,
+        backing_track_source=backing_track_source or "none",
         merge_with_backing=merge_with_backing,
         ignore_non_speech=ignore_non_speech,
         preserve_silence_audio=preserve_silence_audio,
         generated_volume_percent=generated_volume_percent,
+        backing_volume_percent=backing_volume_percent,
         speaker_profiles=copy.deepcopy(speaker_profiles or []),
         speaker_overrides=copy.deepcopy(speaker_overrides or {}),
         gemini_raw_text=gemini_raw_text,
@@ -1976,6 +2060,7 @@ async def _update_translate_session_metadata(
     bitrate: Optional[str] = None,
     gemini_model: Optional[str] = None,
     generated_volume_percent: Optional[float] = None,
+    backing_volume_percent: Optional[float] = None,
 ) -> None:
     async with ADVANCED_TRANSLATE_SESSION_LOCK:
         session = ADVANCED_TRANSLATE_SESSIONS.get(session_id)
@@ -1988,6 +2073,8 @@ async def _update_translate_session_metadata(
                 session.gemini_model = gemini_model
             if generated_volume_percent is not None:
                 session.generated_volume_percent = generated_volume_percent
+        if backing_volume_percent is not None:
+            session.backing_volume_percent = backing_volume_percent
             session.created_at = time.time()
 
 
@@ -2202,6 +2289,9 @@ def _match_segment_duration(
     frame_rate: int,
     sample_width: int,
     channels: int,
+    *,
+    loop_fill: bool = False,
+    allow_trim: bool = False,
 ) -> AudioSegment:
     target_ms = max(0, int(target_ms))
     segment = segment.set_frame_rate(frame_rate)
@@ -2215,10 +2305,21 @@ def _match_segment_duration(
     tolerance_ms = 100
     diff = target_ms - current_ms
     if diff > 0:
+        if loop_fill and current_ms > 0:
+            filler = AudioSegment.silent(duration=0, frame_rate=frame_rate)
+            filler = filler.set_sample_width(sample_width).set_channels(channels)
+            extended = filler
+            while len(extended) < target_ms:
+                extended += segment
+            if len(extended) > target_ms:
+                extended = extended[:target_ms]
+            return extended
         if diff <= tolerance_ms:
             return segment + _create_silence_segment(diff, frame_rate, sample_width, channels)
         return segment + _create_silence_segment(diff, frame_rate, sample_width, channels)
-    # Never trim segments; return original even if longer than target.
+    if diff < 0 and allow_trim and target_ms >= 0:
+        return segment[:target_ms]
+    # Never trim segments by default; return original even if longer than target.
     return segment
 
 
@@ -2289,10 +2390,13 @@ async def _synthesize_translated_audio(
     input_mime_type: Optional[str] = None,
     clearvoice_settings: Optional[Dict[str, bool]] = None,
     backing_track_audio: Optional[AudioSegment] = None,
+    backing_track_source: str = "none",
     merge_with_backing: bool = False,
     preserve_silence_audio: bool = False,
     generated_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT,
     speaker_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    backing_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT,
+    pad_to_original: bool = True,
 ) -> Tuple[bytes, str, Dict[str, Any]]:
     tts = tts_manager.get_tts()
     frame_rate = int(original_audio.frame_rate or 22050)
@@ -2345,16 +2449,52 @@ async def _synthesize_translated_audio(
         override_config = override_map.get(speaker_label) if speaker_label else None
         preset_name = None
         use_emotion_prompt = False
-        emotion_weight = DEFAULT_EMOTION_WEIGHT
+        speaker_emotion_weight = DEFAULT_EMOTION_WEIGHT
+        speaker_volume_percent: Optional[float] = None
+        if override_config:
+            raw_volume = override_config.get("volume_percent")
+            if raw_volume is not None:
+                speaker_volume_percent = _coerce_volume_percent(
+                    raw_volume,
+                    DEFAULT_GENERATED_VOLUME_PERCENT,
+                )
         if override_config:
             preset_candidate = override_config.get("preset_name")
             if isinstance(preset_candidate, str) and preset_candidate.strip():
                 preset_name = preset_candidate.strip()
                 use_emotion_prompt = bool(override_config.get("use_emotion_prompt"))
-                emotion_weight = _coerce_emotion_weight(
+                speaker_emotion_weight = _coerce_emotion_weight(
                     override_config.get("emotion_weight"),
                     DEFAULT_EMOTION_WEIGHT,
                 )
+        segment_volume_percent: Optional[float] = None
+        raw_segment_volume = segment.get("volume_percent")
+        if raw_segment_volume is not None:
+            segment_volume_percent = _coerce_volume_percent(
+                raw_segment_volume,
+                DEFAULT_GENERATED_VOLUME_PERCENT,
+            )
+        segment_emotion_weight: Optional[float] = None
+        raw_segment_emotion = segment.get("emotion_weight")
+        if raw_segment_emotion is not None:
+            segment_emotion_weight = _coerce_emotion_weight(
+                raw_segment_emotion,
+                DEFAULT_EMOTION_WEIGHT,
+            )
+        resolved_emotion_weight = (
+            segment_emotion_weight
+            if segment_emotion_weight is not None
+            else speaker_emotion_weight
+        )
+        resolved_volume_percent = (
+            segment_volume_percent
+            if segment_volume_percent is not None
+            else (
+                speaker_volume_percent
+                if speaker_volume_percent is not None
+                else generated_volume_percent
+            )
+        )
 
         if keep_original:
             audio_seg = _match_segment_duration(chunk_audio, duration_ms, frame_rate, sample_width, channels)
@@ -2405,11 +2545,11 @@ async def _synthesize_translated_audio(
                     verbose=cmd_args.verbose,
                     speaker_preset=preset_name,
                     emo_audio_prompt=emo_prompt_value,
-                    emo_alpha=emotion_weight,
+                    emo_alpha=resolved_emotion_weight,
                 )
             generated_audio = AudioSegment.from_file(inference_path)
-            if abs(generated_volume_percent - DEFAULT_GENERATED_VOLUME_PERCENT) >= 0.01:
-                generated_audio = _apply_volume_with_ffmpeg(generated_audio, generated_volume_percent)
+            if abs(resolved_volume_percent - DEFAULT_GENERATED_VOLUME_PERCENT) >= 0.01:
+                generated_audio = _apply_volume_with_ffmpeg(generated_audio, resolved_volume_percent)
             generated_audio = _match_segment_duration(generated_audio, duration_ms, frame_rate, sample_width, channels)
         except Exception as exc:
             status = "error"
@@ -2441,7 +2581,9 @@ async def _synthesize_translated_audio(
         if preset_name:
             log_entry["speaker_preset"] = preset_name
             log_entry["emotion_prompt"] = use_emotion_prompt
-            log_entry["emotion_weight"] = emotion_weight
+            log_entry["emotion_weight"] = resolved_emotion_weight
+        if speaker_volume_percent is not None or segment_volume_percent is not None:
+            log_entry["volume_percent"] = resolved_volume_percent
         if status == "error" and error_message:
             log_entry["error"] = error_message
 
@@ -2457,8 +2599,9 @@ async def _synthesize_translated_audio(
 
     original_duration_ms = len(original_audio)
     final_duration_ms = len(combined_audio)
-    if final_duration_ms < original_duration_ms:
+    if pad_to_original and final_duration_ms < original_duration_ms:
         combined_audio += _create_silence_segment(original_duration_ms - final_duration_ms, frame_rate, sample_width, channels)
+        final_duration_ms = len(combined_audio)
 
     backing_applied = False
     if merge_with_backing and backing_track_audio is not None:
@@ -2468,13 +2611,23 @@ async def _synthesize_translated_audio(
                 .set_sample_width(sample_width)
                 .set_channels(channels)
             )
+            if abs(backing_volume_percent - DEFAULT_GENERATED_VOLUME_PERCENT) >= 0.01:
+                volume_factor = max(backing_volume_percent, MIN_GENERATED_VOLUME_PERCENT) / 100.0
+                gain_db = 20 * math.log10(volume_factor) if volume_factor > 0 else -120.0
+                prepared_backing = prepared_backing.apply_gain(gain_db)
             prepared_backing = _match_segment_duration(
                 prepared_backing,
                 len(combined_audio),
                 frame_rate,
                 sample_width,
                 channels,
+                loop_fill=backing_track_source == "custom",
+                allow_trim=backing_track_source == "custom",
             )
+            if backing_track_source == "custom":
+                fade_duration = min(2000, len(prepared_backing))
+                if fade_duration > 0:
+                    prepared_backing = prepared_backing.fade_out(fade_duration)
             combined_audio = prepared_backing.overlay(combined_audio)
             backing_applied = True
         except Exception as merge_error:
@@ -2507,6 +2660,8 @@ async def _synthesize_translated_audio(
         "original_duration_ms": original_duration_ms,
         "generated_duration_ms": len(combined_audio),
         "generation_log": generation_log,
+        "padded_to_original": pad_to_original,
+        "backing_volume_percent": backing_volume_percent,
     }
     if input_mime_type:
         metadata["input_mime_type"] = input_mime_type
@@ -2515,6 +2670,8 @@ async def _synthesize_translated_audio(
     metadata["backing_track"] = {
         "available": backing_track_audio is not None,
         "merged": backing_applied,
+        "volume_percent": backing_volume_percent,
+        "source": backing_track_source,
     }
     metadata["preserve_silence_audio"] = preserve_silence_audio
     metadata["generated_volume_percent"] = generated_volume_percent
@@ -2916,6 +3073,14 @@ class TranslateRequest(BaseModel):
     dest_language: str = Field(..., description="Target language for translation, e.g., 'English'.")
     audio_mime_type: Optional[str] = Field(default=None, description="MIME type of the audio, e.g., 'audio/wav'.")
     prompt: Optional[str] = Field(default=None, description="Optional custom prompt for Gemini.")
+    custom_backing_audio: Optional[str] = Field(
+        default=None,
+        description="Optional base64 or URL reference for a custom backing track to mix instead of the extracted instrumental.",
+    )
+    custom_backing_audio_mime_type: Optional[str] = Field(
+        default=None,
+        description="MIME type for the custom backing track (e.g., 'audio/mp3').",
+    )
     response_format: Optional[Literal["mp3", "wav", "flac", "aac", "opus", "ogg", "webm"]] = Field(
         default=None, description="Desired audio format for the translated output."
     )
@@ -2967,6 +3132,10 @@ class TranslateRequest(BaseModel):
         default=None,
         description="Adjust regenerated speech loudness before merging (percentage, default 100%).",
     )
+    backing_volume_percent: Optional[float] = Field(
+        default=None,
+        description="Adjust backing track loudness when merging (percentage, default 100%).",
+    )
 
 
 class SpeakerOverrideInput(BaseModel):
@@ -2982,6 +3151,12 @@ class SpeakerOverrideInput(BaseModel):
         default=DEFAULT_EMOTION_WEIGHT,
         description="Emotion control weight (0.0 - 1.0) when using the original emotion prompt.",
     )
+    volume_percent: Optional[float] = Field(
+        default=None,
+        ge=MIN_GENERATED_VOLUME_PERCENT,
+        le=MAX_GENERATED_VOLUME_PERCENT,
+        description="Override regenerated speech loudness for this speaker (percentage).",
+    )
 
 
 class TranslateSegmentInput(BaseModel):
@@ -2993,6 +3168,39 @@ class TranslateSegmentInput(BaseModel):
     source_text: Optional[str] = ""
     generate: Optional[bool] = True
     speaker: Optional[str] = Field(default=None, description="Detected speaker label")
+    volume_percent: Optional[float] = Field(
+        default=None,
+        ge=MIN_GENERATED_VOLUME_PERCENT,
+        le=MAX_GENERATED_VOLUME_PERCENT,
+        description="Override regenerated speech loudness for this segment (percentage).",
+    )
+    emotion_weight: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Override emotion prompt weight for this segment (0.0-1.0).",
+    )
+
+
+class SegmentPreviewRequest(BaseModel):
+    session_id: str = Field(..., description="Active translate session identifier.")
+    segment: TranslateSegmentInput = Field(..., description="Segment payload to preview.")
+    generated_volume_percent: Optional[float] = Field(
+        default=None,
+        ge=MIN_GENERATED_VOLUME_PERCENT,
+        le=MAX_GENERATED_VOLUME_PERCENT,
+        description="Override the global regenerated volume percent for this preview.",
+    )
+    backing_volume_percent: Optional[float] = Field(
+        default=None,
+        ge=MIN_GENERATED_VOLUME_PERCENT,
+        le=MAX_GENERATED_VOLUME_PERCENT,
+        description="Override backing track volume percent for this preview.",
+    )
+    speaker_overrides: Optional[Dict[str, SpeakerOverrideInput]] = Field(
+        default=None,
+        description="Optional speaker overrides to apply only for this preview request.",
+    )
 
 
 class TranslateGenerateRequest(BaseModel):
@@ -3009,6 +3217,10 @@ class TranslateGenerateRequest(BaseModel):
     generated_volume_percent: Optional[float] = Field(
         default=None,
         description="Override regenerated speech loudness before merging (percentage, default 100%).",
+    )
+    backing_volume_percent: Optional[float] = Field(
+        default=None,
+        description="Override backing-track loudness before merging (percentage, default 100%).",
     )
     speaker_overrides: Optional[Dict[str, SpeakerOverrideInput]] = Field(
         default=None,
@@ -3808,6 +4020,23 @@ async def home():
                                 </small>
                             </div>
                             <div class="form-group">
+                                <label for="translateBackingVolumePercent">Backing Track Volume (%)</label>
+                                <input type="number" id="translateBackingVolumePercent" min="10" max="300" step="5" value="100" placeholder="Default 100%">
+                                <small style="color: #666; margin-top: 5px; display: block;">
+                                    Controls the loudness of the instrumental backing when mix-back is enabled. Lower values keep vocals more forward.
+                                </small>
+                            </div>
+                            <div class="form-group">
+                                <label for="translateCustomBackingFile">Custom Backing Track (optional)</label>
+                                <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
+                                    <input type="file" id="translateCustomBackingFile" name="custom_backing_audio_file" accept=".wav,.mp3,.m4a,.flac,.aac,.ogg,.opus" style="flex: 1 1 auto;">
+                                    <button type="button" class="btn btn-secondary" id="translateCustomBackingClear" style="flex: 0 0 auto;">Clear</button>
+                                </div>
+                                <small id="translateCustomBackingSummary" style="color: #666; margin-top: 5px; display: block;">
+                                    No custom backing selected. Upload audio here to override the extracted instrumental when mix-back is enabled.
+                                </small>
+                            </div>
+                            <div class="form-group">
                                 <label style="display: flex; align-items: center; gap: 10px;">
                                     <input type="checkbox" id="translateIgnoreNonSpeech">
                                     <span>Ask Gemini to ignore non-speech (laughs, shouts, crowd noise)</span>
@@ -3992,8 +4221,8 @@ async def home():
                         <ul style="margin-left: 20px; line-height: 1.6;">
                             <li><strong>POST /api/translate_audio</strong> - Translate speech audio and regenerate voice in the target language while preserving timing.
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
-                                    <li>Multipart form fields: <code>audio_file</code> (file), <code>dest_language</code> (string); optional <code>response_format</code> (mp3/wav/flac/aac/opus/ogg/webm), <code>prompt</code> (custom Gemini instructions), <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) to run ClearVoice preprocessing, <code>merge_backing_track</code> (bool) to blend the result with the extracted instrumental backing, plus <code>min_speech_ms</code>/<code>max_merge_ms</code> to override segment-merging heuristics (set <code>max_merge_ms</code> to 0 to keep Gemini's original segmentation) and <code>segments_json</code> to supply pre-generated Gemini-like segments.</li>
-                                    <li>JSON alternative: <code>{"audio": "&lt;base64&gt;", "dest_language": "English", "audio_mime_type": "audio/wav", "response_format": "mp3", "enhance_voice": true, "super_resolution_voice": false, "merge_backing_track": true, "segments_json": "[...]","min_speech_ms": 3000, "max_merge_ms": 0}</code></li>
+                                    <li>Multipart form fields: <code>audio_file</code> (file), <code>dest_language</code> (string); optional <code>response_format</code> (mp3/wav/flac/aac/opus/ogg/webm), <code>prompt</code> (custom Gemini instructions), <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) to run ClearVoice preprocessing, <code>merge_backing_track</code> (bool) to blend the result with the extracted instrumental backing, <code>custom_backing_audio_file</code> (file) to override the instrumental even without enhancement, plus <code>min_speech_ms</code>/<code>max_merge_ms</code> to override segment-merging heuristics (set <code>max_merge_ms</code> to 0 to keep Gemini's original segmentation) and <code>segments_json</code> to supply pre-generated Gemini-like segments.</li>
+                                    <li>JSON alternative: <code>{"audio": "&lt;base64&gt;", "dest_language": "English", "audio_mime_type": "audio/wav", "custom_backing_audio": "&lt;base64 or url&gt;", "custom_backing_audio_mime_type": "audio/mp3", "response_format": "mp3", "enhance_voice": true, "super_resolution_voice": false, "merge_backing_track": true, "segments_json": "[...]", "min_speech_ms": 3000, "max_merge_ms": 0}</code></li>
                                     <li>Response: Audio stream. Inspect headers like <code>X-Translation-Model</code> and <code>X-Translation-Segments</code> for run metadata.</li>
                                 </ul>
                             </li>
@@ -4528,6 +4757,9 @@ async def home():
             const translateEnhanceEl = document.getElementById('translateEnhancement');
             const translateSuperEl = document.getElementById('translateSuperResolution');
             const translateMergeBackEl = document.getElementById('translateMergeBack');
+            const translateCustomBackingInput = document.getElementById('translateCustomBackingFile');
+            const translateCustomBackingClearBtn = document.getElementById('translateCustomBackingClear');
+            const translateCustomBackingSummary = document.getElementById('translateCustomBackingSummary');
             const translateIgnoreNonSpeechEl = document.getElementById('translateIgnoreNonSpeech');
             const translatePreserveSilenceEl = document.getElementById('translatePreserveSilence');
             const translateSeparationPreview = document.getElementById('translateSeparationPreview');
@@ -4540,7 +4772,11 @@ async def home():
             const translatePromptTranscription = document.getElementById('translatePromptTranscription');
             const translatePromptTemplates = document.getElementById('translatePromptTemplates');
             const DEFAULT_EMOTION_WEIGHT = 0.6;
+            const DEFAULT_VOLUME_PERCENT = 100;
+            const MIN_VOLUME_PERCENT = 10;
+            const MAX_VOLUME_PERCENT = 300;
             const translateVolumeInput = document.getElementById('translateVolumePercent');
+            const translateBackingVolumeInput = document.getElementById('translateBackingVolumePercent');
             const translateSpeakerAssignments = document.getElementById('translateSpeakerAssignments');
             let currentTranslateSessionId = null;
             let currentTranslateSegments = [];
@@ -4550,6 +4786,7 @@ async def home():
             let speakerOverridesDirty = false;
             let availableSpeakerPresets = [];
             let speakerPresetMeta = {};
+            let translateBackingAvailableFromSession = false;
             let promptTemplates = {
                 translation: '',
                 transcription: '',
@@ -4569,6 +4806,31 @@ async def home():
                 return `${String(minutes).padStart(2, '0')}:${secondsStr}`;
             }
 
+            function hasCustomBackingSelection() {
+                if (!translateCustomBackingInput || !translateCustomBackingInput.files) {
+                    return false;
+                }
+                return translateCustomBackingInput.files.length > 0;
+            }
+
+            function updateCustomBackingSummary() {
+                if (!translateCustomBackingSummary) {
+                    return;
+                }
+                if (hasCustomBackingSelection()) {
+                    const file = translateCustomBackingInput.files[0];
+                    translateCustomBackingSummary.textContent = `Selected: ${file ? file.name : ''}`;
+                    translateCustomBackingSummary.style.color = '#0a7c4a';
+                } else if (translateBackingAvailableFromSession) {
+                    translateCustomBackingSummary.textContent = 'Using stored backing track from current session.';
+                    translateCustomBackingSummary.style.color = '#0a7c4a';
+                } else {
+                    translateCustomBackingSummary.textContent =
+                        'No custom backing selected. Upload audio here to override the extracted instrumental when mix-back is enabled.';
+                    translateCustomBackingSummary.style.color = '#666';
+                }
+            }
+
             function setTranslateButtonLabel() {
                 if (!translateBtn) return;
                 if (translateAdvancedToggle && translateAdvancedToggle.checked) {
@@ -4583,8 +4845,11 @@ async def home():
                     return;
                 }
                 const enhancementEnabled = translateEnhanceEl && translateEnhanceEl.checked;
-                translateMergeBackEl.disabled = !enhancementEnabled;
-                if (!enhancementEnabled) {
+                const customSelected = hasCustomBackingSelection();
+                const storedBacking = translateBackingAvailableFromSession;
+                const canEnableMerge = enhancementEnabled || customSelected || storedBacking;
+                translateMergeBackEl.disabled = !canEnableMerge;
+                if (!canEnableMerge) {
                     translateMergeBackEl.checked = false;
                 }
             }
@@ -4593,6 +4858,22 @@ async def home():
                 translateEnhanceEl.addEventListener('change', syncTranslateMergeBackState);
                 syncTranslateMergeBackState();
             }
+            if (translateCustomBackingInput) {
+                translateCustomBackingInput.addEventListener('change', () => {
+                    updateCustomBackingSummary();
+                    syncTranslateMergeBackState();
+                });
+            }
+            if (translateCustomBackingClearBtn) {
+                translateCustomBackingClearBtn.addEventListener('click', () => {
+                    if (translateCustomBackingInput) {
+                        translateCustomBackingInput.value = '';
+                    }
+                    updateCustomBackingSummary();
+                    syncTranslateMergeBackState();
+                });
+            }
+            updateCustomBackingSummary();
             if (translateDestLanguageSelect) {
                 translateDestLanguageSelect.addEventListener('change', refreshPromptTemplates);
             }
@@ -4632,11 +4913,16 @@ async def home():
                         formData.append('max_merge_ms', maxValue);
                     }
                 }
-                const volumeInput = document.getElementById('translateVolumePercent');
-                if (volumeInput) {
-                    const volumeValue = (volumeInput.value || '').trim();
+                if (translateVolumeInput) {
+                    const volumeValue = (translateVolumeInput.value || '').trim();
                     if (volumeValue) {
                         formData.append('generated_volume_percent', volumeValue);
+                    }
+                }
+                if (translateBackingVolumeInput) {
+                    const backingValue = (translateBackingVolumeInput.value || '').trim();
+                    if (backingValue) {
+                        formData.append('backing_volume_percent', backingValue);
                     }
                 }
             }
@@ -4754,6 +5040,9 @@ async def home():
                 if (translateSegmentsSelectAll) {
                     translateSegmentsSelectAll.checked = true;
                 }
+                translateBackingAvailableFromSession = false;
+                updateCustomBackingSummary();
+                syncTranslateMergeBackState();
             }
 
             function updateTranslateSegmentsSummary() {
@@ -4902,12 +5191,52 @@ async def home():
                         body.appendChild(translationGroup);
 
                         if (segment.audio_preview) {
+                            const audioWrapper = document.createElement('div');
+                            audioWrapper.className = 'segment-audio-original';
+                            audioWrapper.innerHTML = '<label>Original audio preview</label>';
                             const audioEl = document.createElement('audio');
                             audioEl.className = 'segment-audio';
                             audioEl.controls = true;
                             audioEl.src = segment.audio_preview;
-                            body.appendChild(audioEl);
+                            audioWrapper.appendChild(audioEl);
+                            body.appendChild(audioWrapper);
                         }
+
+                        const overridesWrapper = document.createElement('div');
+                        overridesWrapper.className = 'segment-override-grid';
+                        overridesWrapper.style.display = 'flex';
+                        overridesWrapper.style.flexWrap = 'wrap';
+                        overridesWrapper.style.gap = '12px';
+                        overridesWrapper.style.marginTop = '10px';
+                        const volumeValue =
+                            typeof segment.volume_percent === 'number' ? segment.volume_percent : '';
+                        const emotionValue =
+                            typeof segment.emotion_weight === 'number' ? segment.emotion_weight : '';
+                        overridesWrapper.innerHTML = `
+                            <div class="segment-override-item">
+                                <label>Segment Volume (%)</label>
+                                <input type="number" class="segment-volume" min="${MIN_VOLUME_PERCENT}" max="${MAX_VOLUME_PERCENT}" step="5" value="${volumeValue}">
+                                <small>Leave blank to inherit speaker/global.</small>
+                            </div>
+                            <div class="segment-override-item">
+                                <label>Emotion Weight (0-1)</label>
+                                <input type="number" class="segment-emotion" min="0" max="1" step="0.05" value="${emotionValue}">
+                                <small>Overrides speaker emotion intensity.</small>
+                            </div>
+                        `;
+                        body.appendChild(overridesWrapper);
+
+                        const previewControls = document.createElement('div');
+                        previewControls.className = 'segment-preview-controls';
+                        previewControls.style.marginTop = '12px';
+                        previewControls.innerHTML = `
+                            <button type="button" class="btn segment-preview-btn">⚡ Preview Segment</button>
+                            <small class="segment-preview-status"></small>
+                            <audio class="segment-preview-audio" controls style="width: 100%; display: none; margin-top: 8px;"></audio>
+                        `;
+                        body.appendChild(previewControls);
+                        const previewButton = previewControls.querySelector('.segment-preview-btn');
+                        previewButton.addEventListener('click', () => handleSegmentPreview(card, previewButton));
                     }
 
                     card.appendChild(body);
@@ -4917,6 +5246,180 @@ async def home():
                     translateSegmentsList.insertAdjacentHTML('beforeend', '<div class="segment-empty">No speech segments detected.</div>');
                 }
                 updateTranslateSegmentsSummary();
+            }
+
+            function readSegmentCardValues(card, options = {}) {
+                const { forceGenerate = false } = options;
+                if (!card) {
+                    throw new Error('Segment card not found.');
+                }
+                const index = parseInt(card.dataset.index, 10);
+                if (Number.isNaN(index)) {
+                    throw new Error('Segment metadata missing index.');
+                }
+                const type = card.dataset.type || 'speech';
+                const startInput = card.querySelector('.segment-start');
+                const endInput = card.querySelector('.segment-end');
+                const startMs = parseInt(startInput ? startInput.value : '0', 10);
+                const endMs = parseInt(endInput ? endInput.value : '0', 10);
+                if (Number.isNaN(startMs) || Number.isNaN(endMs)) {
+                    throw new Error(`Segment #${index}: invalid timing.`);
+                }
+                if (endMs <= startMs) {
+                    throw new Error(`Segment #${index}: end time must be greater than start time.`);
+                }
+                const durationMs = endMs - startMs;
+                const payload = {
+                    index,
+                    type,
+                    start_ms: startMs,
+                    end_ms: endMs,
+                    duration_ms: durationMs,
+                    start: formatTimestamp(startMs),
+                    end: formatTimestamp(endMs),
+                    source_text: '',
+                    translated_text: '',
+                    generate: false,
+                    keep_original: true,
+                    speaker: card.dataset.speaker || null,
+                };
+                if (type === 'speech') {
+                    const checkbox = card.querySelector('input.segment-generate');
+                    const shouldGenerate = forceGenerate ? true : checkbox ? checkbox.checked : true;
+                    payload.generate = shouldGenerate;
+                    payload.keep_original = !shouldGenerate;
+                    const sourceInput = card.querySelector('.segment-source');
+                    payload.source_text = sourceInput ? sourceInput.value : '';
+                    const translationInput = card.querySelector('.segment-translation');
+                    payload.translated_text = translationInput ? translationInput.value : '';
+                    const volumeInput = card.querySelector('.segment-volume');
+                    if (volumeInput) {
+                        const rawVolume = (volumeInput.value || '').trim();
+                        if (rawVolume) {
+                            const parsedVolume = parseFloat(rawVolume);
+                            if (Number.isNaN(parsedVolume)) {
+                                throw new Error(`Segment #${index}: invalid volume override.`);
+                            }
+                            payload.volume_percent = parsedVolume;
+                        }
+                    }
+                    const emotionInput = card.querySelector('.segment-emotion');
+                    if (emotionInput) {
+                        const rawEmotion = (emotionInput.value || '').trim();
+                        if (rawEmotion) {
+                            const parsedEmotion = parseFloat(rawEmotion);
+                            if (Number.isNaN(parsedEmotion)) {
+                                throw new Error(`Segment #${index}: invalid emotion weight.`);
+                            }
+                            payload.emotion_weight = parsedEmotion;
+                        }
+                    }
+                } else {
+                    payload.generate = false;
+                    payload.keep_original = true;
+                }
+                return payload;
+            }
+
+            async function handleSegmentPreview(card, triggerButton) {
+                if (!currentTranslateSessionId) {
+                    showStatus('Analyze audio first to enable previews.', 'error', 'translateSegmentsStatus');
+                    return;
+                }
+                if (!card) {
+                    return;
+                }
+                const statusEl = card.querySelector('.segment-preview-status');
+                const audioEl = card.querySelector('.segment-preview-audio');
+                try {
+                    const segmentPayload = readSegmentCardValues(card, { forceGenerate: true });
+                    if (segmentPayload.type !== 'speech') {
+                        if (statusEl) {
+                            statusEl.textContent = 'Only speech segments can be previewed.';
+                            statusEl.style.color = '#d93025';
+                        }
+                        return;
+                    }
+                    const requestPayload = {
+                        session_id: currentTranslateSessionId,
+                        segment: segmentPayload,
+                    };
+                    if (translateVolumeInput && translateVolumeInput.value) {
+                        const parsedVolume = parseFloat(translateVolumeInput.value);
+                        if (!Number.isNaN(parsedVolume)) {
+                            requestPayload.generated_volume_percent = parsedVolume;
+                        }
+                    }
+                    if (translateBackingVolumeInput && translateBackingVolumeInput.value) {
+                        const parsedBacking = parseFloat(translateBackingVolumeInput.value);
+                        if (!Number.isNaN(parsedBacking)) {
+                            requestPayload.backing_volume_percent = parsedBacking;
+                        }
+                    }
+                    if (speakerOverridesDirty) {
+                        requestPayload.speaker_overrides = buildSpeakerOverridesPayload();
+                    }
+                    if (triggerButton) {
+                        triggerButton.disabled = true;
+                    }
+                    if (statusEl) {
+                        statusEl.textContent = 'Generating preview...';
+                        statusEl.style.color = '#666';
+                    }
+                    const response = await fetch('/api/translate_segment_preview', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(requestPayload),
+                    });
+                    if (!response.ok) {
+                        let errorMessage = `Preview failed (${response.status})`;
+                        try {
+                            const errorData = await response.json();
+                            if (errorData && errorData.message) {
+                                errorMessage = errorData.message;
+                            }
+                        } catch (jsonError) {
+                            console.warn('Failed to parse preview error response', jsonError);
+                        }
+                        if (statusEl) {
+                            statusEl.textContent = errorMessage;
+                            statusEl.style.color = '#d93025';
+                        }
+                        showStatus(errorMessage, 'error', 'translateSegmentsStatus');
+                        return;
+                    }
+                    const data = await response.json();
+                    if (!data || !data.audio_preview) {
+                        const message = 'Preview failed: missing audio.';
+                        if (statusEl) {
+                            statusEl.textContent = message;
+                            statusEl.style.color = '#d93025';
+                        }
+                        showStatus(message, 'error', 'translateSegmentsStatus');
+                        return;
+                    }
+                    if (audioEl) {
+                        audioEl.src = data.audio_preview;
+                        audioEl.style.display = 'block';
+                        audioEl.load();
+                    }
+                    if (statusEl) {
+                        const label = data.media_type || 'audio';
+                        statusEl.textContent = `Preview ready (${label})`;
+                        statusEl.style.color = '#0a7c4a';
+                    }
+                } catch (error) {
+                    const message = error && error.message ? error.message : 'Preview failed.';
+                    if (statusEl) {
+                        statusEl.textContent = message;
+                        statusEl.style.color = '#d93025';
+                    }
+                    showStatus(message, 'error', 'translateSegmentsStatus');
+                } finally {
+                    if (triggerButton) {
+                        triggerButton.disabled = false;
+                    }
+                }
             }
 
             function renderSeparationPreview(sessionId, metadata) {
@@ -4934,9 +5437,17 @@ async def home():
                 let backingMarkup = '';
                 if (separationMeta.backing_available && separationMeta.backing_url) {
                     const backingUrl = `${separationMeta.backing_url}?session=${sessionId}&t=${cacheKey}`;
+                    let backingLabel = '🎼 Instrumental Backing';
+                    if (separationMeta.backing_source === 'custom') {
+                        backingLabel += ' (Custom)';
+                    } else if (separationMeta.backing_source === 'reuse') {
+                        backingLabel += ' (Reused)';
+                    } else if (separationMeta.backing_source === 'extracted') {
+                        backingLabel += ' (ClearVoice)';
+                    }
                     backingMarkup = `
                         <div style="margin-top: 12px;">
-                            <div class="segment-header" style="margin-bottom:4px;">🎼 Instrumental Backing</div>
+                            <div class="segment-header" style="margin-bottom:4px;">${backingLabel}</div>
                             <audio controls style="width: 100%;">
                                 <source src="${backingUrl}" type="audio/mpeg">
                             </audio>
@@ -4980,7 +5491,11 @@ async def home():
                             return;
                         }
                         const normalizedId = String(key || '').toLowerCase();
-                        translateSpeakerOverrides[normalizedId] = {
+                        const normalizedVolume =
+                            typeof value.volume_percent === 'number'
+                                ? Math.min(MAX_VOLUME_PERCENT, Math.max(MIN_VOLUME_PERCENT, value.volume_percent))
+                                : undefined;
+                        const overrideEntry = {
                             preset_name: value.preset_name || '',
                             use_emotion_prompt: Boolean(value.use_emotion_prompt),
                             emotion_weight:
@@ -4988,6 +5503,10 @@ async def home():
                                     ? Math.min(1, Math.max(0, value.emotion_weight))
                                     : DEFAULT_EMOTION_WEIGHT,
                         };
+                        if (normalizedVolume !== undefined) {
+                            overrideEntry.volume_percent = normalizedVolume;
+                        }
+                        translateSpeakerOverrides[normalizedId] = overrideEntry;
                     });
                 }
             }
@@ -5016,6 +5535,10 @@ async def home():
                         typeof override.emotion_weight === 'number'
                             ? override.emotion_weight
                             : DEFAULT_EMOTION_WEIGHT;
+                    const volumeValue =
+                        typeof override.volume_percent === 'number'
+                            ? override.volume_percent
+                            : '';
                     let optionsHtml = '<option value="">Auto (clone original voice)</option>';
                     availableSpeakerPresets.forEach(name => {
                         const safeName = String(name || '');
@@ -5046,6 +5569,13 @@ async def home():
                                         <input type="number" min="0" max="1" step="0.05" value="${weightValue}" class="speaker-emo-weight-input" data-speaker-id="${speakerId}" ${useEmotionPrompt ? '' : 'disabled'}>
                                     </label>
                                 </div>
+                                <div class="speaker-volume-settings">
+                                    <label class="speaker-volume-label">
+                                        <span>Volume (%)</span>
+                                        <input type="number" class="speaker-volume-input" data-speaker-id="${speakerId}" min="${MIN_VOLUME_PERCENT}" max="${MAX_VOLUME_PERCENT}" step="5" value="${volumeValue}">
+                                    </label>
+                                    <small>Leave blank to use global setting.</small>
+                                </div>
                             </div>
                             <div class="speaker-assignment-preview" data-speaker-id="${speakerId}">
                                 <small class="speaker-preview-message"></small>
@@ -5066,11 +5596,16 @@ async def home():
                     input.addEventListener('input', onSpeakerEmotionWeightChange);
                     input.addEventListener('change', onSpeakerEmotionWeightChange);
                 });
+                translateSpeakerAssignments.querySelectorAll('.speaker-volume-input').forEach(input => {
+                    input.addEventListener('input', onSpeakerVolumeChange);
+                    input.addEventListener('change', onSpeakerVolumeChange);
+                });
                 translateSpeakerProfiles.forEach((profile, idx) => {
                     const fallbackId = profile.id ? String(profile.id) : `speaker${idx + 1}`;
                     const speakerId = fallbackId.toLowerCase();
                     updateSpeakerPreviewForId(speakerId);
                     updateSpeakerEmotionWeightInput(speakerId);
+                    updateSpeakerVolumeInput(speakerId);
                 });
             }
 
@@ -5081,11 +5616,20 @@ async def home():
                     return;
                 }
                 const newPreset = select.value;
+                const existing = translateSpeakerOverrides[speakerId] || {};
                 if (!newPreset) {
-                    delete translateSpeakerOverrides[speakerId];
+                    if (typeof existing.volume_percent === 'number') {
+                        translateSpeakerOverrides[speakerId] = {
+                            preset_name: '',
+                            use_emotion_prompt: false,
+                            emotion_weight: DEFAULT_EMOTION_WEIGHT,
+                            volume_percent: existing.volume_percent,
+                        };
+                    } else {
+                        delete translateSpeakerOverrides[speakerId];
+                    }
                 } else {
-                    const existing = translateSpeakerOverrides[speakerId] || {};
-                    translateSpeakerOverrides[speakerId] = {
+                    const nextOverride = {
                         preset_name: newPreset,
                         use_emotion_prompt: Boolean(existing.use_emotion_prompt),
                         emotion_weight:
@@ -5093,7 +5637,12 @@ async def home():
                                 ? existing.emotion_weight
                                 : DEFAULT_EMOTION_WEIGHT,
                     };
+                    if (typeof existing.volume_percent === 'number') {
+                        nextOverride.volume_percent = existing.volume_percent;
+                    }
+                    translateSpeakerOverrides[speakerId] = nextOverride;
                 }
+                cleanupSpeakerOverrideIfEmpty(speakerId);
                 const emoToggle = translateSpeakerAssignments.querySelector(`.speaker-emo-checkbox[data-speaker-id="${speakerId}"]`);
                 if (emoToggle) {
                     if (newPreset) {
@@ -5107,6 +5656,7 @@ async def home():
                 speakerOverridesDirty = true;
                 updateSpeakerPreviewForId(speakerId);
                 updateSpeakerEmotionWeightInput(speakerId);
+                updateSpeakerVolumeInput(speakerId);
             }
 
             function onSpeakerEmotionToggle(event) {
@@ -5128,17 +5678,30 @@ async def home():
             function buildSpeakerOverridesPayload() {
                 const payload = {};
                 Object.entries(translateSpeakerOverrides).forEach(([speakerId, config]) => {
-                    if (!config || !config.preset_name) {
+                    if (!config) {
                         return;
                     }
-                    payload[speakerId] = {
-                        preset_name: config.preset_name,
-                        use_emotion_prompt: Boolean(config.use_emotion_prompt),
-                        emotion_weight:
+                    const hasPreset = Boolean(config.preset_name);
+                    const hasVolume = typeof config.volume_percent === 'number' && !Number.isNaN(config.volume_percent);
+                    if (!hasPreset && !hasVolume) {
+                        return;
+                    }
+                    const entry = {};
+                    if (hasPreset) {
+                        entry.preset_name = config.preset_name;
+                        entry.use_emotion_prompt = Boolean(config.use_emotion_prompt);
+                        entry.emotion_weight =
                             typeof config.emotion_weight === 'number'
                                 ? Math.min(1, Math.max(0, config.emotion_weight))
-                                : DEFAULT_EMOTION_WEIGHT,
-                    };
+                                : DEFAULT_EMOTION_WEIGHT;
+                    }
+                    if (hasVolume) {
+                        entry.volume_percent = Math.min(
+                            MAX_VOLUME_PERCENT,
+                            Math.max(MIN_VOLUME_PERCENT, config.volume_percent)
+                        );
+                    }
+                    payload[speakerId] = entry;
                 });
                 return payload;
             }
@@ -5207,6 +5770,22 @@ async def home():
                 weightInput.disabled = !canUseEmotion;
             }
 
+            function updateSpeakerVolumeInput(speakerId) {
+                if (!translateSpeakerAssignments) {
+                    return;
+                }
+                const volumeInput = translateSpeakerAssignments.querySelector(`.speaker-volume-input[data-speaker-id="${speakerId}"]`);
+                if (!volumeInput) {
+                    return;
+                }
+                const override = translateSpeakerOverrides[speakerId];
+                if (override && typeof override.volume_percent === 'number') {
+                    volumeInput.value = override.volume_percent;
+                } else {
+                    volumeInput.value = '';
+                }
+            }
+
             function onSpeakerEmotionWeightChange(event) {
                 const input = event.target;
                 const speakerId = input.dataset.speakerId;
@@ -5227,15 +5806,79 @@ async def home():
                 input.value = normalized;
             }
 
+            function cleanupSpeakerOverrideIfEmpty(speakerId) {
+                const override = translateSpeakerOverrides[speakerId];
+                if (!override) {
+                    return;
+                }
+                const hasPreset = Boolean(override.preset_name);
+                const hasVolume = typeof override.volume_percent === 'number' && !Number.isNaN(override.volume_percent);
+                if (!hasPreset && !hasVolume) {
+                    delete translateSpeakerOverrides[speakerId];
+                }
+            }
+
+            function onSpeakerVolumeChange(event) {
+                const input = event.target;
+                const speakerId = input.dataset.speakerId;
+                if (!speakerId) {
+                    return;
+                }
+                const rawValue = (input.value || '').trim();
+                if (!rawValue) {
+                    if (translateSpeakerOverrides[speakerId]) {
+                        delete translateSpeakerOverrides[speakerId].volume_percent;
+                        cleanupSpeakerOverrideIfEmpty(speakerId);
+                    }
+                    speakerOverridesDirty = true;
+                    return;
+                }
+                const parsed = parseFloat(rawValue);
+                if (Number.isNaN(parsed)) {
+                    return;
+                }
+                const normalized = Math.min(MAX_VOLUME_PERCENT, Math.max(MIN_VOLUME_PERCENT, parsed));
+                if (!translateSpeakerOverrides[speakerId]) {
+                    translateSpeakerOverrides[speakerId] = {
+                        preset_name: '',
+                        use_emotion_prompt: false,
+                        emotion_weight: DEFAULT_EMOTION_WEIGHT,
+                    };
+                }
+                translateSpeakerOverrides[speakerId].volume_percent = normalized;
+                speakerOverridesDirty = true;
+                input.value = normalized;
+            }
+
             function autoApplyTranslateMetadata(metadata, sessionIdOverride = null) {
                 if (!metadata || typeof metadata !== 'object') {
                     return;
+                }
+                const backingMeta = metadata.backing_track || {};
+                if (typeof backingMeta.available === 'boolean') {
+                    translateBackingAvailableFromSession = Boolean(backingMeta.available);
+                    updateCustomBackingSummary();
+                    syncTranslateMergeBackState();
                 }
                 if (
                     translateVolumeInput &&
                     typeof metadata.generated_volume_percent === 'number'
                 ) {
                     translateVolumeInput.value = metadata.generated_volume_percent;
+                }
+                if (translateBackingVolumeInput) {
+                    let backingValue = null;
+                    if (typeof metadata.backing_volume_percent === 'number') {
+                        backingValue = metadata.backing_volume_percent;
+                    } else if (
+                        metadata.backing_track &&
+                        typeof metadata.backing_track.volume_percent === 'number'
+                    ) {
+                        backingValue = metadata.backing_track.volume_percent;
+                    }
+                    if (backingValue !== null) {
+                        translateBackingVolumeInput.value = backingValue;
+                    }
                 }
                 if (translateManualSegmentsToggle && translateManualSegmentsInput) {
                     let manualText = '';
@@ -5374,6 +6017,9 @@ async def home():
                         } else {
                             formData.append('audio_file', audioInput.files[0]);
                         }
+                        if (translateCustomBackingInput && translateCustomBackingInput.files.length > 0) {
+                            formData.append('custom_backing_audio_file', translateCustomBackingInput.files[0]);
+                        }
                         formData.append('dest_language', destLanguage);
                         formData.append('response_format', selectedFormat);
                         formData.append('enhance_voice', translateEnhanceEl && translateEnhanceEl.checked ? 'true' : 'false');
@@ -5422,6 +6068,9 @@ async def home():
 
                     const formData = new FormData();
                     formData.append('audio_file', audioInput.files[0]);
+                    if (translateCustomBackingInput && translateCustomBackingInput.files.length > 0) {
+                        formData.append('custom_backing_audio_file', translateCustomBackingInput.files[0]);
+                    }
                     formData.append('dest_language', destLanguage);
                     formData.append('response_format', selectedFormat);
                     formData.append('enhance_voice', translateEnhanceEl && translateEnhanceEl.checked ? 'true' : 'false');
@@ -5481,44 +6130,17 @@ async def home():
                         if (hasError) {
                             return;
                         }
-                        const index = parseInt(card.dataset.index, 10);
-                        const type = card.dataset.type || 'speech';
-                        const startInput = card.querySelector('.segment-start');
-                        const endInput = card.querySelector('.segment-end');
-                        const startMs = parseInt(startInput ? startInput.value : '0', 10);
-                        const endMs = parseInt(endInput ? endInput.value : '0', 10);
-                        if (Number.isNaN(startMs) || Number.isNaN(endMs)) {
-                            showStatus(`Segment #${index}: invalid timing.`, 'error', 'translateSegmentsStatus');
+                        try {
+                            const segmentData = readSegmentCardValues(card);
+                            segmentsPayload.push(segmentData);
+                        } catch (segmentError) {
+                            const message =
+                                segmentError && segmentError.message
+                                    ? segmentError.message
+                                    : 'Segment validation failed.';
+                            showStatus(message, 'error', 'translateSegmentsStatus');
                             hasError = true;
-                            return;
                         }
-                        if (endMs <= startMs) {
-                            showStatus(`Segment #${index}: end time must be greater than start time.`, 'error', 'translateSegmentsStatus');
-                            hasError = true;
-                            return;
-                        }
-                        let generate = false;
-                        let sourceText = '';
-                        let translatedText = '';
-                        if (type === 'speech') {
-                            const checkbox = card.querySelector('input.segment-generate');
-                            generate = checkbox ? checkbox.checked : true;
-                            const sourceInput = card.querySelector('.segment-source');
-                            const translationInput = card.querySelector('.segment-translation');
-                            sourceText = sourceInput ? sourceInput.value : '';
-                            translatedText = translationInput ? translationInput.value : '';
-                        }
-
-                        segmentsPayload.push({
-                            index,
-                            type,
-                            start_ms: startMs,
-                            end_ms: endMs,
-                            generate,
-                            source_text: sourceText,
-                            translated_text: translatedText,
-                            speaker: card.dataset.speaker || null,
-                        });
                     });
 
                     if (hasError || !segmentsPayload.length) {
@@ -5538,6 +6160,12 @@ async def home():
                         const volumeValue = parseFloat(translateVolumeInput.value);
                         if (!Number.isNaN(volumeValue)) {
                             payload.generated_volume_percent = volumeValue;
+                        }
+                    }
+                    if (translateBackingVolumeInput && translateBackingVolumeInput.value) {
+                        const backingValue = parseFloat(translateBackingVolumeInput.value);
+                        if (!Number.isNaN(backingValue)) {
+                            payload.backing_volume_percent = backingValue;
                         }
                     }
                     if (speakerOverridesDirty) {
@@ -5931,6 +6559,14 @@ async def home():
                             source_text: updated.source_text || '',
                             translated_text: updated.translated_text || '',
                             generate: updated.generate,
+                            volume_percent:
+                                Object.prototype.hasOwnProperty.call(updated, 'volume_percent')
+                                    ? updated.volume_percent
+                                    : seg.volume_percent,
+                            emotion_weight:
+                                Object.prototype.hasOwnProperty.call(updated, 'emotion_weight')
+                                    ? updated.emotion_weight
+                                    : seg.emotion_weight,
                         };
                     });
                     renderTranslateSegments(currentTranslateSegments);
@@ -6457,6 +7093,8 @@ async def api_translate_segments(
     bitrate: Optional[str] = Form(None),
     audio: Optional[str] = Form(None),
     audio_mime_type: Optional[str] = Form(None),
+    custom_backing_audio: Optional[str] = Form(None),
+    custom_backing_audio_mime_type: Optional[str] = Form(None),
     prompt: Optional[str] = Form(None),
     translate_text: Optional[bool] = Form(True),
     gemini_model: Optional[str] = Form(None),
@@ -6470,8 +7108,10 @@ async def api_translate_segments(
     ignore_non_speech: Optional[bool] = Form(False),
     preserve_silence_audio: Optional[bool] = Form(False),
     generated_volume_percent: Optional[float] = Form(None),
+    backing_volume_percent: Optional[float] = Form(None),
     reuse_session_id: Optional[str] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
+    custom_backing_audio_file: Optional[UploadFile] = File(None),
 ):
     """API: Prepare translation segments for advanced translate/edit workflow."""
     try:
@@ -6481,6 +7121,8 @@ async def api_translate_segments(
         bitrate_value = bitrate
         audio_reference = audio
         audio_mime_type_value = audio_mime_type
+        custom_backing_audio_value = custom_backing_audio
+        custom_backing_audio_mime_type_value = custom_backing_audio_mime_type
         prompt_override = prompt
         translate_flag_value = translate_text
         gemini_model_value = gemini_model
@@ -6494,6 +7136,7 @@ async def api_translate_segments(
         ignore_non_speech_value = ignore_non_speech
         preserve_silence_audio_value = preserve_silence_audio
         generated_volume_percent_value = generated_volume_percent
+        backing_volume_percent_value = backing_volume_percent
         reuse_session_id_value = reuse_session_id
 
         content_type = request.headers.get("content-type", "")
@@ -6517,6 +7160,11 @@ async def api_translate_segments(
             bitrate_value = payload.get("bitrate", bitrate_value)
             audio_reference = payload.get("audio", audio_reference)
             audio_mime_type_value = payload.get("audio_mime_type", audio_mime_type_value)
+            custom_backing_audio_value = payload.get("custom_backing_audio", custom_backing_audio_value)
+            custom_backing_audio_mime_type_value = payload.get(
+                "custom_backing_audio_mime_type",
+                custom_backing_audio_mime_type_value,
+            )
             prompt_override = payload.get("prompt", prompt_override)
             translate_flag_value = payload.get("translate", translate_flag_value)
             gemini_model_value = payload.get("gemini_model", gemini_model_value)
@@ -6532,6 +7180,10 @@ async def api_translate_segments(
             generated_volume_percent_value = payload.get(
                 "generated_volume_percent",
                 generated_volume_percent_value,
+            )
+            backing_volume_percent_value = payload.get(
+                "backing_volume_percent",
+                backing_volume_percent_value,
             )
             reuse_session_id_value = payload.get("reuse_session_id", reuse_session_id_value)
 
@@ -6556,10 +7208,8 @@ async def api_translate_segments(
         preserve_silence_audio_flag = _coerce_to_bool(preserve_silence_audio_value)
         apply_enhancement = _coerce_to_bool(enhance_voice_value)
         apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
-        requested_merge_backing = _coerce_merge_backing_flag(
-            _coerce_to_bool(merge_backing_track_value),
-            apply_enhancement,
-        )
+        custom_backing_present = bool(custom_backing_audio_file) or bool((custom_backing_audio_value or "").strip())
+        merge_backing_requested_raw = _coerce_to_bool(merge_backing_track_value)
         min_speech_duration = _coerce_positive_int(
             min_speech_duration_value,
             MIN_SPEECH_DURATION_MS,
@@ -6574,6 +7224,10 @@ async def api_translate_segments(
             generated_volume_percent_value,
             DEFAULT_GENERATED_VOLUME_PERCENT,
         )
+        backing_volume_percent_value = _coerce_volume_percent(
+            backing_volume_percent_value,
+            DEFAULT_GENERATED_VOLUME_PERCENT,
+        )
         reuse_source_session: Optional[TranslateSessionData] = None
         reuse_session_id_value = (reuse_session_id_value or "").strip()
         if reuse_session_id_value:
@@ -6586,6 +7240,12 @@ async def api_translate_segments(
                         "message": "Reuse session not found or expired. Please re-upload the audio.",
                     },
                 )
+        reuse_backing_available = bool(reuse_source_session and reuse_source_session.backing_track_audio)
+        requested_merge_backing = _coerce_merge_backing_flag(
+            merge_backing_requested_raw,
+            apply_enhancement,
+            custom_backing_present or reuse_backing_available,
+        )
         resolved_gemini_model = _normalize_gemini_model_name(gemini_model_value)
         gemini_api_key_value = (gemini_api_key_value or "").strip()
 
@@ -6596,9 +7256,12 @@ async def api_translate_segments(
             "enhancement": apply_enhancement,
             "super_resolution": apply_super_resolution,
             "merge_backing": requested_merge_backing,
+            "custom_backing": custom_backing_present,
+            "reuse_backing": reuse_backing_available,
             "ignore_non_speech": ignore_non_speech_flag,
             "preserve_silence_audio": preserve_silence_audio_flag,
             "generated_volume_percent": generated_volume_percent_value,
+            "backing_volume_percent": backing_volume_percent_value,
             "translate_enabled": translate_enabled,
         }
 
@@ -6636,6 +7299,7 @@ async def api_translate_segments(
                         gemini_mime_type,
                         backing_track_audio,
                         merge_with_backing,
+                        backing_track_source,
                     ) = await _prepare_audio_assets(
                         reuse_source_session=reuse_source_session,
                         audio_file=audio_file,
@@ -6644,6 +7308,9 @@ async def api_translate_segments(
                         apply_enhancement=apply_enhancement,
                         apply_super_resolution=apply_super_resolution,
                         requested_merge_backing=requested_merge_backing,
+                        custom_backing_audio_file=custom_backing_audio_file,
+                        custom_backing_audio_reference=custom_backing_audio_value,
+                        custom_backing_mime_type_value=custom_backing_audio_mime_type_value,
                         emit_status=emit_status,
                     )
 
@@ -6669,7 +7336,9 @@ async def api_translate_segments(
                         ignore_non_speech_flag=ignore_non_speech_flag,
                         preserve_silence_audio_flag=preserve_silence_audio_flag,
                         generated_volume_percent_value=generated_volume_percent_value,
+                        backing_volume_percent_value=backing_volume_percent_value,
                         backing_track_audio=backing_track_audio,
+                        backing_track_source=backing_track_source,
                         merge_with_backing=merge_with_backing,
                         segments_override_value=segments_override_value,
                         min_speech_duration=min_speech_duration,
@@ -6774,12 +7443,19 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
         base_segment_map = {seg.get("index"): seg for seg in session.base_segments}
 
         volume_percent = session.generated_volume_percent or DEFAULT_GENERATED_VOLUME_PERCENT
+        backing_volume_percent = session.backing_volume_percent or DEFAULT_GENERATED_VOLUME_PERCENT
         if payload.generated_volume_percent is not None:
             volume_percent = _coerce_volume_percent(
                 payload.generated_volume_percent,
                 volume_percent,
             )
         session.generated_volume_percent = volume_percent
+        if payload.backing_volume_percent is not None:
+            backing_volume_percent = _coerce_volume_percent(
+                payload.backing_volume_percent,
+                backing_volume_percent,
+            )
+            session.backing_volume_percent = backing_volume_percent
 
         async def generate_stream():
             queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
@@ -6862,6 +7538,16 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                             "generate": generate_flag if is_speech else False,
                             "keep_original": keep_original,
                         }
+                        if is_speech and seg_input.volume_percent is not None:
+                            segment_payload["volume_percent"] = _coerce_volume_percent(
+                                seg_input.volume_percent,
+                                DEFAULT_GENERATED_VOLUME_PERCENT,
+                            )
+                        if is_speech and seg_input.emotion_weight is not None:
+                            segment_payload["emotion_weight"] = _coerce_emotion_weight(
+                                seg_input.emotion_weight,
+                                DEFAULT_EMOTION_WEIGHT,
+                            )
 
                         base_info = base_segment_map.get(seg_input.index)
                         speaker_label = None
@@ -6887,6 +7573,10 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                             "source_text": source_text,
                             "translated_text": translated_text,
                         }
+                        if is_speech and "volume_percent" in segment_payload:
+                            sanitized_segment["volume_percent"] = segment_payload["volume_percent"]
+                        if is_speech and "emotion_weight" in segment_payload:
+                            sanitized_segment["emotion_weight"] = segment_payload["emotion_weight"]
                         if base_info and base_info.get("text_keys"):
                             sanitized_segment["text_keys"] = base_info["text_keys"]
                         if speaker_label:
@@ -6911,16 +7601,22 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                         input_mime_type=session.input_mime_type,
                         clearvoice_settings=session.clearvoice_settings,
                         backing_track_audio=session.backing_track_audio,
+                        backing_track_source=session.backing_track_source,
                         merge_with_backing=merge_with_backing,
                         preserve_silence_audio=session.preserve_silence_audio,
                         generated_volume_percent=volume_percent,
                         speaker_overrides=session.speaker_overrides,
+                        backing_volume_percent=backing_volume_percent,
                     )
 
-                    metadata.setdefault("backing_track", {})["requested"] = session.merge_with_backing
+                    backing_meta = metadata.setdefault("backing_track", {})
+                    backing_meta["requested"] = session.merge_with_backing
+                    backing_meta["volume_percent"] = backing_volume_percent
+                    backing_meta.setdefault("source", session.backing_track_source or "none")
                     metadata["ignore_non_speech"] = session.ignore_non_speech
                     metadata["preserve_silence_audio"] = session.preserve_silence_audio
                     metadata["speaker_overrides"] = copy.deepcopy(session.speaker_overrides)
+                    metadata["backing_volume_percent"] = backing_volume_percent
                     if session.gemini_raw_text is not None:
                         metadata["gemini_raw_text"] = session.gemini_raw_text
                     generated_count = sum(
@@ -6942,6 +7638,7 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                         bitrate=bitrate_value,
                         gemini_model=session.gemini_model,
                         generated_volume_percent=volume_percent,
+                        backing_volume_percent=backing_volume_percent,
                     )
 
                     headers = {
@@ -7022,6 +7719,138 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
         return JSONResponse(
             status_code=500,
             content={"status": "error", "message": f"Failed to synthesize translation: {str(exc)}"},
+        )
+
+
+@app.post("/api/translate_segment_preview")
+async def api_translate_segment_preview(payload: SegmentPreviewRequest):
+    """API: Generate a quick inline preview for a single translated segment."""
+    try:
+        session = await _get_translate_session(payload.session_id)
+        if session is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": "Translate session not found or expired."},
+            )
+
+        seg_input = payload.segment
+        if seg_input.type != "speech":
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "Only speech segments can be previewed."},
+            )
+
+        max_duration = len(session.original_audio)
+        start_ms = max(0, int(seg_input.start_ms))
+        end_ms = max(0, int(seg_input.end_ms))
+        if end_ms > max_duration:
+            end_ms = max_duration
+        if end_ms <= start_ms:
+            raise TranslateWorkflowHttpError(
+                400,
+                {
+                    "status": "error",
+                    "message": f"Segment index {seg_input.index} has invalid timing (end <= start).",
+                },
+            )
+        duration_ms = end_ms - start_ms
+        start_label = _format_ms_to_timestamp(start_ms)
+        end_label = _format_ms_to_timestamp(end_ms)
+        translated_text = (seg_input.translated_text or "").strip()
+        source_text = (seg_input.source_text or "").strip()
+
+        segment_payload: Dict[str, Any] = {
+            "index": seg_input.index,
+            "type": "speech",
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "duration_ms": duration_ms,
+            "start": start_label,
+            "end": end_label,
+            "source_text": source_text,
+            "translated_text": translated_text,
+            "generate": True,
+            "keep_original": False,
+        }
+        if seg_input.volume_percent is not None:
+            segment_payload["volume_percent"] = _coerce_volume_percent(
+                seg_input.volume_percent,
+                DEFAULT_GENERATED_VOLUME_PERCENT,
+            )
+        if seg_input.emotion_weight is not None:
+            segment_payload["emotion_weight"] = _coerce_emotion_weight(
+                seg_input.emotion_weight,
+                DEFAULT_EMOTION_WEIGHT,
+            )
+
+        base_segment_map = {seg.get("index"): seg for seg in session.base_segments}
+        base_info = base_segment_map.get(seg_input.index)
+        speaker_label = None
+        if base_info and base_info.get("speaker"):
+            speaker_label = base_info["speaker"]
+        elif seg_input.speaker:
+            speaker_label = seg_input.speaker
+        if speaker_label:
+            segment_payload["speaker"] = speaker_label
+        if base_info and base_info.get("text_keys"):
+            segment_payload["text_keys"] = base_info["text_keys"]
+
+        override_payload: Dict[str, Dict[str, Any]] = session.speaker_overrides or {}
+        if payload.speaker_overrides is not None:
+            raw_override_input = {
+                key: value.dict(exclude_none=True)
+                for key, value in payload.speaker_overrides.items()
+            }
+            override_payload = _normalize_speaker_overrides(
+                raw_override_input,
+                session.speaker_profiles,
+            )
+
+        volume_percent = session.generated_volume_percent or DEFAULT_GENERATED_VOLUME_PERCENT
+        if payload.generated_volume_percent is not None:
+            volume_percent = _coerce_volume_percent(payload.generated_volume_percent, volume_percent)
+        backing_volume = session.backing_volume_percent or DEFAULT_GENERATED_VOLUME_PERCENT
+        if payload.backing_volume_percent is not None:
+            backing_volume = _coerce_volume_percent(payload.backing_volume_percent, backing_volume)
+
+        audio_bytes, media_type, metadata = await _synthesize_translated_audio(
+            session.original_audio,
+            [segment_payload],
+            session.dest_language,
+            response_format=session.response_format or TRANSLATE_DEFAULT_OUTPUT_FORMAT,
+            bitrate=session.bitrate or TRANSLATE_DEFAULT_BITRATE,
+            input_mime_type=session.input_mime_type,
+            clearvoice_settings=session.clearvoice_settings,
+            backing_track_audio=None,
+            merge_with_backing=False,
+            preserve_silence_audio=session.preserve_silence_audio,
+            generated_volume_percent=volume_percent,
+            speaker_overrides=override_payload,
+            backing_volume_percent=backing_volume,
+            pad_to_original=False,
+        )
+
+        metadata["preview"] = True
+        metadata["preview_segment_index"] = seg_input.index
+
+        audio_data_uri = f"data:{media_type};base64,{base64.b64encode(audio_bytes).decode('ascii')}"
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "segment_index": seg_input.index,
+                "audio_preview": audio_data_uri,
+                "media_type": media_type,
+                "metadata": metadata,
+            },
+        )
+    except TranslateWorkflowHttpError as http_error:
+        return JSONResponse(status_code=http_error.status_code, content=http_error.content)
+    except Exception as exc:
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Failed to preview segment: {str(exc)}"},
         )
 
 
@@ -7123,6 +7952,8 @@ async def api_translate_audio(
     bitrate: Optional[str] = Form(None),
     audio: Optional[str] = Form(None),
     audio_mime_type: Optional[str] = Form(None),
+    custom_backing_audio: Optional[str] = Form(None),
+    custom_backing_audio_mime_type: Optional[str] = Form(None),
     prompt: Optional[str] = Form(None),
     gemini_model: Optional[str] = Form(None),
     gemini_api_key: Optional[str] = Form(None),
@@ -7135,7 +7966,9 @@ async def api_translate_audio(
     ignore_non_speech: Optional[bool] = Form(False),
     preserve_silence_audio: Optional[bool] = Form(False),
     generated_volume_percent: Optional[float] = Form(None),
+    backing_volume_percent: Optional[float] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
+    custom_backing_audio_file: Optional[UploadFile] = File(None),
 ):
     """API: Translate speech audio to a target language and return synthesized audio."""
     try:
@@ -7143,6 +7976,8 @@ async def api_translate_audio(
         dest_language_value = dest_language
         audio_reference = audio
         audio_mime_type_value = audio_mime_type
+        custom_backing_audio_value = custom_backing_audio
+        custom_backing_audio_mime_type_value = custom_backing_audio_mime_type
         prompt_override = prompt
         response_format_value = response_format
         bitrate_value = bitrate
@@ -7157,6 +7992,7 @@ async def api_translate_audio(
         ignore_non_speech_value = ignore_non_speech
         preserve_silence_audio_value = preserve_silence_audio
         generated_volume_percent_value = generated_volume_percent
+        backing_volume_percent_value = backing_volume_percent
 
         content_type = request.headers.get("content-type", "")
         if (
@@ -7184,6 +8020,10 @@ async def api_translate_audio(
             dest_language_value = translate_req.dest_language
             audio_reference = translate_req.audio or audio_reference
             audio_mime_type_value = translate_req.audio_mime_type or audio_mime_type_value
+            custom_backing_audio_value = translate_req.custom_backing_audio or custom_backing_audio_value
+            custom_backing_audio_mime_type_value = (
+                translate_req.custom_backing_audio_mime_type or custom_backing_audio_mime_type_value
+            )
             prompt_override = translate_req.prompt or prompt_override
             response_format_value = translate_req.response_format or response_format_value
             bitrate_value = translate_req.bitrate or bitrate_value
@@ -7218,6 +8058,11 @@ async def api_translate_audio(
                 if translate_req.generated_volume_percent is not None
                 else generated_volume_percent_value
             )
+            backing_volume_percent_value = (
+                translate_req.backing_volume_percent
+                if translate_req.backing_volume_percent is not None
+                else backing_volume_percent_value
+            )
 
         dest_language_value = (dest_language_value or "").strip()
         if not dest_language_value:
@@ -7239,9 +8084,12 @@ async def api_translate_audio(
         preserve_silence_audio_flag = _coerce_to_bool(preserve_silence_audio_value)
         apply_enhancement = _coerce_to_bool(enhance_voice_value)
         apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
+        custom_backing_present = bool(custom_backing_audio_file) or bool((custom_backing_audio_value or "").strip())
+        merge_backing_requested_raw = _coerce_to_bool(merge_backing_track_value)
         requested_merge_backing = _coerce_merge_backing_flag(
-            _coerce_to_bool(merge_backing_track_value),
+            merge_backing_requested_raw,
             apply_enhancement,
+            custom_backing_present,
         )
         min_speech_duration = _coerce_positive_int(
             min_speech_duration_value,
@@ -7255,6 +8103,10 @@ async def api_translate_audio(
         )
         generated_volume_percent_value = _coerce_volume_percent(
             generated_volume_percent_value,
+            DEFAULT_GENERATED_VOLUME_PERCENT,
+        )
+        backing_volume_percent_value = _coerce_volume_percent(
+            backing_volume_percent_value,
             DEFAULT_GENERATED_VOLUME_PERCENT,
         )
         resolved_gemini_model = _normalize_gemini_model_name(gemini_model_value)
@@ -7283,9 +8135,11 @@ async def api_translate_audio(
             "enhancement": apply_enhancement,
             "super_resolution": apply_super_resolution,
             "merge_backing": requested_merge_backing,
+            "custom_backing": custom_backing_present,
             "ignore_non_speech": ignore_non_speech_flag,
             "preserve_silence_audio": preserve_silence_audio_flag,
             "generated_volume_percent": generated_volume_percent_value,
+            "backing_volume_percent": backing_volume_percent_value,
         }
 
         async def translate_stream():
@@ -7323,6 +8177,7 @@ async def api_translate_audio(
                         gemini_mime_type,
                         backing_track_audio,
                         merge_with_backing,
+                        backing_track_source,
                     ) = await _prepare_audio_assets(
                         reuse_source_session=None,
                         audio_file=audio_file,
@@ -7332,6 +8187,9 @@ async def api_translate_audio(
                         apply_enhancement=apply_enhancement,
                         apply_super_resolution=apply_super_resolution,
                         requested_merge_backing=requested_merge_backing,
+                        custom_backing_audio_file=custom_backing_audio_file,
+                        custom_backing_audio_reference=custom_backing_audio_value,
+                        custom_backing_mime_type_value=custom_backing_audio_mime_type_value,
                         emit_status=emit_status,
                     )
                     input_mime_type_local = input_mime_type_resolved or input_mime_type
@@ -7358,7 +8216,9 @@ async def api_translate_audio(
                         ignore_non_speech_flag=ignore_non_speech_flag,
                         preserve_silence_audio_flag=preserve_silence_audio_flag,
                         generated_volume_percent_value=generated_volume_percent_value,
+                        backing_volume_percent_value=backing_volume_percent_value,
                         backing_track_audio=backing_track_audio,
+                        backing_track_source=backing_track_source,
                         merge_with_backing=merge_with_backing,
                         segments_override_value=segments_override_value,
                         min_speech_duration=min_speech_duration,
@@ -7387,9 +8247,11 @@ async def api_translate_audio(
                             "super_resolution": apply_super_resolution,
                         },
                         backing_track_audio=backing_track_audio,
+                        backing_track_source=backing_track_source,
                         merge_with_backing=merge_with_backing,
                         preserve_silence_audio=preserve_silence_audio_flag,
                         generated_volume_percent=generated_volume_percent_value,
+                        backing_volume_percent=backing_volume_percent_value,
                     )
 
                     metadata = dict(segment_result.metadata)
@@ -7397,6 +8259,7 @@ async def api_translate_audio(
                     metadata["ignore_non_speech"] = ignore_non_speech_flag
                     metadata["preserve_silence_audio"] = preserve_silence_audio_flag
                     metadata["generated_volume_percent"] = generated_volume_percent_value
+                    metadata["backing_volume_percent"] = backing_volume_percent_value
                     metadata["gemini_raw_segments"] = segment_result.gemini_chunks
                     if segment_result.gemini_raw_text is not None:
                         metadata["gemini_raw_text"] = segment_result.gemini_raw_text
@@ -7404,13 +8267,12 @@ async def api_translate_audio(
                         metadata["speaker_overrides"] = copy.deepcopy(session.speaker_overrides)
                     else:
                         metadata["speaker_overrides"] = {}
-                    metadata.setdefault("backing_track", {}).update(
-                        {
-                            "requested": requested_merge_backing,
-                            "available": backing_track_audio is not None,
-                            "merged": merge_with_backing,
-                        }
-                    )
+                    backing_meta = metadata.setdefault("backing_track", {})
+                    backing_meta["requested"] = requested_merge_backing
+                    backing_meta["available"] = backing_track_audio is not None
+                    backing_meta["merged"] = merge_with_backing
+                    backing_meta["volume_percent"] = backing_volume_percent_value
+                    backing_meta.setdefault("source", backing_track_source or ("custom" if custom_backing_present else "extracted" if apply_enhancement else "none"))
                     metadata["segment_rules"] = {
                         "min_speech_ms": min_speech_duration,
                         "max_merge_ms": max_merge_interval,
@@ -7437,7 +8299,8 @@ async def api_translate_audio(
                             f"enhancement={str(apply_enhancement).lower()};super_resolution={str(apply_super_resolution).lower()}"
                         ),
                         "X-Translation-Backing": (
-                            f"available={str(bool(backing_track_audio)).lower()};merged={str(merge_with_backing).lower()}"
+                            f"available={str(bool(backing_track_audio)).lower()};merged={str(merge_with_backing).lower()};"
+                            f"volume_percent={backing_volume_percent_value:.2f}"
                         ),
                     }
 
