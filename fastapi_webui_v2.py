@@ -1109,6 +1109,7 @@ def _guess_media_type_from_extension(filename: str) -> str:
         "opus": "audio/opus",
         "ogg": "audio/ogg",
         "webm": "audio/webm",
+        "srt": "application/x-subrip",
     }
     return mapping.get(ext, "application/octet-stream")
 
@@ -2440,6 +2441,147 @@ def _format_ms_to_timestamp(milliseconds: int) -> str:
     if hours > 0:
         return f"{hours:02d}:{minutes:02d}:{seconds_str}"
     return f"{minutes:02d}:{seconds_str}"
+
+
+def _coerce_segment_ms(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        parsed = _parse_timestamp_to_ms(stripped)
+        if parsed is not None:
+            return parsed
+        try:
+            numeric = float(stripped)
+            return max(0, int(numeric))
+        except ValueError:
+            return None
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_ms_to_srt_timestamp(milliseconds: int) -> str:
+    ms = max(0, int(milliseconds))
+    hours = ms // 3_600_000
+    minutes = (ms % 3_600_000) // 60_000
+    seconds = (ms % 60_000) // 1000
+    millis = ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def _build_srt_entries_from_segments(segments: Optional[List[Dict[str, Any]]]) -> List[Tuple[int, int, str]]:
+    entries: List[Tuple[int, int, str]] = []
+    if not segments:
+        return entries
+
+    def _segment_sort_key(segment: Dict[str, Any]) -> Tuple[int, int]:
+        start_ms = _coerce_segment_ms(segment.get("start_ms")) or _coerce_segment_ms(segment.get("start")) or 0
+        index = segment.get("index")
+        return start_ms, int(index) if isinstance(index, int) else 0
+
+    for segment in sorted(segments, key=_segment_sort_key):
+        seg_type = str(segment.get("type") or "speech").lower()
+        if seg_type != "speech":
+            continue
+        start_ms = _coerce_segment_ms(segment.get("start_ms")) or _coerce_segment_ms(segment.get("start")) or 0
+        end_ms = _coerce_segment_ms(segment.get("end_ms")) or _coerce_segment_ms(segment.get("end"))
+        if end_ms is None:
+            duration_ms = _coerce_segment_ms(segment.get("duration_ms")) or 0
+            end_ms = start_ms + (duration_ms if duration_ms > 0 else 1000)
+        end_ms = max(end_ms, start_ms + 1)
+        text_value = (segment.get("translated_text") or segment.get("source_text") or "").strip()
+        if not text_value:
+            continue
+        sanitized_text = text_value.replace("\r\n", "\n").replace("\r", "\n")
+        entries.append((start_ms, end_ms, sanitized_text))
+    return entries
+
+
+def _offset_segments_for_merge(
+    segments: Optional[List[Dict[str, Any]]],
+    offset_ms: int,
+    *,
+    max_duration_ms: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    adjusted: List[Dict[str, Any]] = []
+    if not segments:
+        return adjusted
+
+    for segment in segments:
+        seg_type = str(segment.get("type") or "speech").lower()
+        if seg_type != "speech":
+            continue
+        local_start = _coerce_segment_ms(segment.get("start_ms")) or _coerce_segment_ms(segment.get("start")) or 0
+        local_end = _coerce_segment_ms(segment.get("end_ms")) or _coerce_segment_ms(segment.get("end"))
+        if local_end is None:
+            duration_ms = _coerce_segment_ms(segment.get("duration_ms")) or 0
+            local_end = local_start + (duration_ms if duration_ms > 0 else 1000)
+        if max_duration_ms is not None:
+            limit = max(0, int(max_duration_ms))
+            local_start = min(local_start, limit)
+            local_end = min(local_end, limit)
+        if local_end <= local_start:
+            local_end = local_start + 1
+        adjusted.append(
+            {
+                "type": "speech",
+                "start_ms": offset_ms + local_start,
+                "end_ms": offset_ms + local_end,
+                "translated_text": segment.get("translated_text"),
+                "source_text": segment.get("source_text"),
+            }
+        )
+    return adjusted
+
+
+def _export_srt_from_segments(
+    segments: Optional[List[Dict[str, Any]]],
+    audio_filename: str,
+    *,
+    empty_note: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    try:
+        srt_entries = _build_srt_entries_from_segments(segments)
+        base_name, _ = os.path.splitext(audio_filename)
+        if not base_name:
+            base_name = os.path.basename(audio_filename) or "subtitle"
+        srt_filename = f"{base_name}.srt"
+        srt_path = os.path.join(TRANSLATE_OUTPUT_DIR, srt_filename)
+        os.makedirs(TRANSLATE_OUTPUT_DIR, exist_ok=True)
+        lines: List[str] = []
+        if srt_entries:
+            for idx, (start_ms, end_ms, text_value) in enumerate(srt_entries, start=1):
+                lines.append(str(idx))
+                lines.append(f"{_format_ms_to_srt_timestamp(start_ms)} --> {_format_ms_to_srt_timestamp(end_ms)}")
+                lines.append(text_value)
+                lines.append("")
+        else:
+            placeholder = empty_note or "No speech segments were available for subtitle export."
+            lines.extend(
+                [
+                    "1",
+                    "00:00:00,000 --> 00:00:01,000",
+                    placeholder,
+                    "",
+                ]
+            )
+        with open(srt_path, "w", encoding="utf-8") as srt_file:
+            srt_file.write("\n".join(lines).strip() + "\n")
+        return {
+            "format": "srt",
+            "filename": srt_filename,
+            "url": f"/api/translate_outputs/{srt_filename}",
+            "entry_count": len(srt_entries),
+        }
+    except Exception as exc:
+        print(f"⚠️ Failed to export SRT subtitles: {exc}")
+        return None
 
 
 def _find_case_insensitive_key(data: Dict[str, Any], candidates: List[str], ignore: Set[str]) -> Optional[str]:
@@ -4708,6 +4850,77 @@ async def home():
             .form-section h3 {
                 margin-bottom: 20px;
             }
+            .translate-steps {
+                display: flex;
+                flex-direction: column;
+                gap: 20px;
+            }
+            .translate-step {
+                background: #fff;
+                border: 1px solid #e4e7fb;
+                border-radius: 20px;
+                padding: 20px;
+                box-shadow: inset 0 1px 0 rgba(255,255,255,0.85);
+            }
+            .step-header {
+                display: flex;
+                align-items: center;
+                gap: 16px;
+                margin-bottom: 16px;
+                flex-wrap: wrap;
+            }
+            .step-badge {
+                width: 44px;
+                height: 44px;
+                border-radius: 12px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: #fff;
+                font-weight: 700;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 1rem;
+            }
+            .step-meta {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                flex: 1;
+            }
+            .step-meta h4 {
+                margin: 0;
+                font-size: 1.1rem;
+            }
+            .step-description {
+                margin: 4px 0 0;
+                color: var(--text-secondary);
+                font-size: 0.95rem;
+            }
+            .step-toggle {
+                margin-left: auto;
+                border: 1px solid var(--border);
+                background: transparent;
+                color: var(--brand-indigo);
+                border-radius: 999px;
+                padding: 6px 14px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: background 0.2s, color 0.2s;
+            }
+            .step-toggle:hover {
+                background: rgba(99,112,255,0.1);
+            }
+            .step-body {
+                display: flex;
+                flex-direction: column;
+                gap: 18px;
+            }
+            .step-body .form-group {
+                margin-bottom: 0;
+            }
+            .translate-step.collapsible.collapsed .step-body {
+                display: none;
+            }
             .form-group {
                 margin-bottom: 20px;
             }
@@ -5300,237 +5513,282 @@ async def home():
                             Upload source speech audio, pick a destination language, and optionally enter advanced mode to audition Gemini segments, tweak timings/text, and regenerate only the pieces you need.
                         </p>
                         <form id="translateForm" enctype="multipart/form-data">
-                            <div class="form-group">
-                                <label for="translateAudioFile">Source Audio:</label>
-                                <input type="file" id="translateAudioFile" name="audio_file" accept=".wav,.mp3,.m4a,.flac,.aac,.ogg,.opus" required>
-                                <small style="color: #666; display: block; margin-top: 6px;">
-                                    Supported formats: WAV, MP3, M4A, FLAC, AAC, OGG, OPUS. Audio is processed locally then sent to Gemini for transcription.
-                                </small>
-                            </div>
-                            <div class="form-group" id="translateClearVoiceBlock">
-                                <label>ClearVoice Separation & Chunking:</label>
-                                <div style="display: flex; gap: 16px; flex-wrap: wrap;">
-                                    <label style="display: flex; align-items: center; gap: 8px;">
-                                        <input type="checkbox" id="translateEnhancement">
-                                        <span>Enhance with MossFormer2_SE_48K</span>
-                                    </label>
-                                    <label style="display: flex; align-items: center; gap: 8px;">
-                                        <input type="checkbox" id="translateSuperResolution">
-                                        <span>Super Resolution with MossFormer2_SR_48K (auto-enables enhancement)</span>
-                                    </label>
-                                    <label style="display: flex; align-items: center; gap: 8px;">
-                                        <input type="checkbox" id="translateMergeBack" disabled>
-                                        <span>Mix translated speech back into instrumental (requires enhancement)</span>
-                                    </label>
-                                </div>
-                                <small style="color: #666; margin-top: 5px; display: block;">
-                                    ClearVoice runs locally before contacting Gemini. Enable it for cleaner vocals, optional super-resolution, and backing-track extraction.
-                                </small>
-                                <div style="margin-top: 12px; padding: 12px; border-radius: 12px; background: rgba(102,126,234,0.08);">
-                                    <label style="display: flex; align-items: center; gap: 10px; font-weight: 500;">
-                                        <input type="checkbox" id="translateEnableChunkSplit">
-                                        <span>Split long audio into 10–15 minute chunks before Gemini (requires ClearVoice enhancement)</span>
-                                    </label>
-                                    <div id="translateChunkSettings" style="display: none; margin-top: 10px;">
-                                        <div style="display: flex; gap: 12px; flex-wrap: wrap;">
-                                            <div style="flex: 1 1 180px;">
-                                                <label for="translateChunkMinMinutes" style="font-weight: 500;">Minimum chunk length (minutes):</label>
-                                                <input type="number" id="translateChunkMinMinutes" value="10" min="1" max="45" step="1">
-                                                <small id="translateChunkMinHint" style="display:block;color:#666;margin-top:4px;"></small>
+                            <div class="translate-steps">
+                                <div class="translate-step">
+                                    <div class="step-header">
+                                        <span class="step-badge">🎧</span>
+                                        <div class="step-meta">
+                                            <h4>Audio Prep & Preprocessing</h4>
+                                            <p class="step-description">Upload your source audio, enable ClearVoice, and manage chunk workflows.</p>
+                                        </div>
+                                    </div>
+                                    <div class="step-body">
+                                        <div class="form-group">
+                                            <label for="translateAudioFile">Source Audio:</label>
+                                            <input type="file" id="translateAudioFile" name="audio_file" accept=".wav,.mp3,.m4a,.flac,.aac,.ogg,.opus" required>
+                                            <small style="color: #666; display: block; margin-top: 6px;">
+                                                Supported formats: WAV, MP3, M4A, FLAC, AAC, OGG, OPUS. Audio is processed locally then sent to Gemini for transcription.
+                                            </small>
+                                        </div>
+                                        <div class="form-group" id="translateClearVoiceBlock">
+                                            <label>ClearVoice Separation & Chunking:</label>
+                                            <div style="display: flex; gap: 16px; flex-wrap: wrap;">
+                                                <label style="display: flex; align-items: center; gap: 8px;">
+                                        <input type="checkbox" id="translateEnhancement" checked>
+                                                    <span>Enhance with MossFormer2_SE_48K</span>
+                                                </label>
+                                                <label style="display: flex; align-items: center; gap: 8px;">
+                                                    <input type="checkbox" id="translateSuperResolution">
+                                                    <span>Super Resolution with MossFormer2_SR_48K (auto-enables enhancement)</span>
+                                                </label>
+                                                <label style="display: flex; align-items: center; gap: 8px;">
+                                        <input type="checkbox" id="translateMergeBack" checked>
+                                                    <span>Mix translated speech back into instrumental (requires enhancement)</span>
+                                                </label>
                                             </div>
-                                            <div style="flex: 1 1 180px;">
-                                                <label for="translateChunkMaxMinutes" style="font-weight: 500;">Maximum chunk length (minutes):</label>
-                                                <input type="number" id="translateChunkMaxMinutes" value="15" min="1" max="45" step="1">
-                                                <small id="translateChunkMaxHint" style="display:block;color:#666;margin-top:4px;"></small>
-                                            </div>
-                                            <div style="flex: 1 1 200px;">
-                                                <label for="translateChunkMinSilenceMs" style="font-weight: 500;">Minimum silence gap (ms):</label>
-                                                <input type="number" id="translateChunkMinSilenceMs" value="1500" min="500" max="120000" step="100">
-                                                <small style="display:block;color:#666;margin-top:4px;">Lower values create more splits; higher values keep longer phrases.</small>
+                                            <small style="color: #666; margin-top: 5px; display: block;">
+                                                ClearVoice runs locally before contacting Gemini. Enable it for cleaner vocals, optional super-resolution, and backing-track extraction.
+                                            </small>
+                                            <div style="margin-top: 12px; padding: 12px; border-radius: 12px; background: rgba(102,126,234,0.08);">
+                                                <label style="display: flex; align-items: center; gap: 10px; font-weight: 500;">
+                                                    <input type="checkbox" id="translateEnableChunkSplit">
+                                                    <span>Split long audio into 10–15 minute chunks before Gemini (requires ClearVoice enhancement)</span>
+                                                </label>
+                                                <div id="translateChunkSettings" style="display: none; margin-top: 10px;">
+                                                    <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+                                                        <div style="flex: 1 1 180px;">
+                                                            <label for="translateChunkMinMinutes" style="font-weight: 500;">Minimum chunk length (minutes):</label>
+                                                            <input type="number" id="translateChunkMinMinutes" value="10" min="1" max="45" step="1">
+                                                            <small id="translateChunkMinHint" style="display:block;color:#666;margin-top:4px;"></small>
+                                                        </div>
+                                                        <div style="flex: 1 1 180px;">
+                                                            <label for="translateChunkMaxMinutes" style="font-weight: 500;">Maximum chunk length (minutes):</label>
+                                                            <input type="number" id="translateChunkMaxMinutes" value="15" min="1" max="45" step="1">
+                                                            <small id="translateChunkMaxHint" style="display:block;color:#666;margin-top:4px;"></small>
+                                                        </div>
+                                                        <div style="flex: 1 1 200px;">
+                                                            <label for="translateChunkMinSilenceMs" style="font-weight: 500;">Minimum silence gap (ms):</label>
+                                                            <input type="number" id="translateChunkMinSilenceMs" value="1500" min="500" max="120000" step="100">
+                                                            <small style="display:block;color:#666;margin-top:4px;">Lower values create more splits; higher values keep longer phrases.</small>
+                                                        </div>
+                                                    </div>
+                                                    <div style="margin-top: 12px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
+                                                        <button type="button" class="btn btn-secondary" id="translateSplitAudioBtn">✂️ Split Audio Now</button>
+                                                        <small style="color: #666;">
+                                                            We detect long silences on the enhanced vocal track so each chunk can be processed (and mixed back) independently, then concatenated later.
+                                                        </small>
+                                                    </div>
+                                                </div>
+                                                <div id="translateChunkSelection" style="display: none; margin-top: 12px; padding: 10px; border-radius: 10px; border: 1px dashed #7f85f5; background: rgba(102,126,234,0.08);">
+                                                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+                                                        <span id="translateChunkSelectionText" style="font-weight: 500;"></span>
+                                                        <button type="button" class="btn btn-secondary" id="translateClearChunkBtn" style="background: transparent; color: #6370ff; border-color: #6370ff;">Clear Selection</button>
+                                                    </div>
+                                                </div>
+                                                <div id="translateChunkResults" style="display: none; margin-top: 12px;">
+                                                    <div id="translateChunkSummary" style="font-weight: 500; color: #0a7c4a; margin-bottom: 10px;"></div>
+                                                    <div id="translateChunkList" style="display: flex; flex-direction: column; gap: 12px;"></div>
+                                                </div>
+                                                <div id="translateChunkBatchControls" style="display: none; margin-top: 12px; gap: 12px; flex-wrap: wrap; align-items: center;">
+                                                    <label style="display: flex; align-items: center; gap: 8px; font-size: 0.95em; margin: 0;">
+                                                        <input type="checkbox" id="translateChunkSelectPending">
+                                                        <span>Select all pending chunks</span>
+                                                    </label>
+                                                    <button type="button" class="btn btn-secondary" id="translateGenerateChunksBtn" style="display: none;">⚡ Generate Selected Chunks</button>
+                                                </div>
+                                                <div id="translateChunkBatchStatus" class="status"></div>
+                                                <div id="translateSplitStatus" class="status"></div>
+                                                <div style="margin-top: 12px;">
+                                                    <button type="button" class="btn btn-secondary" id="translateMergeChunksBtn" style="display: none;">🔗 Merge All Chunks</button>
+                                                </div>
                                             </div>
                                         </div>
-                                        <div style="margin-top: 12px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
-                                            <button type="button" class="btn btn-secondary" id="translateSplitAudioBtn">✂️ Split Audio Now</button>
-                                            <small style="color: #666;">
-                                                We detect long silences on the enhanced vocal track so each chunk can be processed (and mixed back) independently, then concatenated later.
+                                    </div>
+                                </div>
+                                <div class="translate-step collapsible collapsed">
+                                    <div class="step-header">
+                                        <span class="step-badge">🤖</span>
+                                        <div class="step-meta">
+                                            <h4>AI & Gemini Configuration</h4>
+                                            <p class="step-description">Choose the target language, Gemini model, API overrides, and Gemini/manual controls.</p>
+                                        </div>
+                                        <button type="button" class="step-toggle" aria-expanded="false">Expand</button>
+                                    </div>
+                                    <div class="step-body">
+                                        <div class="form-group">
+                                            <label for="translateDestLanguage">Destination Language:</label>
+                                            <select id="translateDestLanguage" name="dest_language" required>
+                                                <option value="">Select a language...</option>
+                                                <option value="English">English</option>
+                                                <option value="Chinese" selected>Chinese</option>
+                                            </select>
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="translateGeminiModel">Gemini Model:</label>
+                                            <select id="translateGeminiModel" name="gemini_model">
+                                                <option value="gemini-2.5-pro" selected>Gemini 2.5 Pro (highest accuracy)</option>
+                                                <option value="gemini-flash-latest">Gemini Flash Latest (fast)</option>
+                                            </select>
+                                            <small style="color: #666; display: block; margin-top: 6px;">
+                                                Choose the Gemini model used for transcription/translation. Flash is faster; Pro is more accurate.
+                                            </small>
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="translateGeminiApiKey">Gemini API Key (optional):</label>
+                                            <input type="password" id="translateGeminiApiKey" name="gemini_api_key" placeholder="Use this key instead of the system default..." autocomplete="off">
+                                            <small style="color: #666; display: block; margin-top: 6px;">
+                                                Provide a key if the server environment does not have one configured or you need to override it for this request.
+                                            </small>
+                                        </div>
+                                        <div class="form-group">
+                                            <label style="display: flex; align-items: center; gap: 10px;">
+                                                <input type="checkbox" id="translateIgnoreNonSpeech">
+                                                <span>Ask Gemini to ignore non-speech (laughs, shouts, crowd noise)</span>
+                                            </label>
+                                            <small style="color: #666; margin-top: 6px; display: block;">
+                                                When enabled, Gemini only transcribes spoken dialogue and skips non-speech vocalizations.
+                                            </small>
+                                        </div>
+                                        <div class="form-group">
+                                            <label style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+                                                <input type="checkbox" id="translateManualSegmentsToggle">
+                                                <span>Provide manual Gemini segments JSON (skip Gemini inference)</span>
+                                            </label>
+                                            <div id="translateManualSegmentsPanel" style="display: none;">
+                                                <textarea id="translateManualSegments" rows="6" placeholder='Paste the raw JSON array returned from Gemini (or another AI). Each entry should include "start", "end", "source_text", and "translated_text".'></textarea>
+                                                <small style="color: #666; display: block; margin-top: 6px;">
+                                                    Use the prompt templates below with any LLM to generate the JSON response, then paste it here to bypass the Gemini API step.
+                                                </small>
+                                            </div>
+                                        </div>
+                                        <div class="form-group" id="translatePromptTemplates" style="display: none; background: rgba(102,126,234,0.08); padding: 16px; border-radius: 12px;">
+                                            <label>Gemini Prompt Templates</label>
+                                            <div style="display: flex; flex-wrap: wrap; gap: 16px;">
+                                                <div style="flex: 1 1 250px;">
+                                                    <label style="font-weight: 500;">Translation mode prompt:</label>
+                                                    <textarea id="translatePromptTranslation" readonly style="min-height: 140px;"></textarea>
+                                                </div>
+                                                <div style="flex: 1 1 250px;">
+                                                    <label style="font-weight: 500;">Transcription-only prompt:</label>
+                                                    <textarea id="translatePromptTranscription" readonly style="min-height: 140px;"></textarea>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="translate-step collapsible collapsed">
+                                    <div class="step-header">
+                                        <span class="step-badge">⚙️</span>
+                                        <div class="step-meta">
+                                            <h4>Additional Settings</h4>
+                                            <p class="step-description">Control output format, merging, mix levels, and silence handling.</p>
+                                        </div>
+                                        <button type="button" class="step-toggle" aria-expanded="false">Expand</button>
+                                    </div>
+                                    <div class="step-body">
+                                        <div class="form-group">
+                                            <label for="translateOutputFormat">Output Format:</label>
+                                            <select id="translateOutputFormat" name="response_format" disabled>
+                                                <option value="mp3" selected>MP3 (optimized for storage & transfer)</option>
+                                            </select>
+                                            <small style="color:#666;display:block;margin-top:6px;">All outputs are delivered as MP3 to keep files lightweight.</small>
+                                        </div>
+                                        <div class="form-group">
+                                            <label>Segment Merge Settings (Optional):</label>
+                                            <div style="display: flex; gap: 16px; flex-wrap: wrap;">
+                                                <div style="flex: 1 1 220px;">
+                                                    <label for="translateMinSpeech" style="font-weight: 500;">Minimum speech duration (ms):</label>
+                                                    <input type="number" id="translateMinSpeech" min="500" step="100" placeholder="Default 3000">
+                                                </div>
+                                                <div style="flex: 1 1 220px;">
+                                                    <label for="translateMaxMerge" style="font-weight: 500;">Max merge silence gap (ms):</label>
+                                                    <input type="number" id="translateMaxMerge" min="0" step="50" placeholder="Default 0 (0 disables)">
+                                                </div>
+                                            </div>
+                                            <small style="color: #666; margin-top: 5px; display: block;">
+                                                These values control Gemini segment stitching. Lower min duration keeps shorter phrases; higher max merge gap allows merging across longer silences, and setting the max gap to 0 skips automatic merging entirely.
+                                            </small>
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="translateVolumePercent">Generated Speech Volume (%)</label>
+                                            <input type="number" id="translateVolumePercent" min="10" max="300" step="5" value="100" placeholder="Default 100%">
+                                            <small style="color: #666; margin-top: 5px; display: block;">
+                                                Adjust the loudness of regenerated speech before mixing with backing or preserved segments. 100% keeps original volume; try 80%–150% for fine control.
+                                            </small>
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="translateBackingVolumePercent">Backing Track Volume (%)</label>
+                                            <input type="number" id="translateBackingVolumePercent" min="10" max="300" step="5" value="100" placeholder="Default 100%">
+                                            <small style="color: #666; margin-top: 5px; display: block;">
+                                                Controls the loudness of the instrumental backing when mix-back is enabled. Lower values keep vocals more forward.
+                                            </small>
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="translateCustomBackingFile">Custom Backing Track (optional)</label>
+                                            <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
+                                                <input type="file" id="translateCustomBackingFile" name="custom_backing_audio_file" accept=".wav,.mp3,.m4a,.flac,.aac,.ogg,.opus" style="flex: 1 1 auto;">
+                                                <button type="button" class="btn btn-secondary" id="translateCustomBackingClear" style="flex: 0 0 auto;">Clear</button>
+                                            </div>
+                                            <small id="translateCustomBackingSummary" style="color: #666; margin-top: 5px; display: block;">
+                                                No custom backing selected. Upload audio here to override the extracted instrumental when mix-back is enabled.
+                                            </small>
+                                        </div>
+                                        <div id="translateSeparationPreview" style="display: none; margin-bottom: 16px;"></div>
+                                        <div class="form-group">
+                                            <label style="display: flex; align-items: center; gap: 10px;">
+                                                <input type="checkbox" id="translatePreserveSilence">
+                                                <span>Preserve original audio for segments treated as silence</span>
+                                            </label>
+                                            <small style="color: #666; margin-top: 6px; display: block;">
+                                                Keeps the source vocal audio for silent segments (helpful for laughs or crowd reactions).
+                                            </small>
+                                        </div>
+                                        <div class="form-group" id="translateSilenceVolumeGroup" style="display: none;">
+                                            <label for="translateSilenceVolumePercent">Preserved silence volume (%)</label>
+                                            <input type="number" id="translateSilenceVolumePercent" min="10" max="300" step="5" value="100" placeholder="Default 100%">
+                                            <small style="color: #666; margin-top: 5px; display: block;">
+                                                Adjust how loud the preserved original audio should be when silence segments are kept.
                                             </small>
                                         </div>
                                     </div>
-                                    <div id="translateChunkSelection" style="display: none; margin-top: 12px; padding: 10px; border-radius: 10px; border: 1px dashed #7f85f5; background: rgba(102,126,234,0.08);">
-                                        <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
-                                            <span id="translateChunkSelectionText" style="font-weight: 500;"></span>
-                                            <button type="button" class="btn btn-secondary" id="translateClearChunkBtn" style="background: transparent; color: #6370ff; border-color: #6370ff;">Clear Selection</button>
+                                </div>
+                                <div class="translate-step">
+                                    <div class="step-header">
+                                        <span class="step-badge">🧩</span>
+                                        <div class="step-meta">
+                                            <h4>Advanced Mode (Optional)</h4>
+                                            <p class="step-description">Enable Gemini segment analysis for edit/playback workflows.</p>
                                         </div>
                                     </div>
-                                    <div id="translateChunkResults" style="display: none; margin-top: 12px;">
-                                        <div id="translateChunkSummary" style="font-weight: 500; color: #0a7c4a; margin-bottom: 10px;"></div>
-                                        <div id="translateChunkList" style="display: flex; flex-direction: column; gap: 12px;"></div>
+                                    <div class="step-body">
+                                        <div class="form-group">
+                                            <label style="display: flex; align-items: center; gap: 10px;">
+                                                <input type="checkbox" id="translateAdvancedMode">
+                                                <span>Enable advanced translate/edit workflow</span>
+                                            </label>
+                                            <small style="color: #666; margin-top: 6px; display: block;">
+                                                When enabled we will analyze segments first so you can listen, edit, and choose which parts to regenerate before final synthesis.
+                                            </small>
+                                        </div>
+                                        <div id="translateAdvancedSettings" style="display: none; background: rgba(102,126,234,0.08); padding: 16px; border-radius: 12px; margin-bottom: 0;">
+                                            <div class="form-group" style="margin-bottom: 16px;">
+                                                <label style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px;">
+                                                    <input type="checkbox" id="translateDebugTranslate" checked>
+                                                    <span>Ask Gemini to translate while transcribing</span>
+                                                </label>
+                                                <small style="color: #666; display: block;">
+                                                    Uncheck to only transcribe with timestamps; you can enter translation text manually per segment.
+                                                </small>
+                                            </div>
+                                            <div class="form-group" style="margin-bottom: 0;">
+                                                <label for="translateCustomPrompt">Custom Gemini Prompt (optional):</label>
+                                                <textarea id="translateCustomPrompt" rows="3" placeholder="Override the default Gemini prompt for segment analysis..."></textarea>
+                                                <small style="color: #666; margin-top: 6px; display: block;">
+                                                    Leave blank to use the optimized defaults for translate/transcribe modes.
+                                                </small>
+                                            </div>
+                                        </div>
                                     </div>
-                                    <div id="translateChunkBatchControls" style="display: none; margin-top: 12px; gap: 12px; flex-wrap: wrap; align-items: center;">
-                                        <label style="display: flex; align-items: center; gap: 8px; font-size: 0.95em; margin: 0;">
-                                            <input type="checkbox" id="translateChunkSelectPending">
-                                            <span>Select all pending chunks</span>
-                                        </label>
-                                        <button type="button" class="btn btn-secondary" id="translateGenerateChunksBtn" style="display: none;">⚡ Generate Selected Chunks</button>
-                                    </div>
-                                    <div id="translateChunkBatchStatus" class="status"></div>
-                                    <div id="translateSplitStatus" class="status"></div>
-                                    <div style="margin-top: 12px;">
-                                        <button type="button" class="btn btn-secondary" id="translateMergeChunksBtn" style="display: none;">🔗 Merge All Chunks</button>
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="form-group">
-                                <label for="translateDestLanguage">Destination Language:</label>
-                                <select id="translateDestLanguage" name="dest_language" required>
-                                    <option value="">Select a language...</option>
-                                    <option value="English">English</option>
-                                    <option value="Chinese">Chinese</option>
-                                </select>
-                            </div>
-                            <div class="form-group">
-                                <label for="translateGeminiModel">Gemini Model:</label>
-                                <select id="translateGeminiModel" name="gemini_model">
-                                    <option value="gemini-2.5-pro" selected>Gemini 2.5 Pro (highest accuracy)</option>
-                                    <option value="gemini-flash-latest">Gemini Flash Latest (fast)</option>
-                                </select>
-                                <small style="color: #666; display: block; margin-top: 6px;">
-                                    Choose the Gemini model used for transcription/translation. Flash is faster; Pro is more accurate.
-                                </small>
-                            </div>
-                            <div class="form-group">
-                                <label for="translateGeminiApiKey">Gemini API Key (optional):</label>
-                                <input type="password" id="translateGeminiApiKey" name="gemini_api_key" placeholder="Use this key instead of the system default..." autocomplete="off">
-                                <small style="color: #666; display: block; margin-top: 6px;">
-                                    Provide a key if the server environment does not have one configured or you need to override it for this request.
-                                </small>
-                            </div>
-                            <div class="form-group">
-                                <label for="translateOutputFormat">Output Format:</label>
-                                <select id="translateOutputFormat" name="response_format" disabled>
-                                    <option value="mp3" selected>MP3 (optimized for storage & transfer)</option>
-                                </select>
-                                <small style="color:#666;display:block;margin-top:6px;">All outputs are delivered as MP3 to keep files lightweight.</small>
-                            </div>
-                            <div class="form-group">
-                                <label>Segment Merge Settings (Optional):</label>
-                                <div style="display: flex; gap: 16px; flex-wrap: wrap;">
-                                    <div style="flex: 1 1 220px;">
-                                        <label for="translateMinSpeech" style="font-weight: 500;">Minimum speech duration (ms):</label>
-                                        <input type="number" id="translateMinSpeech" min="500" step="100" placeholder="Default 3000">
-                                    </div>
-                                    <div style="flex: 1 1 220px;">
-                                        <label for="translateMaxMerge" style="font-weight: 500;">Max merge silence gap (ms):</label>
-                                        <input type="number" id="translateMaxMerge" min="0" step="50" placeholder="Default 0 (0 disables)">
-                                    </div>
-                                </div>
-                                <small style="color: #666; margin-top: 5px; display: block;">
-                                    These values control Gemini segment stitching. Lower min duration keeps shorter phrases; higher max merge gap allows merging across longer silences, and setting the max gap to 0 skips automatic merging entirely.
-                                </small>
-                            </div>
-                            <div class="form-group">
-                                <label for="translateVolumePercent">Generated Speech Volume (%)</label>
-                                <input type="number" id="translateVolumePercent" min="10" max="300" step="5" value="100" placeholder="Default 100%">
-                                <small style="color: #666; margin-top: 5px; display: block;">
-                                    Adjust the loudness of regenerated speech before mixing with backing or preserved segments. 100% keeps original volume; try 80%–150% for fine control.
-                                </small>
-                            </div>
-                            <div class="form-group">
-                                <label for="translateBackingVolumePercent">Backing Track Volume (%)</label>
-                                <input type="number" id="translateBackingVolumePercent" min="10" max="300" step="5" value="100" placeholder="Default 100%">
-                                <small style="color: #666; margin-top: 5px; display: block;">
-                                    Controls the loudness of the instrumental backing when mix-back is enabled. Lower values keep vocals more forward.
-                                </small>
-                            </div>
-                            <div class="form-group">
-                                <label for="translateCustomBackingFile">Custom Backing Track (optional)</label>
-                                <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
-                                    <input type="file" id="translateCustomBackingFile" name="custom_backing_audio_file" accept=".wav,.mp3,.m4a,.flac,.aac,.ogg,.opus" style="flex: 1 1 auto;">
-                                    <button type="button" class="btn btn-secondary" id="translateCustomBackingClear" style="flex: 0 0 auto;">Clear</button>
-                                </div>
-                                <small id="translateCustomBackingSummary" style="color: #666; margin-top: 5px; display: block;">
-                                    No custom backing selected. Upload audio here to override the extracted instrumental when mix-back is enabled.
-                                </small>
-                            </div>
-                            <div class="form-group">
-                                <label style="display: flex; align-items: center; gap: 10px;">
-                                    <input type="checkbox" id="translateIgnoreNonSpeech">
-                                    <span>Ask Gemini to ignore non-speech (laughs, shouts, crowd noise)</span>
-                                </label>
-                                <small style="color: #666; margin-top: 6px; display: block;">
-                                    When enabled, Gemini only transcribes spoken dialogue and skips non-speech vocalizations.
-                                </small>
-                            </div>
-                            <div class="form-group">
-                                <label style="display: flex; align-items: center; gap: 10px;">
-                                    <input type="checkbox" id="translatePreserveSilence">
-                                    <span>Preserve original audio for segments treated as silence</span>
-                                </label>
-                                <small style="color: #666; margin-top: 6px; display: block;">
-                                    Keeps the source vocal audio for silent segments (helpful for laughs or crowd reactions).
-                                </small>
-                            </div>
-                            <div class="form-group" id="translateSilenceVolumeGroup" style="display: none;">
-                                <label for="translateSilenceVolumePercent">Preserved silence volume (%)</label>
-                                <input type="number" id="translateSilenceVolumePercent" min="10" max="300" step="5" value="100" placeholder="Default 100%">
-                                <small style="color: #666; margin-top: 5px; display: block;">
-                                    Adjust how loud the preserved original audio should be when silence segments are kept.
-                                </small>
-                            </div>
-                            <div class="form-group">
-                                <label style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
-                                    <input type="checkbox" id="translateManualSegmentsToggle">
-                                    <span>Provide manual Gemini segments JSON (skip Gemini inference)</span>
-                                </label>
-                                <div id="translateManualSegmentsPanel" style="display: none;">
-                                    <textarea id="translateManualSegments" rows="6" placeholder='Paste the raw JSON array returned from Gemini (or another AI). Each entry should include "start", "end", "source_text", and "translated_text".'></textarea>
-                                    <small style="color: #666; display: block; margin-top: 6px;">
-                                        Use the prompt templates below with any LLM to generate the JSON response, then paste it here to bypass the Gemini API step.
-                                    </small>
-                                </div>
-                            </div>
-                            <div id="translateSeparationPreview" style="display: none; margin-bottom: 16px;"></div>
-                            <div class="form-group" id="translatePromptTemplates" style="display: none; background: rgba(102,126,234,0.08); padding: 16px; border-radius: 12px;">
-                                <label>Gemini Prompt Templates</label>
-                                <div style="display: flex; flex-wrap: wrap; gap: 16px;">
-                                    <div style="flex: 1 1 250px;">
-                                        <label style="font-weight: 500;">Translation mode prompt:</label>
-                                        <textarea id="translatePromptTranslation" readonly style="min-height: 140px;"></textarea>
-                                    </div>
-                                    <div style="flex: 1 1 250px;">
-                                        <label style="font-weight: 500;">Transcription-only prompt:</label>
-                                        <textarea id="translatePromptTranscription" readonly style="min-height: 140px;"></textarea>
-                                    </div>
-                                </div>
-                                <small style="color: #666; display: block; margin-top: 6px;">
-                                    Copy these prompts when generating manual segments with your preferred AI model. Replace <code>{'{dest_language}'}</code> as needed.
-                                </small>
-                            </div>
-                            <div class="form-group" style="margin-top: 20px;">
-                                <label style="display: flex; align-items: center; gap: 10px;">
-                                    <input type="checkbox" id="translateAdvancedMode">
-                                    <span>Enable advanced translate/edit workflow</span>
-                                </label>
-                                <small style="color: #666; margin-top: 6px; display: block;">
-                                    When enabled we will analyze segments first so you can listen, edit, and choose which parts to regenerate before final synthesis.
-                                </small>
-                            </div>
-                            <div id="translateAdvancedSettings" style="display: none; background: rgba(102,126,234,0.08); padding: 16px; border-radius: 12px; margin-bottom: 20px;">
-                                <div class="form-group" style="margin-bottom: 16px;">
-                                    <label style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px;">
-                                        <input type="checkbox" id="translateDebugTranslate" checked>
-                                        <span>Ask Gemini to translate while transcribing</span>
-                                    </label>
-                                    <small style="color: #666; display: block;">
-                                        Uncheck to only transcribe with timestamps; you can enter translation text manually per segment.
-                                    </small>
-                                </div>
-                                <div class="form-group" style="margin-bottom: 0;">
-                                    <label for="translateCustomPrompt">Custom Gemini Prompt (optional):</label>
-                                    <textarea id="translateCustomPrompt" rows="3" placeholder="Override the default Gemini prompt for segment analysis..."></textarea>
-                                    <small style="color: #666; margin-top: 6px; display: block;">
-                                        Leave blank to use the optimized defaults for translate/transcribe modes.
-                                    </small>
                                 </div>
                             </div>
                             <button type="submit" class="btn" id="translateBtn">🌐 Translate Speech</button>
@@ -6197,6 +6455,7 @@ async def home():
             const translateCustomBackingInput = document.getElementById('translateCustomBackingFile');
             const translateCustomBackingClearBtn = document.getElementById('translateCustomBackingClear');
             const translateCustomBackingSummary = document.getElementById('translateCustomBackingSummary');
+            const translateStepToggles = document.querySelectorAll('.translate-step.collapsible .step-toggle');
             const translateIgnoreNonSpeechEl = document.getElementById('translateIgnoreNonSpeech');
             const translatePreserveSilenceEl = document.getElementById('translatePreserveSilence');
             const translateSilenceVolumeInput = document.getElementById('translateSilenceVolumePercent');
@@ -6258,6 +6517,22 @@ async def home():
             let translateSelectedChunkId = null;
             let translateChunkSelections = new Set();
             let currentChunkSessionId = null;
+
+            translateStepToggles.forEach((toggle) => {
+                const step = toggle.closest('.translate-step');
+                if (!step) {
+                    return;
+                }
+                const syncToggleState = (isOpen) => {
+                    toggle.textContent = isOpen ? 'Collapse' : 'Expand';
+                    toggle.setAttribute('aria-expanded', String(isOpen));
+                };
+                syncToggleState(!step.classList.contains('collapsed'));
+                toggle.addEventListener('click', () => {
+                    step.classList.toggle('collapsed');
+                    syncToggleState(!step.classList.contains('collapsed'));
+                });
+            });
 
             function updateAudioInputRequirement() {
                 if (!translateAudioInput) {
@@ -6776,12 +7051,23 @@ async def home():
                 }
                 const mediaType = getMediaTypeForFormat(format);
                 const downloadName = data.file_name || `merged_chunks.${format}`;
+                const subtitleUrl = data.subtitle_url || (data.subtitle && data.subtitle.url) || null;
+                const subtitleFileName =
+                    data.subtitle_file_name ||
+                    (data.subtitle && data.subtitle.filename) ||
+                    downloadName.replace(/\\.[^.]+$/, '.srt');
+                let downloadButtons = `<a class="btn" href="${audioUrl}" download="${downloadName}">💾 Download Merged Audio</a>`;
+                if (subtitleUrl) {
+                    downloadButtons += ` <a class="btn btn-secondary" href="${subtitleUrl}" download="${subtitleFileName}">📝 Subtitles (.srt)</a>`;
+                }
                 resultDiv.innerHTML = `
                     <h3>🔗 Merged Chunk Output</h3>
                     <audio controls preload="none" style="width: 100%; margin: 10px 0;">
                         <source src="${audioUrl}" type="${mediaType}">
                     </audio>
-                    <a class="btn" href="${audioUrl}" download="${downloadName}">💾 Download Merged Audio</a>
+                    <div style="margin-top: 12px;">
+                        ${downloadButtons}
+                    </div>
                 `;
             }
 
@@ -8655,10 +8941,22 @@ async def home():
                                 return;
                             }
                             const downloadName = eventData.file_name || `translated_speech.${selectedFormat}`;
+                            const subtitleUrl =
+                                eventData.subtitle_url ||
+                                (eventData.metadata && eventData.metadata.subtitle && eventData.metadata.subtitle.url) ||
+                                null;
+                            const subtitleFileName =
+                                eventData.subtitle_file_name ||
+                                (eventData.metadata && eventData.metadata.subtitle && eventData.metadata.subtitle.filename) ||
+                                'translated_speech.srt';
+                            let downloadButtons = `<a href="${audioUrl}" download="${downloadName}" class="btn">💾 Download</a>`;
+                            if (subtitleUrl) {
+                                downloadButtons += `<a href="${subtitleUrl}" download="${subtitleFileName}" class="btn btn-secondary" style="margin-left: 10px;">📝 Subtitles (.srt)</a>`;
+                            }
                             resultDiv.innerHTML = `
                                 <audio controls src="${audioUrl}" style="width: 100%; margin-top: 20px;"></audio>
                                 <div style="margin-top: 12px;">
-                                    <a href="${audioUrl}" download="${downloadName}" class="btn">💾 Download</a>
+                                    ${downloadButtons}
                                 </div>
                             `;
 
@@ -8896,11 +9194,23 @@ async def home():
                     }
 
                     const downloadName = data.file_name || `translated_speech.${selectedFormat}`;
+                    const subtitleUrl =
+                        data.subtitle_url ||
+                        (metadata && metadata.subtitle && metadata.subtitle.url) ||
+                        null;
+                    const subtitleFileName =
+                        data.subtitle_file_name ||
+                        (metadata && metadata.subtitle && metadata.subtitle.filename) ||
+                        'translated_speech.srt';
+                    let downloadButtons = `<a href="${audioUrl}" download="${downloadName}" class="btn">💾 Download</a>`;
+                    if (subtitleUrl) {
+                        downloadButtons += `<a href="${subtitleUrl}" download="${subtitleFileName}" class="btn btn-secondary" style="margin-left: 10px;">📝 Subtitles (.srt)</a>`;
+                    }
                     if (resultDiv) {
                         resultDiv.innerHTML = `
                             <audio controls src="${audioUrl}" style="width: 100%; margin-top: 20px;"></audio>
                             <div style="margin-top: 12px;">
-                                <a href="${audioUrl}" download="${downloadName}" class="btn">💾 Download</a>
+                                ${downloadButtons}
                             </div>
                         `;
                     }
@@ -9865,7 +10175,9 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
 
         merge_backing_request = _coerce_to_bool(payload.merge_backing_track)
         merged_audio: Optional[AudioSegment] = None
+        merged_segments: List[Dict[str, Any]] = []
         chunk_results: List[Dict[str, Any]] = []
+        timeline_offset_ms = 0
         for session in sessions:
             segment_audio = _load_chunk_audio_for_merge(session)
             if segment_audio is None:
@@ -9886,6 +10198,15 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
                     "audio_url": _chunk_output_url(session) if session.chunk_generated else None,
                 }
             )
+            chunk_duration_ms = len(segment_audio)
+            merged_segments.extend(
+                _offset_segments_for_merge(
+                    getattr(session, "base_segments", None),
+                    timeline_offset_ms,
+                    max_duration_ms=chunk_duration_ms,
+                )
+            )
+            timeline_offset_ms += chunk_duration_ms
             merged_audio = segment_audio if merged_audio is None else merged_audio + segment_audio
 
         if merged_audio is None:
@@ -9927,6 +10248,12 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
             outfile.write(merged_bytes)
 
         audio_url = f"/api/translate_outputs/{output_filename}"
+        subtitle_info = _export_srt_from_segments(
+            merged_segments,
+            output_filename,
+            empty_note="No merged speech segments were available for subtitle export.",
+        )
+        subtitle_url = subtitle_info["url"] if subtitle_info else None
 
         return JSONResponse(
             status_code=200,
@@ -9938,6 +10265,9 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
                 "response_format": response_format_value,
                 "chunk_results": chunk_results,
                 "chunk_batch_id": chunk_batch_id or sessions[0].chunk_parent_id,
+                "subtitle_url": subtitle_url,
+                "subtitle_file_name": subtitle_info["filename"] if subtitle_info else None,
+                "subtitle": subtitle_info,
             },
         )
     except Exception as exc:
@@ -10770,6 +11100,14 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                     with open(output_path, "wb") as outfile:
                         outfile.write(audio_payload)
                     audio_url = f"/api/translate_outputs/{output_filename}"
+                    subtitle_info = _export_srt_from_segments(
+                        final_segments,
+                        output_filename,
+                        empty_note="No translated speech segments were selected for subtitle export.",
+                    )
+                    subtitle_url = subtitle_info["url"] if subtitle_info else None
+                    if subtitle_info:
+                        metadata["subtitle"] = subtitle_info
 
                     if chunk_session_for_generation and chunk_session_for_generation.chunk_parent_id:
                         _mark_chunk_generated(
@@ -10820,6 +11158,8 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                         headers=headers,
                         metadata=metadata,
                         file_name=output_filename,
+                        subtitle_url=subtitle_url,
+                        subtitle_file_name=subtitle_info["filename"] if subtitle_info else None,
                     )
 
                 except TranslateWorkflowHttpError as http_error:
@@ -11115,6 +11455,7 @@ async def api_translate_audio(
     preserve_silence_audio: Optional[bool] = Form(False),
     generated_volume_percent: Optional[float] = Form(None),
     backing_volume_percent: Optional[float] = Form(None),
+    silence_volume_percent: Optional[float] = Form(None),
     reuse_session_id: Optional[str] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
     custom_backing_audio_file: Optional[UploadFile] = File(None),
@@ -11143,6 +11484,7 @@ async def api_translate_audio(
         preserve_silence_audio_value = preserve_silence_audio
         generated_volume_percent_value = generated_volume_percent
         backing_volume_percent_value = backing_volume_percent
+        silence_volume_percent_value = silence_volume_percent
 
         content_type = request.headers.get("content-type", "")
         if (
@@ -11508,6 +11850,14 @@ async def api_translate_audio(
                     with open(output_path, "wb") as outfile:
                         outfile.write(audio_payload)
                     audio_url = f"/api/translate_outputs/{output_filename}"
+                    subtitle_info = _export_srt_from_segments(
+                        segments,
+                        output_filename,
+                        empty_note="No speech segments were available for subtitle export.",
+                    )
+                    subtitle_url = subtitle_info["url"] if subtitle_info else None
+                    if subtitle_info:
+                        metadata["subtitle"] = subtitle_info
 
                     if reuse_session_for_translate and reuse_session_for_translate.chunk_parent_id:
                         _mark_chunk_generated(
@@ -11558,6 +11908,8 @@ async def api_translate_audio(
                         headers=headers,
                         metadata=metadata,
                         file_name=output_filename,
+                        subtitle_url=subtitle_url,
+                        subtitle_file_name=subtitle_info["filename"] if subtitle_info else None,
                     )
                     print(
                         "[translate_audio] complete audio_url=%s chunk_id=%s generated=%s"
