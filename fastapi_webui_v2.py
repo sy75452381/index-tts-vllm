@@ -65,7 +65,7 @@ except ImportError:
 # FastAPI and web interface
 from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks, HTTPException, Depends
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from urllib.parse import quote
 
 # IndexTTS v2 and speaker management
@@ -80,7 +80,9 @@ from speaker_preset_manager import SpeakerPresetManager, initialize_preset_manag
 import argparse
 
 # Global thread executor for blocking operations
-executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="fastapi_async")
+# Use CPU count for parallel audio processing, but cap at 8 to avoid excessive context switching
+_executor_workers = min(8, max(4, (os.cpu_count() or 4)))
+executor = ThreadPoolExecutor(max_workers=_executor_workers, thread_name_prefix="fastapi_async")
 
 # Global ClearVoice models (initialized lazily and reused)
 _enhancement_model: Optional[Any] = None
@@ -139,7 +141,7 @@ NON_SPEECH_PROMPT_PLACEHOLDER = "{non_speech_instruction}"
 DEFAULT_GEMINI_TEMPERATURE = 0.2
 DEFAULT_GEMINI_TOP_P = 0.9
 TRANSLATE_DEFAULT_OUTPUT_FORMAT = "mp3"
-TRANSLATE_DEFAULT_BITRATE = "192k"
+TRANSLATE_DEFAULT_BITRATE = "128k"
 AUDIO_GENERATION_MARGIN_MS = 20
 TRANSLATION_TTS_CONCURRENCY = 20
 MIN_SPEECH_DURATION_MS = 3000
@@ -147,25 +149,27 @@ MAX_MERGE_INTERVAL_MS = 0
 DEFAULT_GENERATED_VOLUME_PERCENT = 100.0
 MIN_GENERATED_VOLUME_PERCENT = 10.0
 MAX_GENERATED_VOLUME_PERCENT = 300.0
+DEFAULT_SILENCE_VOLUME_PERCENT = DEFAULT_GENERATED_VOLUME_PERCENT
 DEFAULT_EMOTION_WEIGHT = 0.6
-ALLOWED_TRANSLATE_FORMATS = {"mp3", "wav", "flac", "aac", "opus", "ogg", "webm"}
 ALLOWED_GEMINI_MODELS = {"gemini-flash-latest", "gemini-2.5-pro"}
 GEMINI_AUDIO_EXPORT_BITRATE = "128k"
 SPEAKER_PREVIEW_DIR = Path("speaker_presets") / "previews"
 SPEAKER_PREVIEW_BITRATE = "128k"
+CHUNK_SPLIT_DEFAULT_MIN_MINUTES = 10.0
+CHUNK_SPLIT_DEFAULT_MAX_MINUTES = 15.0
+CHUNK_SPLIT_MIN_MINUTES = 1.0
+CHUNK_SPLIT_MAX_MINUTES = 45.0
+CHUNK_SPLIT_MIN_SILENCE_MS = 1500
+CHUNK_SPLIT_SILENCE_THRESHOLD_DB = -42.0
+CHUNK_SPLIT_MAX_CHUNKS = 64
+CHUNK_SPLIT_SILENCE_GRACE_MS = 45000
+CHUNK_SPLIT_MIN_CHUNK_MS = 1000
+CHUNK_BATCH_GENERATE_DELAY_SECONDS = 60
 
 
 async def _run_blocking(func: Callable, *args, **kwargs):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, functools.partial(func, *args, **kwargs))
-
-
-def _normalize_response_format(response_format_value: Optional[str]) -> str:
-    fmt = (response_format_value or TRANSLATE_DEFAULT_OUTPUT_FORMAT).lower()
-    if fmt not in ALLOWED_TRANSLATE_FORMATS:
-        allowed_text = ", ".join(sorted(ALLOWED_TRANSLATE_FORMATS))
-        raise ValueError(f"Unsupported response_format '{fmt}'. Allowed: {allowed_text}")
-    return fmt
 
 
 def _normalize_gemini_model_name(gemini_model_value: Optional[str]) -> str:
@@ -253,7 +257,14 @@ async def _export_audio_segment_to_tempfile(audio: AudioSegment, suffix: str = "
 
 
 def _load_audio_segment_from_path_sync(path: str) -> AudioSegment:
-    return AudioSegment.from_file(path, format="wav")
+    """Load audio segment from file path, auto-detecting format from extension."""
+    ext = os.path.splitext(path)[1].lstrip(".").lower()
+    if ext == "mp3":
+        return AudioSegment.from_file(path, format="mp3")
+    elif ext == "wav":
+        return AudioSegment.from_file(path, format="wav")
+    else:
+        return AudioSegment.from_file(path)
 
 
 async def _load_audio_segment_from_path(path: str) -> AudioSegment:
@@ -267,6 +278,7 @@ async def _run_clearvoice_pipeline(
     apply_super_resolution: bool,
     pre_clearvoice_mix_audio: Optional[AudioSegment],
     emit_status: Optional[Callable[..., Awaitable[None]]],
+    source_audio_path: Optional[str] = None,
 ) -> Tuple[AudioSegment, Optional[AudioSegment]]:
     if not (apply_enhancement or apply_super_resolution):
         return original_audio, None
@@ -289,42 +301,143 @@ async def _run_clearvoice_pipeline(
                 action = "Applying MossFormer2_SE_48K enhancement + SR_48K super-resolution..."
             await emit_status(stage="enhancement", message=action)
 
-        temp_input_path = await _export_audio_segment_to_tempfile(original_audio)
-        processed_paths.add(temp_input_path)
-        final_processed_path, clearvoice_paths, enhancement_output_path = await apply_clearvoice_processing(
-            temp_input_path,
-            apply_enhancement,
-            apply_super_resolution,
-        )
-        processed_paths.update(clearvoice_paths)
-        processed_paths.add(final_processed_path)
+        wav_input_path: Optional[str] = None
+        if source_audio_path:
+            wav_input_path, created_temp = await _ensure_clearvoice_input_path(source_audio_path)
+            if created_temp and wav_input_path:
+                processed_paths.add(wav_input_path)
+                temp_input_path = wav_input_path
+            else:
+                temp_input_path = wav_input_path or source_audio_path
+        else:
+            temp_input_path = await _export_audio_segment_to_tempfile(original_audio)
+            processed_paths.add(temp_input_path)
+
+        cache_hash = _compute_file_md5(temp_input_path)
+        cache_dir = os.path.join(CLEARVOICE_CACHE_DIR, cache_hash)
+        os.makedirs(cache_dir, exist_ok=True)
+        cached_enhanced_path = os.path.join(cache_dir, "mossformer2_se.mp3")
+        cached_sr_path = os.path.join(cache_dir, "mossformer2_sr.mp3")
+        cached_backing_path = os.path.join(cache_dir, "backing_track.mp3")
+        use_cached_enhancement = apply_enhancement and os.path.exists(cached_enhanced_path)
+        use_cached_sr = apply_super_resolution and os.path.exists(cached_sr_path)
+        clearvoice_paths: List[str] = []
+
+        final_processed_path: Optional[str] = None
+        enhancement_output_path: Optional[str] = None
+
+        if apply_super_resolution:
+            if use_cached_sr and (not apply_enhancement or use_cached_enhancement):
+                final_processed_path = cached_sr_path
+                enhancement_output_path = cached_enhanced_path if apply_enhancement else None
+                print(f"♻️ ClearVoice: Reusing cached MossFormer2_SR_48K output for {cache_hash}.")
+        elif apply_enhancement and use_cached_enhancement:
+            final_processed_path = cached_enhanced_path
+            enhancement_output_path = cached_enhanced_path
+            print(f"♻️ ClearVoice: Reusing cached MossFormer2_SE_48K output for {cache_hash}.")
+
+        if final_processed_path is None:
+            final_processed_local_path, clearvoice_paths, enhancement_output_local = await apply_clearvoice_processing(
+                temp_input_path,
+                apply_enhancement,
+                apply_super_resolution,
+            )
+            processed_paths.update(clearvoice_paths)
+            processed_paths.add(final_processed_local_path)
+            final_processed_path = final_processed_local_path
+            enhancement_output_path = enhancement_output_local
+
+            if apply_enhancement and enhancement_output_local:
+                enhancement_output_path = await _normalize_audio_to_cached(
+                    enhancement_output_local,
+                    cached_enhanced_path,
+                    delete_source=True,
+                )
+                print(f"💾 ClearVoice: Cached MossFormer2_SE_48K output for {cache_hash}.")
+
+            if apply_super_resolution:
+                final_processed_path = await _normalize_audio_to_cached(
+                    final_processed_local_path,
+                    cached_sr_path,
+                    delete_source=True,
+                )
+                print(f"💾 ClearVoice: Cached MossFormer2_SR_48K output for {cache_hash}.")
+            elif apply_enhancement and enhancement_output_path is not None:
+                final_processed_path = enhancement_output_path
+            else:
+                final_processed_path = await _normalize_audio_to_cached(
+                    final_processed_local_path,
+                    cached_enhanced_path,
+                    delete_source=True,
+                )
+        else:
+            # Ensure enhancement path is set when reusing cache
+            if apply_enhancement and enhancement_output_path is None and os.path.exists(cached_enhanced_path):
+                enhancement_output_path = cached_enhanced_path
 
         processed_audio = await _load_audio_segment_from_path(final_processed_path)
 
         backing_track_audio: Optional[AudioSegment] = None
+        if os.path.exists(cached_backing_path):
+            try:
+                backing_track_audio = AudioSegment.from_file(cached_backing_path, format="mp3")
+                print(
+                    "♻️ ClearVoice: Reusing cached backing track for %s (%.2fs)"
+                    % (cache_hash, len(backing_track_audio) / 1000.0)
+                )
+            except Exception as backing_exc:
+                print(f"⚠️ Failed to load cached backing track for {cache_hash}: {backing_exc}")
+                backing_track_audio = None
         if apply_enhancement and pre_clearvoice_mix_audio is not None:
             enhancement_audio: Optional[AudioSegment] = None
-            if enhancement_output_path is None:
-                print("⚠️ Enhancement output path not available, cannot extract backing track.")
-            else:
-                try:
-                    enhancement_audio = await _load_audio_segment_from_path(enhancement_output_path)
-                except Exception as enhancement_load_error:
-                    print(f"⚠️ Failed to load ClearVoice enhancement output: {enhancement_load_error}")
-            if enhancement_audio is None:
-                print("⚠️ Cannot extract backing track: enhancement audio not available.")
-            else:
-                backing_track_audio = _extract_backing_track_from_vocals(
-                    pre_clearvoice_mix_audio,
-                    enhancement_audio,
-                )
-                if backing_track_audio is not None and emit_status:
-                    sr_note = " (super-resolution applied after extraction)" if apply_super_resolution else ""
-                    await emit_status(
-                        stage="enhancement",
-                        message=f"Extracted instrumental backing track via MossFormer2_SE_48K{sr_note}.",
+            if backing_track_audio is None:
+                if enhancement_output_path is None:
+                    print("⚠️ Enhancement output path not available, cannot extract backing track.")
+                else:
+                    try:
+                        enhancement_audio = await _load_audio_segment_from_path(enhancement_output_path)
+                    except Exception as enhancement_load_error:
+                        print(f"⚠️ Failed to load ClearVoice enhancement output: {enhancement_load_error}")
+                if enhancement_audio is None:
+                    print("⚠️ Cannot extract backing track: enhancement audio not available.")
+                else:
+                    backing_track_audio = _extract_backing_track_from_vocals(
+                        pre_clearvoice_mix_audio,
+                        enhancement_audio,
                     )
+                    if backing_track_audio is not None:
+                        backing_dbfs = backing_track_audio.dBFS
+                        if math.isinf(backing_dbfs):
+                            backing_dbfs = -120.0
+                        print(
+                            "🎼 Extracted backing track %.2fs @ %d Hz (%d ch, %.1f dBFS)"
+                            % (
+                                len(backing_track_audio) / 1000.0,
+                                backing_track_audio.frame_rate,
+                                backing_track_audio.channels,
+                                backing_dbfs,
+                            )
+                        )
+                        try:
+                            backing_track_audio.export(cached_backing_path, format="mp3")
+                            print(f"💾 ClearVoice: Cached backing track for {cache_hash}.")
+                        except Exception as cache_exc:
+                            print(f"⚠️ Failed to cache backing track for {cache_hash}: {cache_exc}")
+                    if backing_track_audio is not None and emit_status:
+                        sr_note = " (super-resolution applied after extraction)" if apply_super_resolution else ""
+                        await emit_status(
+                            stage="enhancement",
+                            message=f"Extracted instrumental backing track via MossFormer2_SE_48K{sr_note}.",
+                        )
 
+        if backing_track_audio is not None:
+            reference_audio = pre_clearvoice_mix_audio or processed_audio
+            reference_ms = len(reference_audio)
+            backing_ms = len(backing_track_audio)
+            if abs(backing_ms - reference_ms) > 1000:
+                print(
+                    f"⚠️ Backing track duration mismatch (backing={backing_ms} ms vs reference={reference_ms} ms) for cache {cache_hash}."
+                )
         if emit_status:
             await emit_status(stage="enhancement", message="ClearVoice enhancement complete.")
         return processed_audio, backing_track_audio
@@ -349,6 +462,7 @@ async def _prepare_audio_assets(
     audio_file: Optional[UploadFile],
     audio_reference: Optional[str],
     preloaded_audio_bytes: Optional[bytes] = None,
+    source_audio_filename: Optional[str] = None,
     audio_mime_type_value: Optional[str],
     apply_enhancement: bool,
     apply_super_resolution: bool,
@@ -358,8 +472,10 @@ async def _prepare_audio_assets(
     custom_backing_mime_type_value: Optional[str] = None,
     emit_status: Optional[Callable[..., Awaitable[None]]] = None,
 ) -> Tuple[AudioSegment, str, bytes, str, Optional[AudioSegment], bool, str]:
+    source_audio_temp_path: Optional[str] = None
     custom_backing_audio: Optional[AudioSegment] = None
     backing_track_source = "none"
+    effective_apply_enhancement = apply_enhancement or apply_super_resolution
     custom_backing_ref = (custom_backing_audio_reference or "").strip()
     custom_backing_requested = bool(custom_backing_audio_file) or bool(custom_backing_ref)
     if custom_backing_requested:
@@ -395,8 +511,9 @@ async def _prepare_audio_assets(
             await emit_status(stage="backing", message="Custom backing track loaded.")
 
     if reuse_source_session is not None:
-        original_audio = reuse_source_session.original_audio
-        if original_audio is None:
+        try:
+            original_audio = _get_session_original_audio(reuse_source_session)
+        except RuntimeError:
             raise TranslateWorkflowHttpError(
                 404,
                 {
@@ -415,10 +532,10 @@ async def _prepare_audio_assets(
             fmt="mp3",
             bitrate=GEMINI_AUDIO_EXPORT_BITRATE,
         )
-        backing_track_audio = custom_backing_audio or reuse_source_session.backing_track_audio
+        backing_track_audio = custom_backing_audio or _get_session_backing_audio(reuse_source_session)
         if custom_backing_audio is not None:
             backing_track_source = "custom"
-        elif reuse_source_session.backing_track_audio is not None:
+        elif backing_track_audio is not None:
             backing_track_source = reuse_source_session.backing_track_source or "reuse"
         else:
             backing_track_source = "none"
@@ -435,89 +552,106 @@ async def _prepare_audio_assets(
             backing_track_source,
         )
 
-    if preloaded_audio_bytes is not None:
-        audio_bytes = preloaded_audio_bytes
-    else:
-        audio_io = await load_audio_bytes_from_request(audio_file, audio_reference)
-        if audio_io is None:
+    try:
+        if preloaded_audio_bytes is not None:
+            audio_bytes = preloaded_audio_bytes
+        else:
+            audio_io = await load_audio_bytes_from_request(audio_file, audio_reference)
+            if audio_io is None:
+                raise TranslateWorkflowHttpError(
+                    400,
+                    {"status": "error", "message": "No audio provided for translation."},
+                )
+            audio_bytes = audio_io.read()
+        if not audio_bytes:
             raise TranslateWorkflowHttpError(
                 400,
-                {"status": "error", "message": "No audio provided for translation."},
+                {"status": "error", "message": "Provided audio data is empty."},
             )
-        audio_bytes = audio_io.read()
-    if not audio_bytes:
-        raise TranslateWorkflowHttpError(
-            400,
-            {"status": "error", "message": "Provided audio data is empty."},
+        original_filename = source_audio_filename or (audio_file.filename if audio_file else None)
+        normalized_audio_temp_path: Optional[str] = None
+        if effective_apply_enhancement:
+            upload_temp_path = _persist_audio_upload(audio_bytes, original_filename)
+            normalized_audio_temp_path = await _normalize_uploaded_audio(upload_temp_path)
+            source_audio_temp_path = normalized_audio_temp_path
+
+        input_mime_type = audio_mime_type_value or (audio_file.content_type if audio_file else None) or "audio/wav"
+        audio_format = _guess_audio_format_from_mime(input_mime_type)
+
+        if emit_status:
+            await emit_status(stage="decode", message="Decoding audio input...")
+        try:
+            if normalized_audio_temp_path:
+                original_audio = await _load_audio_segment_from_path(normalized_audio_temp_path)
+            else:
+                original_audio = await _decode_audio_segment(audio_bytes, audio_format)
+        except Exception as exc:
+            raise TranslateWorkflowHttpError(
+                400,
+                {"status": "error", "message": f"Failed to decode audio: {str(exc)}"},
+            ) from exc
+        if emit_status:
+            await emit_status(
+                stage="decode",
+                message=f"Decoded audio ({len(original_audio) / 1000:.1f}s).",
+            )
+
+        pre_clearvoice_mix_audio = original_audio if effective_apply_enhancement else None
+        processed_audio, backing_track_audio = await _run_clearvoice_pipeline(
+            original_audio,
+            apply_enhancement=effective_apply_enhancement,
+            apply_super_resolution=apply_super_resolution,
+            pre_clearvoice_mix_audio=pre_clearvoice_mix_audio,
+            emit_status=emit_status,
+            source_audio_path=source_audio_temp_path,
         )
+        if backing_track_audio is not None:
+            backing_track_source = "extracted"
+        if custom_backing_audio is not None:
+            backing_track_audio = custom_backing_audio
+            backing_track_source = "custom"
 
-    input_mime_type = audio_mime_type_value or (audio_file.content_type if audio_file else None) or "audio/wav"
-    audio_format = _guess_audio_format_from_mime(input_mime_type)
-
-    if emit_status:
-        await emit_status(stage="decode", message="Decoding audio input...")
-    try:
-        original_audio = await _decode_audio_segment(audio_bytes, audio_format)
-    except Exception as exc:
-        raise TranslateWorkflowHttpError(
-            400,
-            {"status": "error", "message": f"Failed to decode audio: {str(exc)}"},
-        ) from exc
-    if emit_status:
-        await emit_status(
-            stage="decode",
-            message=f"Decoded audio ({len(original_audio) / 1000:.1f}s).",
+        processed_audio_bytes = await _export_audio_segment_bytes(
+            processed_audio,
+            fmt="mp3",
+            bitrate=GEMINI_AUDIO_EXPORT_BITRATE,
         )
+        merge_with_backing = requested_merge_backing and backing_track_audio is not None
+        if requested_merge_backing and backing_track_audio is None:
+            print("⚠️ Unable to merge with backing track because no instrumental was derived.")
 
-    pre_clearvoice_mix_audio = original_audio if apply_enhancement else None
-    processed_audio, backing_track_audio = await _run_clearvoice_pipeline(
-        original_audio,
-        apply_enhancement=apply_enhancement,
-        apply_super_resolution=apply_super_resolution,
-        pre_clearvoice_mix_audio=pre_clearvoice_mix_audio,
-        emit_status=emit_status,
-    )
-    if backing_track_audio is not None:
-        backing_track_source = "extracted"
-    if custom_backing_audio is not None:
-        backing_track_audio = custom_backing_audio
-        backing_track_source = "custom"
+        if emit_status:
+            if apply_super_resolution:
+                await emit_status(
+                    stage="gemini_prep",
+                    message="📤 Sending super-resolved audio (MossFormer2_SR_48K) to Gemini for transcription/translation.",
+                )
+            elif apply_enhancement:
+                await emit_status(
+                    stage="gemini_prep",
+                    message="📤 Sending enhanced audio (MossFormer2_SE_48K) to Gemini for transcription/translation.",
+                )
+            else:
+                await emit_status(
+                    stage="gemini_prep",
+                    message="📤 Sending original audio to Gemini for transcription/translation.",
+                )
 
-    processed_audio_bytes = await _export_audio_segment_bytes(
-        processed_audio,
-        fmt="mp3",
-        bitrate=GEMINI_AUDIO_EXPORT_BITRATE,
-    )
-    merge_with_backing = requested_merge_backing and backing_track_audio is not None
-    if requested_merge_backing and backing_track_audio is None:
-        print("⚠️ Unable to merge with backing track because no instrumental was derived.")
-
-    if emit_status:
-        if apply_super_resolution:
-            await emit_status(
-                stage="gemini_prep",
-                message="📤 Sending super-resolved audio (MossFormer2_SR_48K) to Gemini for transcription/translation.",
-            )
-        elif apply_enhancement:
-            await emit_status(
-                stage="gemini_prep",
-                message="📤 Sending enhanced audio (MossFormer2_SE_48K) to Gemini for transcription/translation.",
-            )
-        else:
-            await emit_status(
-                stage="gemini_prep",
-                message="📤 Sending original audio to Gemini for transcription/translation.",
-            )
-
-    return (
-        processed_audio,
-        input_mime_type,
-        processed_audio_bytes,
-        "audio/mpeg",
-        backing_track_audio,
-        merge_with_backing,
-        backing_track_source,
-    )
+        return (
+            processed_audio,
+            input_mime_type,
+            processed_audio_bytes,
+            "audio/mpeg",
+            backing_track_audio,
+            merge_with_backing,
+            backing_track_source,
+        )
+    finally:
+        if source_audio_temp_path:
+            try:
+                os.remove(source_audio_temp_path)
+            except Exception:
+                pass
 
 
 @dataclass
@@ -549,6 +683,7 @@ async def _build_translation_segments(
     preserve_silence_audio_flag: bool,
     generated_volume_percent_value: float,
     backing_volume_percent_value: float,
+    silence_volume_percent_value: float,
     backing_track_audio: Optional[AudioSegment],
     backing_track_source: str,
     merge_with_backing: bool,
@@ -558,6 +693,7 @@ async def _build_translation_segments(
     resolved_gemini_model: str,
     gemini_api_key_value: Optional[str],
     emit_status: Optional[Callable[..., Awaitable[None]]] = None,
+    source_chunk_session: Optional[TranslateSessionData] = None,
 ) -> SegmentBuildResult:
     manual_chunk_data = None
     manual_speaker_profiles: List[Dict[str, Any]] = []
@@ -645,10 +781,19 @@ async def _build_translation_segments(
         preserve_silence_audio=preserve_silence_audio_flag,
         generated_volume_percent=generated_volume_percent_value,
         backing_volume_percent=backing_volume_percent_value,
+        silence_volume_percent=silence_volume_percent_value,
         speaker_profiles=speaker_profiles,
         gemini_raw_text=raw_gemini_response_text,
         backing_track_source=backing_track_source,
     )
+    if source_chunk_session and source_chunk_session.chunk_parent_id:
+        session.chunk_parent_id = source_chunk_session.chunk_parent_id
+        session.chunk_index = source_chunk_session.chunk_index
+        session.chunk_start_ms = source_chunk_session.chunk_start_ms
+        session.chunk_end_ms = source_chunk_session.chunk_end_ms
+        session.chunk_cut_reason = source_chunk_session.chunk_cut_reason
+        session.chunk_silence_midpoint_ms = source_chunk_session.chunk_silence_midpoint_ms
+        session.chunk_source_session_id = source_chunk_session.session_id
     ui_segments = _serialize_segments_for_ui(segments, original_audio)
 
     metadata = {
@@ -666,6 +811,7 @@ async def _build_translation_segments(
         "preserve_silence_audio": preserve_silence_audio_flag,
         "generated_volume_percent": generated_volume_percent_value,
         "backing_volume_percent": backing_volume_percent_value,
+        "silence_volume_percent": silence_volume_percent_value,
         "gemini_raw_segments": gemini_chunks,
         "speaker_profiles": copy.deepcopy(speaker_profiles),
         "speaker_overrides": copy.deepcopy(getattr(session, "speaker_overrides", {})),
@@ -690,6 +836,33 @@ async def _build_translation_segments(
         },
         "manual_segments": manual_segments_used,
     }
+    chunk_reference = source_chunk_session if source_chunk_session else (session if session.chunk_parent_id else None)
+    if chunk_reference:
+        metadata["chunk"] = {
+            "session_id": chunk_reference.session_id,
+            "chunk_index": chunk_reference.chunk_index,
+            "start_ms": chunk_reference.chunk_start_ms,
+            "end_ms": chunk_reference.chunk_end_ms,
+            "cut_reason": chunk_reference.chunk_cut_reason,
+            "batch_id": chunk_reference.chunk_parent_id,
+            "silence_midpoint_ms": chunk_reference.chunk_silence_midpoint_ms,
+            "start_label": _format_ms_to_timestamp(chunk_reference.chunk_start_ms or 0),
+            "end_label": _format_ms_to_timestamp(chunk_reference.chunk_end_ms or 0),
+            "duration_label": _format_ms_to_timestamp(
+                max(0, (chunk_reference.chunk_end_ms or 0) - (chunk_reference.chunk_start_ms or 0))
+            ),
+            "backing_available": _session_has_backing_audio(chunk_reference),
+            "backing_source": chunk_reference.backing_track_source or "none",
+            "audio_url": _chunk_output_url(chunk_reference),
+            "output_format": chunk_reference.chunk_output_format,
+            "output_filename": chunk_reference.chunk_output_filename,
+            "vocals_url": f"/api/translate_vocals/{chunk_reference.session_id}",
+            "backing_url": (
+                f"/api/translate_backing_track/{chunk_reference.session_id}"
+                if _session_has_backing_audio(chunk_reference)
+                else None
+            ),
+        }
     metadata["session_id"] = session.session_id
     metadata["reuse_session_id"] = session.session_id
     separation_info = {
@@ -729,6 +902,7 @@ class TranslateSessionData:
     gemini_chunks: List[Dict[str, Any]]
     gemini_model: str
     gemini_api_key: Optional[str]
+    original_audio_path: Optional[str] = None
     backing_track_audio: Optional[AudioSegment] = None
     backing_track_source: str = "none"
     merge_with_backing: bool = False
@@ -736,15 +910,80 @@ class TranslateSessionData:
     preserve_silence_audio: bool = False
     generated_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT
     backing_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT
+    silence_volume_percent: float = DEFAULT_SILENCE_VOLUME_PERCENT
     speaker_profiles: List[Dict[str, Any]] = field(default_factory=list)
     speaker_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     gemini_raw_text: Optional[str] = None
     created_at: float = field(default_factory=lambda: time.time())
+    chunk_parent_id: Optional[str] = None
+    chunk_index: Optional[int] = None
+    chunk_start_ms: Optional[int] = None
+    chunk_end_ms: Optional[int] = None
+    chunk_generated: bool = False
+    chunk_output_path: Optional[str] = None
+    chunk_output_filename: Optional[str] = None
+    chunk_output_format: Optional[str] = None
+    chunk_generated_at: Optional[float] = None
+    chunk_cut_reason: Optional[str] = None
+    chunk_silence_midpoint_ms: Optional[int] = None
+    chunk_source_session_id: Optional[str] = None
 
 
 ADVANCED_TRANSLATE_SESSIONS: Dict[str, TranslateSessionData] = {}
 ADVANCED_TRANSLATE_SESSION_LOCK = asyncio.Lock()
 ADVANCED_TRANSLATE_SESSION_TTL_SECONDS = 60 * 60  # 1 hour
+
+
+def _session_media_path(session_id: str, kind: str, fmt: str = "mp3") -> str:
+    safe_kind = "".join(c for c in kind if c.isalnum() or c in {"_", "-"}).strip() or "media"
+    return os.path.join(TRANSLATE_SESSION_MEDIA_DIR, f"{session_id}_{safe_kind}.{fmt}")
+
+
+def _chunk_batch_media_path(batch_id: str, kind: str, fmt: str = "mp3") -> str:
+    safe_kind = "".join(c for c in kind if c.isalnum() or c in {"_", "-"}).strip() or kind
+    return os.path.join(TRANSLATE_SESSION_MEDIA_DIR, f"{batch_id}_{safe_kind}.{fmt}")
+
+
+def _compute_file_md5(path: str) -> str:
+    hash_md5 = hashlib.md5()
+    with open(path, "rb") as infile:
+        for chunk in iter(lambda: infile.read(8192), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+
+def _persist_session_audio_segment(session_id: str, audio: AudioSegment, kind: str, fmt: str = "mp3") -> str:
+    path = _session_media_path(session_id, kind, fmt)
+    audio.export(path, format=fmt)
+    return path
+
+
+def _get_session_original_audio(session: TranslateSessionData) -> AudioSegment:
+    if session.original_audio is not None:
+        return session.original_audio
+    if session.original_audio_path and os.path.exists(session.original_audio_path):
+        session.original_audio = _load_audio_segment_from_path_sync(session.original_audio_path)
+        return session.original_audio
+    raise RuntimeError(f"Session {session.session_id} does not have a stored vocal track.")
+
+
+def _get_session_backing_audio(session: TranslateSessionData) -> Optional[AudioSegment]:
+    return session.backing_track_audio
+
+
+def _session_has_backing_audio(session: TranslateSessionData) -> bool:
+    return session.backing_track_audio is not None
+
+
+def _persist_chunk_batch_media(batch_id: str, audio: AudioSegment, kind: str, fmt: str = "mp3") -> str:
+    path = _chunk_batch_media_path(batch_id, kind, fmt)
+    audio.export(path, format=fmt)
+    return path
+
+
+def _session_audio_duration_ms(session: TranslateSessionData) -> int:
+    audio = _get_session_original_audio(session)
+    return len(audio)
 
 
 class TranslateWorkflowHttpError(Exception):
@@ -854,6 +1093,10 @@ os.makedirs("prompts", exist_ok=True)
 os.makedirs("speaker_presets", exist_ok=True)
 TRANSLATE_OUTPUT_DIR = os.path.join("outputs", "translate_results")
 os.makedirs(TRANSLATE_OUTPUT_DIR, exist_ok=True)
+TRANSLATE_SESSION_MEDIA_DIR = os.path.join("outputs", "translate_session_media")
+os.makedirs(TRANSLATE_SESSION_MEDIA_DIR, exist_ok=True)
+CLEARVOICE_CACHE_DIR = os.path.join("outputs", "clearvoice_cache")
+os.makedirs(CLEARVOICE_CACHE_DIR, exist_ok=True)
 
 
 def _guess_media_type_from_extension(filename: str) -> str:
@@ -975,61 +1218,58 @@ def _detect_silence_intervals(audio_data, sample_rate, min_silence_duration=0.3,
         List of tuples (start_sample, end_sample) for each silence interval
     """
     import numpy as np
-    
+
+    if sample_rate <= 0:
+        return []
+
+    samples = np.asarray(audio_data)
+    if samples.size == 0:
+        return []
+
     # Convert to mono if stereo
-    if len(audio_data.shape) > 1:
-        audio_mono = np.mean(audio_data, axis=1)
+    if samples.ndim > 1:
+        audio_mono = samples.mean(axis=1)
     else:
-        audio_mono = audio_data
-    
-    # Calculate RMS energy in dB
-    frame_length = int(0.02 * sample_rate)  # 20ms frames
-    hop_length = int(0.01 * sample_rate)    # 10ms hop
-    
-    # Calculate energy for each frame
-    energy_db = []
-    for i in range(0, len(audio_mono) - frame_length, hop_length):
-        frame = audio_mono[i:i + frame_length]
-        rms = np.sqrt(np.mean(frame ** 2))
-        db = 20 * np.log10(rms + 1e-10)  # Add small value to avoid log(0)
-        energy_db.append(db)
-    
-    energy_db = np.array(energy_db)
-    
-    # Find silence regions (below threshold)
+        audio_mono = samples
+
+    frame_length = max(1, int(0.02 * sample_rate))  # 20ms frames
+    hop_length = max(1, int(0.01 * sample_rate))  # 10ms hop
+    total_samples = audio_mono.shape[0]
+    if total_samples < frame_length:
+        return []
+
+    squared = np.square(audio_mono, dtype=np.float32)
+    cumsum = np.cumsum(squared, dtype=np.float64)
+    cumsum = np.concatenate(([0.0], cumsum))
+
+    total_frames = 1 + (total_samples - frame_length) // hop_length
+    if total_frames <= 0:
+        return []
+
+    starts = np.arange(total_frames, dtype=np.int64) * hop_length
+    ends = starts + frame_length
+    window_energy = cumsum[ends] - cumsum[starts]
+    rms = np.sqrt(np.maximum(window_energy / frame_length, 1e-12))
+    energy_db = 20.0 * np.log10(rms)
+
+    if not np.any(energy_db < silence_threshold):
+        return []
+
     is_silence = energy_db < silence_threshold
-    
-    # Convert frame indices to sample indices
-    min_silence_frames = int(min_silence_duration * sample_rate / hop_length)
-    
-    # Find continuous silence regions
-    silence_intervals = []
-    in_silence = False
-    silence_start = 0
-    
-    for i, silent in enumerate(is_silence):
-        if silent and not in_silence:
-            # Start of silence
-            in_silence = True
-            silence_start = i
-        elif not silent and in_silence:
-            # End of silence
-            silence_length = i - silence_start
-            if silence_length >= min_silence_frames:
-                # Convert frame indices to sample indices
-                start_sample = silence_start * hop_length
-                end_sample = i * hop_length
-                silence_intervals.append((start_sample, end_sample))
-            in_silence = False
-    
-    # Check last region
-    if in_silence:
-        silence_length = len(is_silence) - silence_start
-        if silence_length >= min_silence_frames:
-            start_sample = silence_start * hop_length
-            end_sample = len(audio_mono)
-            silence_intervals.append((start_sample, end_sample))
-    
+    min_silence_frames = max(1, int(math.ceil(min_silence_duration * sample_rate / hop_length)))
+
+    padded = np.pad(is_silence.astype(np.int8), (1, 1))
+    changes = np.diff(padded)
+    start_frames = np.where(changes == 1)[0]
+    end_frames = np.where(changes == -1)[0]
+
+    silence_intervals: List[Tuple[int, int]] = []
+    for start_frame, end_frame in zip(start_frames, end_frames):
+        if end_frame - start_frame >= min_silence_frames:
+            start_sample = start_frame * hop_length
+            end_sample = min(total_samples, end_frame * hop_length + frame_length)
+            silence_intervals.append((int(start_sample), int(end_sample)))
+
     return silence_intervals
 
 def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
@@ -1123,10 +1363,645 @@ def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
         return input_path
 
 
+def _audio_segment_to_ndarray(audio: AudioSegment) -> Tuple[np.ndarray, int]:
+    """Convert a pydub AudioSegment into a normalized numpy array (float32)."""
+    if audio is None:
+        return np.zeros((0,), dtype=np.float32), 16000
+    frame_rate = int(audio.frame_rate or 16000)
+    sample_width = max(1, int(audio.sample_width or 2))
+    raw_samples = np.array(audio.get_array_of_samples())
+    if audio.channels > 1:
+        try:
+            raw_samples = raw_samples.reshape((-1, audio.channels))
+        except ValueError:
+            raw_samples = raw_samples.reshape((-1, audio.channels), order="F")
+    max_val = float(1 << (8 * sample_width - 1))
+    if max_val > 0:
+        normalized = raw_samples.astype(np.float32) / max_val
+    else:
+        normalized = raw_samples.astype(np.float32)
+    return normalized, frame_rate
+
+
+def _prepare_analysis_samples(
+    audio: AudioSegment,
+    target_sample_rate: int = 16_000,
+) -> Tuple[np.ndarray, int, int]:
+    """
+    Prepare a numpy array for analysis-heavy operations.
+    Returns (samples, effective_sample_rate, downsample_factor).
+    """
+    samples, sample_rate = _audio_segment_to_ndarray(audio)
+    if sample_rate <= 0:
+        return samples, 1, 1
+
+    downsample_factor = 1
+    if target_sample_rate and sample_rate > target_sample_rate:
+        downsample_factor = max(1, sample_rate // target_sample_rate)
+        samples = samples[::downsample_factor].copy()
+        sample_rate = max(1, sample_rate // downsample_factor)
+
+    return samples, sample_rate, downsample_factor
+
+
+def _detect_silence_midpoints_in_window(
+    audio: Optional[AudioSegment] = None,
+    *,
+    min_silence_ms: int,
+    silence_threshold_db: float,
+    offset_ms: int = 0,
+    samples: Optional[np.ndarray] = None,
+    sample_rate: Optional[int] = None,
+) -> List[int]:
+    """
+    Detect silence midpoints within a short audio window and return absolute millisecond offsets.
+    """
+    if samples is None or sample_rate is None:
+        if audio is None:
+            return []
+        samples, sample_rate = _audio_segment_to_ndarray(audio)
+
+    silence_seconds = max(min_silence_ms / 1000.0, 0.1)
+    silence_intervals = _detect_silence_intervals(
+        samples,
+        sample_rate,
+        min_silence_duration=silence_seconds,
+        silence_threshold=silence_threshold_db,
+    )
+    return [
+        offset_ms + int(((start + end) / 2) * 1000 / sample_rate)
+        for start, end in silence_intervals
+        if end > start
+    ]
+
+
+def _detect_silence_midpoints_parallel(
+    audio: AudioSegment,
+    *,
+    min_silence_ms: int,
+    silence_threshold_db: float,
+    window_ms: int = 240_000,
+    analysis_samples: Optional[np.ndarray] = None,
+    analysis_sample_rate: Optional[int] = None,
+    analysis_downsample_factor: int = 1,
+) -> Tuple[List[int], Dict[str, Any]]:
+    """
+    Split the audio into overlapping windows and detect silence midpoints in parallel.
+    Returns (sorted_midpoints, stats).
+    """
+    total_duration_ms = len(audio)
+    if total_duration_ms <= 0:
+        return [], {"windows": 0, "strategy": "empty"}
+
+    detection_start = time.perf_counter()
+    if analysis_samples is None or analysis_sample_rate is None:
+        analysis_samples, analysis_sample_rate, analysis_downsample_factor = _prepare_analysis_samples(audio)
+
+    analysis_samples = np.asarray(analysis_samples)
+    analysis_sample_rate = max(1, int(analysis_sample_rate or 1))
+    samples_per_ms = analysis_sample_rate / 1000.0
+    total_samples = analysis_samples.shape[0]
+    if total_samples <= 0:
+        return [], {
+            "windows": 0,
+            "strategy": "empty",
+            "analysis_sample_rate": analysis_sample_rate,
+            "analysis_downsample_factor": analysis_downsample_factor,
+        }
+
+    effective_window = max(window_ms, min_silence_ms * 4, 60_000)
+    overlap_ms = max(min_silence_ms * 2, 2_000)
+    step_ms = max(10_000, effective_window - overlap_ms)
+
+    tasks: List[Tuple[int, np.ndarray]] = []
+    start_ms = 0
+    while start_ms < total_duration_ms:
+        end_ms = min(total_duration_ms, start_ms + effective_window)
+        start_sample = int(start_ms * samples_per_ms)
+        end_sample = int(math.ceil(end_ms * samples_per_ms))
+        if end_sample <= start_sample:
+            end_sample = min(total_samples, start_sample + max(1, int(samples_per_ms * min_silence_ms)))
+        end_sample = min(total_samples, end_sample)
+        window_samples = analysis_samples[start_sample:end_sample]
+        if window_samples.size == 0:
+            break
+        tasks.append((start_ms, window_samples))
+        if end_ms >= total_duration_ms:
+            break
+        start_ms += step_ms
+
+    midpoints: List[int] = []
+    stats: Dict[str, Any] = {
+        "windows": len(tasks),
+        "strategy": "single" if len(tasks) <= 1 else "parallel",
+        "analysis_sample_rate": analysis_sample_rate,
+        "analysis_downsample_factor": analysis_downsample_factor,
+        "window_ms": effective_window,
+        "overlap_ms": overlap_ms,
+        "step_ms": step_ms,
+    }
+
+    if not tasks:
+        stats["elapsed_ms"] = (time.perf_counter() - detection_start) * 1000
+        return [], stats
+
+    if len(tasks) == 1:
+        offset_ms, window_samples = tasks[0]
+        midpoints.extend(
+            _detect_silence_midpoints_in_window(
+                min_silence_ms=min_silence_ms,
+                silence_threshold_db=silence_threshold_db,
+                offset_ms=offset_ms,
+                samples=window_samples,
+                sample_rate=analysis_sample_rate,
+            )
+        )
+    else:
+        futures: List[Any] = []
+        for offset_ms, window_samples in tasks:
+            futures.append(
+                executor.submit(
+                    _detect_silence_midpoints_in_window,
+                    min_silence_ms=min_silence_ms,
+                    silence_threshold_db=silence_threshold_db,
+                    offset_ms=offset_ms,
+                    samples=window_samples,
+                    sample_rate=analysis_sample_rate,
+                )
+            )
+
+        for future in futures:
+            try:
+                midpoints.extend(future.result())
+            except Exception as exc:
+                print(f"⚠️ Silence detection window failed: {exc}")
+
+    stats["elapsed_ms"] = (time.perf_counter() - detection_start) * 1000
+    return sorted(set(midpoints)), stats
+
+
+def _plan_chunk_ranges(
+    audio: AudioSegment,
+    *,
+    min_chunk_ms: int,
+    max_chunk_ms: int,
+    min_silence_ms: int = CHUNK_SPLIT_MIN_SILENCE_MS,
+    silence_threshold_db: float = CHUNK_SPLIT_SILENCE_THRESHOLD_DB,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Determine chunk boundaries for long-form audio by opportunistically snapping to nearby silence.
+    Returns a list of chunk metadata dictionaries plus diagnostics.
+    """
+    total_duration_ms = len(audio)
+    if total_duration_ms <= 0:
+        return [(0, 0)], {
+            "silence_probes": 0,
+            "silence_points": 0,
+            "silence_count": 0,
+            "timing_ms": {},
+        }
+    min_chunk_ms = max(60_000, int(min_chunk_ms))
+    max_chunk_ms = max(min_chunk_ms, int(max_chunk_ms))
+    if total_duration_ms <= max_chunk_ms:
+        return [(0, total_duration_ms)], {
+            "silence_probes": 0,
+            "silence_points": 0,
+            "silence_count": 0,
+            "timing_ms": {},
+        }
+
+    timing_ms: Dict[str, float] = {}
+    analysis_start = time.perf_counter()
+    analysis_samples, analysis_sample_rate, analysis_downsample_factor = _prepare_analysis_samples(audio)
+    timing_ms["analysis_samples"] = (time.perf_counter() - analysis_start) * 1000
+
+    silence_detection_start = time.perf_counter()
+    silence_midpoints_ms, silence_profile = _detect_silence_midpoints_parallel(
+        audio,
+        min_silence_ms=min_silence_ms,
+        silence_threshold_db=silence_threshold_db,
+        window_ms=max(max_chunk_ms * 2, 240_000),
+        analysis_samples=analysis_samples,
+        analysis_sample_rate=analysis_sample_rate,
+        analysis_downsample_factor=analysis_downsample_factor,
+    )
+    timing_ms["silence_detection"] = (time.perf_counter() - silence_detection_start) * 1000
+
+    print(
+        f"🧮 chunk planner: analysis prep {timing_ms['analysis_samples']:.1f}ms "
+        f"(downsample x{analysis_downsample_factor}, rate={analysis_sample_rate}Hz)"
+    )
+    print(
+        f"🧮 chunk planner: silence detection {timing_ms['silence_detection']:.1f}ms "
+        f"(windows={silence_profile.get('windows', 0)}, points={len(silence_midpoints_ms)})"
+    )
+
+    chunk_ranges: List[Dict[str, Any]] = []
+    current_start = 0
+    pointer = 0
+    grace_window = min(CHUNK_SPLIT_SILENCE_GRACE_MS, max_chunk_ms // 2 or 15_000)
+
+    range_selection_start = time.perf_counter()
+    while current_start < total_duration_ms and len(chunk_ranges) < CHUNK_SPLIT_MAX_CHUNKS:
+        desired_min = current_start + min_chunk_ms
+        desired_max = min(current_start + max_chunk_ms, total_duration_ms)
+        candidate_cut: Optional[int] = None
+        candidate_after_window: Optional[int] = None
+        cut_from_silence = False
+
+        while pointer < len(silence_midpoints_ms) and silence_midpoints_ms[pointer] <= current_start:
+            pointer += 1
+
+        lookahead = pointer
+        while lookahead < len(silence_midpoints_ms):
+            point = silence_midpoints_ms[lookahead]
+            if point < desired_min:
+                lookahead += 1
+                continue
+            if point <= desired_max:
+                candidate_cut = point
+                cut_from_silence = True
+                pointer = lookahead + 1
+                break
+            candidate_after_window = point
+            pointer = lookahead + 1
+            break
+
+        if candidate_cut is None and candidate_after_window is not None:
+            if candidate_after_window - desired_max <= grace_window:
+                candidate_cut = candidate_after_window
+                cut_from_silence = True
+
+        if candidate_cut is None:
+            candidate_cut = desired_max
+            cut_from_silence = False
+
+        if candidate_cut <= current_start:
+            candidate_cut = min(total_duration_ms, max(current_start + min_chunk_ms, current_start + 1000))
+            cut_from_silence = False
+
+        chunk_ranges.append(
+            {
+                "start_ms": current_start,
+                "end_ms": candidate_cut,
+                "cut_reason": "silence_center" if cut_from_silence else "hard_limit",
+                "silence_midpoint_ms": candidate_cut if cut_from_silence else None,
+            }
+        )
+        current_start = candidate_cut
+
+    timing_ms["range_selection"] = (time.perf_counter() - range_selection_start) * 1000
+
+    if chunk_ranges:
+        last_range = chunk_ranges[-1]
+        if last_range["end_ms"] < total_duration_ms:
+            last_range["end_ms"] = total_duration_ms
+            if last_range["cut_reason"] != "silence_center":
+                last_range["cut_reason"] = "hard_limit"
+
+    merge_start = time.perf_counter()
+    merged_ranges: List[Dict[str, Any]] = []
+    for entry in chunk_ranges:
+        start_ms = entry["start_ms"]
+        end_ms = entry["end_ms"]
+        duration = end_ms - start_ms
+        if merged_ranges and duration < max(10_000, int(0.25 * min_chunk_ms)):
+            merged_ranges[-1]["end_ms"] = end_ms
+            merged_ranges[-1]["cut_reason"] = entry["cut_reason"]
+            merged_ranges[-1]["silence_midpoint_ms"] = entry.get("silence_midpoint_ms")
+        else:
+            merged_ranges.append(entry)
+
+    timing_ms["range_merge"] = (time.perf_counter() - merge_start) * 1000
+
+    print(
+        f"🧮 chunk planner: range selection {timing_ms['range_selection']:.1f}ms, "
+        f"merge {timing_ms['range_merge']:.1f}ms -> {len(merged_ranges)} chunk(s)"
+    )
+
+    diagnostics = {
+        "silence_probes": silence_profile.get("windows", 0),
+        "silence_points": len(silence_midpoints_ms),
+        "silence_count": len(silence_midpoints_ms),
+        "analysis_sample_rate": analysis_sample_rate,
+        "analysis_downsample_factor": analysis_downsample_factor,
+        "timing_ms": timing_ms,
+        "silence_profile": silence_profile,
+    }
+
+    return merged_ranges, diagnostics
+
+
 def _append_suffix_to_path(file_path: str, suffix: str) -> str:
     """Create a new path with the given suffix before the extension."""
     path_obj = Path(file_path)
     return str(path_obj.with_name(f"{path_obj.stem}{suffix}{path_obj.suffix}"))
+
+
+def _persist_audio_upload(bytes_data: bytes, original_filename: Optional[str] = None) -> str:
+    """Persist uploaded audio bytes to a temporary file and return its path."""
+    suffix = ".tmp"
+    if original_filename:
+        _, ext = os.path.splitext(original_filename)
+        if ext:
+            suffix = ext.lower()
+    fd, temp_path = tempfile.mkstemp(suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as temp_file:
+            temp_file.write(bytes_data)
+    except Exception:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+        raise
+    return temp_path
+
+
+def _transcode_audio_to_wav(source_path: str) -> str:
+    """Transcode an arbitrary audio file to WAV (48 kHz PCM16)."""
+    fd, temp_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        source_path,
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "48000",
+        temp_path,
+    ]
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+        stderr_msg = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else ""
+        raise RuntimeError(f"Failed to transcode audio for ClearVoice: {stderr_msg.strip()}") from exc
+    return temp_path
+
+
+async def _normalize_audio_to_cached(
+    source_path: str,
+    target_path: str,
+    *,
+    delete_source: bool = False,
+) -> str:
+    """Convert ClearVoice output to MP3 and save it to cache."""
+    # Load the audio from source (WAV from ClearVoice)
+    audio = await _load_audio_segment_from_path(source_path)
+    # Export as MP3 to cache
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    audio.export(target_path, format="mp3", bitrate="128k")
+    if delete_source and os.path.exists(source_path) and source_path != target_path:
+        try:
+            os.remove(source_path)
+        except Exception as exc:
+            print(f"⚠️ Failed to delete temp ClearVoice output {source_path}: {exc}")
+    return target_path
+
+
+async def _normalize_uploaded_audio(source_path: str) -> str:
+    """
+    Normalize user-uploaded audio to canonical WAV (48 kHz PCM16) before
+    ClearVoice processing and backing extraction.
+    """
+    normalized_path = await _run_blocking(_transcode_audio_to_wav, source_path)
+    if os.path.exists(source_path) and source_path != normalized_path:
+        try:
+            os.remove(source_path)
+        except Exception as exc:
+            print(f"⚠️ Failed to remove original upload {source_path}: {exc}")
+    return normalized_path
+
+
+async def _ensure_clearvoice_input_path(source_path: str) -> Tuple[str, bool]:
+    """
+    Ensure the ClearVoice input is a WAV file on disk.
+    Returns (path, created_temp_flag).
+    """
+    if source_path.lower().endswith(".wav"):
+        return source_path, False
+    temp_wav_path = await _run_blocking(_transcode_audio_to_wav, source_path)
+    return temp_wav_path, True
+
+
+def _chunk_output_url(session: TranslateSessionData) -> Optional[str]:
+    if session.chunk_output_filename:
+        return f"/api/translate_outputs/{session.chunk_output_filename}"
+    return None
+
+
+def _serialize_chunk_session(session: TranslateSessionData) -> Dict[str, Any]:
+    start_ms = max(0, session.chunk_start_ms or 0)
+    end_ms = max(start_ms, session.chunk_end_ms or _session_audio_duration_ms(session))
+    duration_ms = max(0, end_ms - start_ms)
+    audio_url = _chunk_output_url(session)
+    backing_available = _session_has_backing_audio(session)
+    return {
+        "chunk_index": session.chunk_index,
+        "session_id": session.session_id,
+        "reuse_session_id": session.session_id,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "duration_ms": duration_ms,
+        "start_label": _format_ms_to_timestamp(start_ms),
+        "end_label": _format_ms_to_timestamp(end_ms),
+        "duration_label": _format_ms_to_timestamp(duration_ms),
+        "generated": bool(session.chunk_generated),
+        "generated_at": session.chunk_generated_at,
+        "audio_url": audio_url,
+        "output_format": session.chunk_output_format,
+        "output_filename": session.chunk_output_filename,
+        "backing_available": backing_available,
+        "backing_source": session.backing_track_source or "none",
+        "vocals_url": f"/api/translate_vocals/{session.session_id}",
+        "backing_url": f"/api/translate_backing_track/{session.session_id}" if backing_available else None,
+        "batch_id": session.chunk_parent_id,
+        "cut_reason": session.chunk_cut_reason or "unknown",
+        "silence_midpoint_ms": session.chunk_silence_midpoint_ms,
+    }
+
+
+def _mark_chunk_generated(
+    session: TranslateSessionData,
+    output_path: str,
+    output_filename: str,
+    response_format: str,
+) -> None:
+    session.chunk_generated = True
+    session.chunk_output_path = output_path
+    session.chunk_output_filename = output_filename
+    session.chunk_output_format = response_format
+    session.chunk_generated_at = time.time()
+
+
+async def _generate_chunk_audio_from_session(
+    chunk_session: TranslateSessionData,
+    *,
+    dest_language: str,
+    response_format: str,
+    bitrate: str,
+    gemini_model: str,
+    gemini_api_key: Optional[str],
+    ignore_non_speech: bool,
+    preserve_silence_audio: bool,
+    generated_volume_percent: float,
+    backing_volume_percent: float,
+    merge_backing_track: bool,
+    silence_volume_percent: float,
+) -> Tuple[str, str, Dict[str, Any]]:
+    clearvoice_settings = chunk_session.clearvoice_settings or {}
+    apply_enhancement = bool(clearvoice_settings.get("enhancement"))
+    apply_super_resolution = bool(clearvoice_settings.get("super_resolution"))
+    if apply_super_resolution and not apply_enhancement:
+        apply_enhancement = True
+        clearvoice_settings["enhancement"] = True
+
+    (
+        original_audio,
+        input_mime_type_value,
+        processed_audio_bytes,
+        gemini_mime_type,
+        backing_track_audio,
+        merge_with_backing,
+        backing_track_source,
+    ) = await _prepare_audio_assets(
+        reuse_source_session=chunk_session,
+        audio_file=None,
+        audio_reference=None,
+        preloaded_audio_bytes=None,
+        audio_mime_type_value=chunk_session.input_mime_type,
+        apply_enhancement=apply_enhancement,
+        apply_super_resolution=apply_super_resolution,
+        requested_merge_backing=merge_backing_track,
+        custom_backing_audio_file=None,
+        custom_backing_audio_reference=None,
+        custom_backing_mime_type_value=None,
+        emit_status=None,
+    )
+
+    final_prompt = _resolve_final_prompt(
+        chunk_session.prompt,
+        dest_language,
+        True,
+        ignore_non_speech,
+    )
+
+    segment_result = await _build_translation_segments(
+        original_audio=original_audio,
+        processed_audio_bytes=processed_audio_bytes,
+        gemini_mime_type=gemini_mime_type,
+        dest_language=dest_language,
+        final_prompt=final_prompt,
+        translate_enabled=True,
+        response_format_value=response_format,
+        bitrate_value=bitrate,
+        input_mime_type=input_mime_type_value,
+        apply_enhancement=apply_enhancement,
+        apply_super_resolution=apply_super_resolution,
+        ignore_non_speech_flag=ignore_non_speech,
+        preserve_silence_audio_flag=preserve_silence_audio,
+        generated_volume_percent_value=generated_volume_percent,
+        backing_volume_percent_value=backing_volume_percent,
+        silence_volume_percent_value=silence_volume_percent,
+        backing_track_audio=backing_track_audio,
+        backing_track_source=backing_track_source,
+        merge_with_backing=merge_with_backing,
+        segments_override_value=None,
+        min_speech_duration=MIN_SPEECH_DURATION_MS,
+        max_merge_interval=MAX_MERGE_INTERVAL_MS,
+        resolved_gemini_model=gemini_model,
+        gemini_api_key_value=(gemini_api_key or "").strip() or None,
+        emit_status=None,
+        source_chunk_session=chunk_session,
+    )
+
+    audio_payload, _media_type, synthesis_metadata = await _synthesize_translated_audio(
+        original_audio,
+        segment_result.segments,
+        dest_language,
+        response_format=response_format,
+        bitrate=bitrate,
+        input_mime_type=input_mime_type_value,
+        clearvoice_settings=clearvoice_settings,
+        backing_track_audio=backing_track_audio,
+        backing_track_source=backing_track_source,
+        merge_with_backing=merge_with_backing,
+        preserve_silence_audio=preserve_silence_audio,
+        generated_volume_percent=generated_volume_percent,
+        silence_volume_percent=silence_volume_percent,
+        speaker_overrides=chunk_session.speaker_overrides,
+        backing_volume_percent=backing_volume_percent,
+    )
+
+    metadata = dict(segment_result.metadata)
+    metadata.update(synthesis_metadata or {})
+    metadata["ignore_non_speech"] = ignore_non_speech
+    metadata["preserve_silence_audio"] = preserve_silence_audio
+    metadata["generated_volume_percent"] = generated_volume_percent
+    metadata["backing_volume_percent"] = backing_volume_percent
+    metadata["silence_volume_percent"] = silence_volume_percent
+    metadata["gemini_model"] = gemini_model
+
+    output_filename = f"translate_chunk_{chunk_session.session_id}_{uuid.uuid4().hex}.{response_format}"
+    output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
+    with open(output_path, "wb") as outfile:
+        outfile.write(audio_payload)
+    audio_url = f"/api/translate_outputs/{output_filename}"
+
+    _mark_chunk_generated(chunk_session, output_path, output_filename, response_format)
+    metadata["chunk"] = _serialize_chunk_session(chunk_session)
+
+    chunk_session.dest_language = dest_language
+    chunk_session.ignore_non_speech = ignore_non_speech
+    chunk_session.preserve_silence_audio = preserve_silence_audio
+    chunk_session.generated_volume_percent = generated_volume_percent
+    chunk_session.backing_volume_percent = backing_volume_percent
+    chunk_session.silence_volume_percent = silence_volume_percent
+    chunk_session.gemini_model = gemini_model
+
+    await _update_translate_session_metadata(
+        chunk_session.session_id,
+        response_format=response_format,
+        bitrate=bitrate,
+        gemini_model=gemini_model,
+        generated_volume_percent=generated_volume_percent,
+        backing_volume_percent=backing_volume_percent,
+    )
+    await _update_translate_session_segments(
+        chunk_session.session_id,
+        segment_result.ui_segments,
+    )
+
+    return audio_url, output_filename, metadata
+
+
+def _load_chunk_audio_for_merge(session: TranslateSessionData) -> Optional[AudioSegment]:
+    if (
+        session.chunk_generated
+        and session.chunk_output_path
+        and os.path.exists(session.chunk_output_path)
+    ):
+        ext = os.path.splitext(session.chunk_output_path)[1].lstrip(".") or None
+        try:
+            return AudioSegment.from_file(session.chunk_output_path, format=ext)
+        except Exception as exc:
+            print(f"⚠️ Failed to load generated chunk audio ({session.session_id}): {exc}")
+    try:
+        return _get_session_original_audio(session)
+    except RuntimeError as exc:
+        print(f"⚠️ Chunk session '{session.session_id}' is missing original audio: {exc}")
+        return None
 
 
 def _extract_backing_track_from_vocals(
@@ -1682,6 +2557,49 @@ def _coerce_positive_int(
     return parsed
 
 
+def _coerce_positive_float(
+    value: Any,
+    default: float,
+    *,
+    min_value: float = 0.0,
+    max_value: Optional[float] = None,
+) -> float:
+    if value is None:
+        return max(default, min_value)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return max(default, min_value)
+    if not math.isfinite(parsed):
+        return max(default, min_value)
+    parsed = max(parsed, min_value)
+    if max_value is not None:
+        parsed = min(parsed, max_value)
+    return parsed
+
+
+def _coerce_float_range(
+    value: Any,
+    default: float,
+    *,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    if min_value is not None and parsed < min_value:
+        parsed = min_value
+    if max_value is not None and parsed > max_value:
+        parsed = max_value
+    return parsed
+
+
 def _coerce_volume_percent(
     value: Any,
     default: float = DEFAULT_GENERATED_VOLUME_PERCENT,
@@ -1988,9 +2906,18 @@ async def _create_translate_session(
     preserve_silence_audio: bool = False,
     generated_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT,
     backing_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT,
+    silence_volume_percent: float = DEFAULT_SILENCE_VOLUME_PERCENT,
     speaker_profiles: Optional[List[Dict[str, Any]]] = None,
     speaker_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     gemini_raw_text: Optional[str] = None,
+    chunk_parent_id: Optional[str] = None,
+    chunk_index: Optional[int] = None,
+    chunk_start_ms: Optional[int] = None,
+    chunk_end_ms: Optional[int] = None,
+    chunk_cut_reason: Optional[str] = None,
+    chunk_silence_midpoint_ms: Optional[int] = None,
+    persist_media: bool = False,
+    media_format: str = "wav",
 ) -> TranslateSessionData:
     session_id = uuid.uuid4().hex
     session = TranslateSessionData(
@@ -2014,10 +2941,20 @@ async def _create_translate_session(
         preserve_silence_audio=preserve_silence_audio,
         generated_volume_percent=generated_volume_percent,
         backing_volume_percent=backing_volume_percent,
+        silence_volume_percent=silence_volume_percent,
         speaker_profiles=copy.deepcopy(speaker_profiles or []),
         speaker_overrides=copy.deepcopy(speaker_overrides or {}),
         gemini_raw_text=gemini_raw_text,
+        chunk_parent_id=chunk_parent_id,
+        chunk_index=chunk_index,
+        chunk_start_ms=chunk_start_ms,
+        chunk_end_ms=chunk_end_ms,
+        chunk_cut_reason=chunk_cut_reason,
+        chunk_silence_midpoint_ms=chunk_silence_midpoint_ms,
     )
+    if persist_media:
+        session.original_audio_path = _persist_session_audio_segment(session_id, original_audio, "vocals", fmt=media_format)
+        session.original_audio = None
     async with ADVANCED_TRANSLATE_SESSION_LOCK:
         _cleanup_expired_translate_sessions_locked()
         ADVANCED_TRANSLATE_SESSIONS[session_id] = session
@@ -2076,6 +3013,16 @@ async def _update_translate_session_metadata(
         if backing_volume_percent is not None:
             session.backing_volume_percent = backing_volume_percent
             session.created_at = time.time()
+
+
+async def _list_chunk_sessions(chunk_parent_id: str) -> List[TranslateSessionData]:
+    async with ADVANCED_TRANSLATE_SESSION_LOCK:
+        _cleanup_expired_translate_sessions_locked()
+        return [
+            session
+            for session in ADVANCED_TRANSLATE_SESSIONS.values()
+            if session.chunk_parent_id == chunk_parent_id
+        ]
 
 
 def _guess_audio_format_from_mime(mime_type: Optional[str]) -> Optional[str]:
@@ -2394,6 +3341,7 @@ async def _synthesize_translated_audio(
     merge_with_backing: bool = False,
     preserve_silence_audio: bool = False,
     generated_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT,
+    silence_volume_percent: float = DEFAULT_SILENCE_VOLUME_PERCENT,
     speaker_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     backing_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT,
     pad_to_original: bool = True,
@@ -2409,6 +3357,10 @@ async def _synthesize_translated_audio(
     override_map: Dict[str, Dict[str, Any]] = {
         str(key).lower(): value for key, value in (speaker_overrides or {}).items()
     }
+    silence_volume_percent = _coerce_volume_percent(
+        silence_volume_percent,
+        DEFAULT_SILENCE_VOLUME_PERCENT,
+    )
 
     async def process_segment(index: int, segment: Dict[str, Any]):
         seg_type = segment.get("type")
@@ -2419,6 +3371,7 @@ async def _synthesize_translated_audio(
         if seg_type == "silence":
             if preserve_silence_audio:
                 chunk_audio = original_audio[start_ms:end_ms]
+                chunk_audio = _apply_volume_with_ffmpeg(chunk_audio, silence_volume_percent)
                 audio_seg = _match_segment_duration(chunk_audio, duration_ms, frame_rate, sample_width, channels)
                 log_entry = {
                     "index": index,
@@ -3086,7 +4039,7 @@ class TranslateRequest(BaseModel):
     )
     bitrate: Optional[str] = Field(
         default=None,
-        description="Optional bitrate (e.g., '192k') when using lossy codecs such as MP3.",
+        description="Optional bitrate (e.g., '128k') when using lossy codecs such as MP3.",
     )
     enhance_voice: Optional[bool] = Field(
         default=False,
@@ -3135,6 +4088,16 @@ class TranslateRequest(BaseModel):
     backing_volume_percent: Optional[float] = Field(
         default=None,
         description="Adjust backing track loudness when merging (percentage, default 100%).",
+    )
+    silence_volume_percent: Optional[float] = Field(
+        default=None,
+        ge=MIN_GENERATED_VOLUME_PERCENT,
+        le=MAX_GENERATED_VOLUME_PERCENT,
+        description="Adjust preserved-silence loudness when keeping original audio (percentage, default 100%).",
+    )
+    reuse_session_id: Optional[str] = Field(
+        default=None,
+        description="Reuse a previous translate session (e.g., from chunk splitting) instead of uploading audio again.",
     )
 
 
@@ -3222,9 +4185,96 @@ class TranslateGenerateRequest(BaseModel):
         default=None,
         description="Override backing-track loudness before merging (percentage, default 100%).",
     )
+    silence_volume_percent: Optional[float] = Field(
+        default=None,
+        ge=MIN_GENERATED_VOLUME_PERCENT,
+        le=MAX_GENERATED_VOLUME_PERCENT,
+        description="Override preserved-silence loudness before merging (percentage, default 100%).",
+    )
     speaker_overrides: Optional[Dict[str, SpeakerOverrideInput]] = Field(
         default=None,
         description="Optional mapping from detected speaker ids (speaker1, speaker2, …) to preset overrides.",
+    )
+
+
+class MergeChunksRequest(BaseModel):
+    chunk_session_ids: Optional[List[str]] = Field(
+        default=None,
+        description="Specific chunk session IDs to merge, ordered as provided.",
+    )
+    chunk_batch_id: Optional[str] = Field(
+        default=None,
+        description="Chunk batch identifier returned from /api/translate_split_audio.",
+    )
+    response_format: Optional[Literal["mp3", "wav", "flac", "aac", "opus", "ogg", "webm"]] = Field(
+        default=None,
+        description="Desired format for the merged output (defaults to MP3).",
+    )
+    bitrate: Optional[str] = Field(
+        default=None,
+        description="Optional bitrate (e.g., '128k') for lossy codecs.",
+    )
+    merge_backing_track: Optional[bool] = Field(
+        default=None,
+        description="Whether to mix the concatenated chunk vocals with their stored backing audio.",
+    )
+
+
+class ChunkBatchGenerateRequest(BaseModel):
+    chunk_session_ids: List[str] = Field(
+        ...,
+        min_items=1,
+        description="List of chunk session IDs to generate in parallel.",
+    )
+    dest_language: Optional[str] = Field(
+        default=None,
+        description="Override destination language; defaults to the stored chunk language.",
+    )
+    response_format: Optional[Literal["mp3", "wav", "flac", "aac", "opus", "ogg", "webm"]] = Field(
+        default=None,
+        description="Desired audio format for each generated chunk.",
+    )
+    bitrate: Optional[str] = Field(
+        default=None,
+        description="Optional bitrate (e.g., '128k') when using lossy codecs such as MP3.",
+    )
+    gemini_model: Optional[str] = Field(
+        default=None,
+        description="Override the Gemini model used for chunk transcription/translation.",
+    )
+    gemini_api_key: Optional[str] = Field(
+        default=None,
+        description="Provide a Gemini API key for this batch if environment defaults should be bypassed.",
+    )
+    merge_backing_track: Optional[bool] = Field(
+        default=None,
+        description="When true, attempt to mix regenerated speech with the stored backing track if available.",
+    )
+    ignore_non_speech: Optional[bool] = Field(
+        default=None,
+        description="When true, ask Gemini to ignore non-speech vocalizations.",
+    )
+    preserve_silence_audio: Optional[bool] = Field(
+        default=None,
+        description="When true, reuse the original audio for silence segments.",
+    )
+    generated_volume_percent: Optional[float] = Field(
+        default=None,
+        ge=MIN_GENERATED_VOLUME_PERCENT,
+        le=MAX_GENERATED_VOLUME_PERCENT,
+        description="Override regenerated speech loudness before merging (percentage, default 100%).",
+    )
+    backing_volume_percent: Optional[float] = Field(
+        default=None,
+        ge=MIN_GENERATED_VOLUME_PERCENT,
+        le=MAX_GENERATED_VOLUME_PERCENT,
+        description="Override backing-track loudness when merging (percentage, default 100%).",
+    )
+    silence_volume_percent: Optional[float] = Field(
+        default=None,
+        ge=MIN_GENERATED_VOLUME_PERCENT,
+        le=MAX_GENERATED_VOLUME_PERCENT,
+        description="Override preserved-silence loudness before merging (percentage, default 100%).",
     )
 
 
@@ -3249,6 +4299,10 @@ class CloneRequest(BaseModel):
     diffusion_steps: int = Field(default=10, description="Number of diffusion steps for mel-spectrogram generation (1-50). Higher values improve quality but increase latency.")
     max_text_tokens_per_sentence: int = Field(default=120, ge=80, le=200, description="Maximum tokens per sentence for text splitting (80-200). Higher values = longer sentences but may impact quality.")
 
+    @validator("response_format", pre=True, always=True)
+    def _force_mp3(cls, value: Optional[str]) -> str:
+        return "mp3"
+
 class SpeakRequest(BaseModel):
     text: str = Field(..., description="The text to generate audio for.")
     name: Optional[str] = Field(default=None, description="The name of the voice character")
@@ -3268,6 +4322,10 @@ class SpeakRequest(BaseModel):
     speech_length: int = Field(default=0, description="Target audio duration in milliseconds. If 0, uses default duration calculation.")
     diffusion_steps: int = Field(default=10, description="Number of diffusion steps for mel-spectrogram generation (1-50). Higher values improve quality but increase latency.")
     max_text_tokens_per_sentence: int = Field(default=120, ge=80, le=200, description="Maximum tokens per sentence for text splitting (80-200). Higher values = longer sentences but may impact quality.")
+
+    @validator("response_format", pre=True, always=True)
+    def _force_mp3(cls, value: Optional[str]) -> str:
+        return "mp3"
 
 async def warmup_model():
     """Run warmup inferences to fully preload the model"""
@@ -3395,125 +4453,351 @@ async def home():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>🚀 IndexTTS vLLM v2 - FastAPI WebUI</title>
         <style>
+            :root {
+                --brand-indigo: #4f46e5;
+                --brand-violet: #7c3aed;
+                --brand-pink: #db2777;
+                --text-primary: #111a2c;
+                --text-secondary: #475467;
+                --surface: #ffffff;
+                --surface-muted: #f8f9ff;
+                --border: #e4e7fb;
+            }
             * { box-sizing: border-box; margin: 0; padding: 0; }
             body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+                background: radial-gradient(circle at top, rgba(79,70,229,0.15), transparent 60%), #f2f3fb;
                 min-height: 100vh;
-                padding: 20px;
+                padding: 32px;
+                color: var(--text-primary);
             }
-            .container {
-                max-width: 1200px;
-                margin: 0 auto;
-                background: white;
-                border-radius: 20px;
-                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-                overflow: hidden;
+            .app-shell {
+                max-width: 1440px;
+                margin: 0 auto 56px;
+                display: flex;
+                flex-direction: column;
+                gap: 24px;
             }
-            .header {
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
+            .hero {
+                background: linear-gradient(120deg, var(--brand-indigo), var(--brand-violet), var(--brand-pink));
+                border-radius: 28px;
                 padding: 40px;
-                text-align: center;
+                color: #fff;
+                display: flex;
+                flex-wrap: wrap;
+                gap: 32px;
+                position: relative;
+                overflow: hidden;
+                box-shadow: 0 35px 90px rgba(79,70,229,0.35);
             }
-            .header h1 { font-size: 3em; margin-bottom: 10px; }
-            .subtitle { font-size: 1.3em; opacity: 0.9; margin-bottom: 15px; }
+            .hero::after {
+                content: "";
+                position: absolute;
+                inset: 18px;
+                border-radius: 24px;
+                border: 1px solid rgba(255,255,255,0.25);
+                pointer-events: none;
+            }
+            .hero-text {
+                flex: 1 1 360px;
+                min-width: 280px;
+                z-index: 1;
+            }
+            .hero-eyebrow {
+                text-transform: uppercase;
+                letter-spacing: 0.28em;
+                font-size: 0.75rem;
+                opacity: 0.75;
+                margin-bottom: 10px;
+            }
+            .hero h1 {
+                font-size: clamp(2.2rem, 3vw, 3rem);
+                margin-bottom: 12px;
+            }
+            .hero p.subtitle {
+                font-size: 1.05rem;
+                opacity: 0.92;
+                line-height: 1.5;
+            }
+            .hero-highlights {
+                flex: 1 1 280px;
+                min-width: 240px;
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 16px;
+                z-index: 1;
+            }
+            .hero-card {
+                background: rgba(255,255,255,0.13);
+                border-radius: 20px;
+                padding: 18px;
+                backdrop-filter: blur(8px);
+                box-shadow: inset 0 0 0 1px rgba(255,255,255,0.1);
+            }
+            .hero-card span {
+                display: block;
+                font-size: 0.82rem;
+                letter-spacing: 0.08em;
+                opacity: 0.75;
+                margin-bottom: 8px;
+                text-transform: uppercase;
+            }
+            .hero-card strong {
+                font-size: 1.35rem;
+                display: block;
+                margin-bottom: 4px;
+            }
+            .hero-card p {
+                font-size: 0.9rem;
+                opacity: 0.85;
+                line-height: 1.4;
+            }
+            .badge-grid {
+                width: 100%;
+                display: flex;
+                flex-wrap: wrap;
+                gap: 12px;
+                margin-top: 18px;
+                z-index: 1;
+            }
             .performance-badge {
-                background: rgba(255,255,255,0.2);
-                padding: 10px 20px;
-                border-radius: 25px;
-                font-size: 0.95em;
-                display: inline-block;
-                margin: 5px;
+                background: rgba(255,255,255,0.16);
+                padding: 8px 16px;
+                border-radius: 999px;
+                font-size: 0.9rem;
+                white-space: nowrap;
             }
-            .content { padding: 40px; }
+            .layout {
+                display: grid;
+                grid-template-columns: 320px 1fr;
+                gap: 24px;
+                align-items: start;
+            }
+            .sidebar {
+                background: var(--surface);
+                border-radius: 24px;
+                padding: 28px;
+                box-shadow: 0 25px 60px rgba(15,23,42,0.08);
+                display: flex;
+                flex-direction: column;
+                gap: 24px;
+                position: sticky;
+                top: 32px;
+            }
+            .sidebar h3 {
+                font-size: 0.8rem;
+                text-transform: uppercase;
+                letter-spacing: 0.25em;
+                color: var(--text-secondary);
+                margin-bottom: 10px;
+            }
             .tabs {
                 display: flex;
-                border-bottom: 2px solid #f0f0f0;
-                margin-bottom: 30px;
+                flex-direction: column;
+                gap: 12px;
             }
             .tab {
-                padding: 15px 25px;
+                appearance: none;
+                -webkit-appearance: none;
+                border: 1px solid transparent;
+                border-radius: 16px;
+                padding: 16px;
+                background: var(--surface-muted);
+                display: flex;
+                align-items: center;
+                gap: 12px;
                 cursor: pointer;
-                border-bottom: 3px solid transparent;
-                transition: all 0.3s;
+                font-weight: 600;
+                color: var(--text-secondary);
+                transition: all 0.2s ease;
+                width: 100%;
+                text-align: left;
+                outline: none;
+                font-size: 1rem;
+                box-shadow: inset 0 0 0 1px rgba(255,255,255,0.6);
+            }
+            .tab span.icon {
+                font-size: 1.2rem;
+            }
+            .tab-label {
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+                font-size: 0.88rem;
+                line-height: 1.3;
+            }
+            .tab-label strong {
+                color: var(--text-primary);
+                font-size: 1rem;
+            }
+            .tab-label small {
+                color: var(--text-secondary);
+                font-weight: 500;
+                font-size: 0.8rem;
+            }
+            .tab:hover {
+                border-color: rgba(79,70,229,0.35);
+                transform: translateX(4px);
             }
             .tab.active {
-                border-bottom-color: #667eea;
-                color: #667eea;
-                font-weight: 600;
-            }
-            .tab-content { display: none; }
-            .tab-content.active { display: block; }
-            .form-section {
                 background: #fff;
-                padding: 30px;
-                border-radius: 15px;
-                border: 2px solid #f0f0f0;
-                margin-bottom: 25px;
+                border-color: rgba(79,70,229,0.35);
+                color: var(--brand-indigo);
+                box-shadow: 0 18px 45px rgba(79,70,229,0.2);
+                transform: translateX(6px);
             }
-            .form-group { margin-bottom: 25px; }
+            .tab:focus-visible {
+                box-shadow: 0 0 0 3px rgba(79,70,229,0.3);
+            }
+            .sidebar-card {
+                border: 1px solid var(--border);
+                border-radius: 22px;
+                padding: 20px;
+                background: var(--surface-muted);
+            }
+            .sidebar-card h4 {
+                margin-bottom: 12px;
+                font-size: 1rem;
+                color: var(--text-primary);
+            }
+            .sidebar-card ul {
+                list-style: none;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                color: var(--text-secondary);
+                font-size: 0.92rem;
+            }
+            .sidebar-card li {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .sidebar-card li span {
+                font-size: 0.85rem;
+                color: var(--brand-indigo);
+            }
+            .panel-stack {
+                display: flex;
+                flex-direction: column;
+                gap: 24px;
+            }
+            .tab-content {
+                display: none;
+                background: var(--surface);
+                border-radius: 28px;
+                padding: 32px;
+                box-shadow: 0 35px 80px rgba(15,23,42,0.08);
+            }
+            .tab-content.active {
+                display: block;
+                animation: fadeIn 0.3s ease-out;
+            }
+            @keyframes fadeIn {
+                from { opacity: 0; transform: translateY(12px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+            .form-section {
+                background: var(--surface-muted);
+                padding: 28px;
+                border-radius: 24px;
+                border: 1px solid var(--border);
+                margin-bottom: 24px;
+                box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
+            }
+            .form-section h3 {
+                margin-bottom: 20px;
+            }
+            .form-group {
+                margin-bottom: 20px;
+            }
             label {
                 display: block;
                 margin-bottom: 8px;
                 font-weight: 600;
-                color: #333;
+                color: var(--text-primary);
             }
-            textarea, input[type="file"], input[type="text"], select {
+            textarea,
+            input[type="file"],
+            input[type="text"],
+            input[type="password"],
+            input[type="number"],
+            select {
                 width: 100%;
-                padding: 15px;
-                border: 2px solid #e1e5e9;
-                border-radius: 10px;
+                padding: 14px;
+                border: 1.5px solid #dfe3fb;
+                border-radius: 14px;
                 font-size: 16px;
-                transition: border-color 0.3s;
+                transition: border-color 0.2s, box-shadow 0.2s;
+                background: #fff;
             }
-            textarea:focus, input:focus, select:focus {
+            textarea:focus,
+            input:focus,
+            select:focus {
                 outline: none;
-                border-color: #667eea;
+                border-color: var(--brand-indigo);
+                box-shadow: 0 0 0 3px rgba(79,70,229,0.18);
             }
-            textarea { resize: vertical; min-height: 120px; }
+            textarea {
+                resize: vertical;
+                min-height: 120px;
+            }
+            input[type="checkbox"],
+            input[type="radio"] {
+                accent-color: var(--brand-indigo);
+            }
             .btn {
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                background: linear-gradient(135deg, var(--brand-indigo), var(--brand-violet));
                 color: white;
                 border: none;
-                padding: 15px 30px;
+                padding: 14px 24px;
                 font-size: 16px;
-                border-radius: 10px;
+                border-radius: 14px;
                 cursor: pointer;
-                transition: transform 0.2s;
+                transition: transform 0.2s, box-shadow 0.2s;
                 margin: 5px;
+                font-weight: 600;
             }
-            .btn:hover { transform: translateY(-2px); }
+            .btn:hover {
+                transform: translateY(-1px);
+                box-shadow: 0 12px 24px rgba(79,70,229,0.25);
+            }
             .btn:disabled {
-                opacity: 0.6;
+                opacity: 0.55;
                 cursor: not-allowed;
+                box-shadow: none;
                 transform: none;
             }
             .btn-danger {
-                background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
+                background: linear-gradient(135deg, #e11d48, #be123c);
+            }
+            .btn-secondary {
+                background: linear-gradient(135deg, #e2e8f0, #cbd5f5);
+                color: var(--text-primary);
             }
             .status {
                 margin-top: 20px;
-                padding: 15px;
-                border-radius: 10px;
+                padding: 16px;
+                border-radius: 14px;
                 display: none;
+                font-weight: 500;
             }
             .status.success {
-                background: #d4edda;
-                border: 1px solid #c3e6cb;
-                color: #155724;
+                background: #d1fae5;
+                border: 1px solid #10b981;
+                color: #065f46;
             }
             .status.error {
-                background: #f8d7da;
-                border: 1px solid #f5c6cb;
-                color: #721c24;
+                background: #fee2e2;
+                border: 1px solid #f87171;
+                color: #7f1d1d;
             }
             .segment-panel {
                 margin-top: 25px;
-                border: 2px dashed #d7dcff;
-                padding: 20px;
-                border-radius: 15px;
-                background: #f7f8ff;
+                border: 2px dashed #c7ceff;
+                padding: 24px;
+                border-radius: 20px;
+                background: #f5f6ff;
             }
             .segment-controls {
                 display: flex;
@@ -3532,14 +4816,14 @@ async def home():
                 padding-right: 8px;
             }
             .segment-card {
-                border-radius: 12px;
+                border-radius: 16px;
                 border: 1px solid #dce1fa;
                 padding: 16px;
                 background: white;
-                box-shadow: 0 4px 16px rgba(102,126,234,0.08);
+                box-shadow: 0 4px 18px rgba(102,126,234,0.12);
             }
-            .segment-card.speech { border-left: 4px solid #667eea; }
-            .segment-card.silence { border-left: 4px solid #9aa0b6; }
+            .segment-card.speech { border-left: 5px solid var(--brand-indigo); }
+            .segment-card.silence { border-left: 5px solid #94a3b8; }
             .segment-header {
                 display: flex;
                 align-items: center;
@@ -3564,13 +4848,6 @@ async def home():
                 grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
                 gap: 12px;
                 align-items: end;
-            }
-            .segment-timing label {
-                font-weight: 500;
-                color: #444;
-            }
-            .segment-timing input {
-                width: 100%;
             }
             .segment-duration-label {
                 font-size: 0.85em;
@@ -3606,7 +4883,7 @@ async def home():
                 padding: 15px;
                 border-radius: 8px;
                 margin-bottom: 10px;
-                border-left: 4px solid #667eea;
+                border-left: 4px solid var(--brand-indigo);
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
@@ -3719,7 +4996,7 @@ async def home():
                 width: 20px;
                 height: 20px;
                 border: 3px solid #f3f3f3;
-                border-top: 3px solid #667eea;
+                border-top: 3px solid var(--brand-indigo);
                 border-radius: 50%;
                 animation: spin 1s linear infinite;
                 margin-right: 10px;
@@ -3728,35 +5005,124 @@ async def home():
                 0% { transform: rotate(0deg); }
                 100% { transform: rotate(360deg); }
             }
+            @media (max-width: 1200px) {
+                body { padding: 24px; }
+                .layout { grid-template-columns: 1fr; }
+                .sidebar { position: static; }
+            }
+            @media (max-width: 768px) {
+                body { padding: 20px 16px 32px; }
+                .hero { padding: 32px; }
+                .tabs {
+                    flex-direction: row;
+                    overflow-x: auto;
+                    padding-bottom: 8px;
+                }
+                .tabs::-webkit-scrollbar {
+                    display: none;
+                }
+                .tab {
+                    flex: 0 0 230px;
+                    transform: none;
+                }
+                .tab.active {
+                    transform: none;
+                }
+                .tab-content {
+                    padding: 24px;
+                }
+                .form-section {
+                    padding: 20px;
+                }
+            }
         </style>
     </head>
     <body>
-        <div class="container">
-            <div class="header">
-                <h1>🚀 IndexTTS vLLM v2</h1>
-                <p class="subtitle">Ultra-Fast TTS with vLLM Backend / 超快速中英文语音合成</p>
-                <div>
-                    <span class="performance-badge">⚡ vLLM v2 Backend</span>
-                    <span class="performance-badge">🇨🇳 Chinese Support</span>
-                    <span class="performance-badge">🎭 Speaker Presets</span>
-                    <span class="performance-badge">🎵 MP3 Output</span>
-                    <span class="performance-badge">🔌 API Integration</span>
-                    <span class="performance-badge">😊 Emotion Text Control</span>
-                    <span class="performance-badge">🌊 Streaming Mode</span>
-                    <span class="performance-badge">🌐 Translate/Edit Mode</span>
-                    <span class="performance-badge">✂️ Segment Editing</span>
+        <div class="app-shell">
+            <header class="hero">
+                <div class="hero-text">
+                    <p class="hero-eyebrow">IndexTTS vLLM v2</p>
+                    <h1>🚀 IndexTTS vLLM v2</h1>
+                    <p class="subtitle">Ultra-fast multilingual speech studio powered by vLLM v2, Gemini-assisted translation, and precision speaker workflows.</p>
+                    <div class="badge-grid">
+                        <span class="performance-badge">⚡ vLLM v2 Backend</span>
+                        <span class="performance-badge">🇨🇳 Chinese Support</span>
+                        <span class="performance-badge">🎭 Speaker Presets</span>
+                        <span class="performance-badge">🎵 MP3 Output</span>
+                        <span class="performance-badge">🔌 API Integration</span>
+                        <span class="performance-badge">😊 Emotion Text Control</span>
+                        <span class="performance-badge">🌊 Streaming Mode</span>
+                        <span class="performance-badge">🌐 Translate/Edit Mode</span>
+                        <span class="performance-badge">✂️ Segment Editing</span>
+                    </div>
                 </div>
-            </div>
-            <div class="content">
-                <div class="tabs">
-                    <div class="tab active" onclick="switchTab('synthesis')">🎵 Speech Synthesis</div>
-                    <div class="tab" onclick="switchTab('translate')">🌐 Speech Translate/Edit</div>
-                    <div class="tab" onclick="switchTab('speakers')">🎭 Speaker Management</div>
-                    <div class="tab" onclick="switchTab('api')">📚 API Documentation</div>
+                <div class="hero-highlights">
+                    <div class="hero-card">
+                        <span>Realtime</span>
+                        <strong>Streaming Mode</strong>
+                        <p>Preview speech while tokens are generated for faster approvals.</p>
+                    </div>
+                    <div class="hero-card">
+                        <span>Gemini</span>
+                        <strong>Translate / Edit</strong>
+                        <p>Audition diarized segments, tweak timings, and selectively regenerate.</p>
+                    </div>
+                    <div class="hero-card">
+                        <span>Speakers</span>
+                        <strong>Presets & Cloning</strong>
+                        <p>Persist voices, extract clean prompts, and manage previews with a click.</p>
+                    </div>
                 </div>
+            </header>
+            <div class="layout">
+                <aside class="sidebar">
+                    <div>
+                        <h3>Workflow Tabs</h3>
+                        <div class="tabs">
+                            <button type="button" class="tab active" data-tab="synthesis" onclick="switchTab(event, 'synthesis')">
+                                <span class="icon">🎵</span>
+                                <span class="tab-label">
+                                    <strong>Speech Synthesis</strong>
+                                    <small>Instant text-to-speech</small>
+                                </span>
+                            </button>
+                            <button type="button" class="tab" data-tab="translate" onclick="switchTab(event, 'translate')">
+                                <span class="icon">🌐</span>
+                                <span class="tab-label">
+                                    <strong>Speech Translate/Edit</strong>
+                                    <small>Gemini-assisted workflow</small>
+                                </span>
+                            </button>
+                            <button type="button" class="tab" data-tab="speakers" onclick="switchTab(event, 'speakers')">
+                                <span class="icon">🎭</span>
+                                <span class="tab-label">
+                                    <strong>Speaker Management</strong>
+                                    <small>Presets & previews</small>
+                                </span>
+                            </button>
+                            <button type="button" class="tab" data-tab="api" onclick="switchTab(event, 'api')">
+                                <span class="icon">📚</span>
+                                <span class="tab-label">
+                                    <strong>API Documentation</strong>
+                                    <small>Integrate in code</small>
+                                </span>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="sidebar-card">
+                        <h4>Quick System Highlights</h4>
+                        <ul>
+                            <li><span>⚡</span>Warm-started vLLM backend with optional streaming</li>
+                            <li><span>🧠</span>Gemini Pro & Flash selection with prompt overrides</li>
+                            <li><span>🎛️</span>Emotion text, diffusion, and token splitting controls</li>
+                            <li><span>🧩</span>Segment-level editing plus selective regeneration</li>
+                        </ul>
+                    </div>
+                </aside>
+                <main class="panel-stack">
 
-                <!-- Speech Synthesis Tab -->
-                <div id="synthesis" class="tab-content active">
+                    <!-- Speech Synthesis Tab -->
+                    <div id="synthesis" class="tab-content active">
                     <div class="form-section">
                         <h3>🎵 Generate Speech</h3>
                         
@@ -3941,6 +5307,79 @@ async def home():
                                     Supported formats: WAV, MP3, M4A, FLAC, AAC, OGG, OPUS. Audio is processed locally then sent to Gemini for transcription.
                                 </small>
                             </div>
+                            <div class="form-group" id="translateClearVoiceBlock">
+                                <label>ClearVoice Separation & Chunking:</label>
+                                <div style="display: flex; gap: 16px; flex-wrap: wrap;">
+                                    <label style="display: flex; align-items: center; gap: 8px;">
+                                        <input type="checkbox" id="translateEnhancement">
+                                        <span>Enhance with MossFormer2_SE_48K</span>
+                                    </label>
+                                    <label style="display: flex; align-items: center; gap: 8px;">
+                                        <input type="checkbox" id="translateSuperResolution">
+                                        <span>Super Resolution with MossFormer2_SR_48K (auto-enables enhancement)</span>
+                                    </label>
+                                    <label style="display: flex; align-items: center; gap: 8px;">
+                                        <input type="checkbox" id="translateMergeBack" disabled>
+                                        <span>Mix translated speech back into instrumental (requires enhancement)</span>
+                                    </label>
+                                </div>
+                                <small style="color: #666; margin-top: 5px; display: block;">
+                                    ClearVoice runs locally before contacting Gemini. Enable it for cleaner vocals, optional super-resolution, and backing-track extraction.
+                                </small>
+                                <div style="margin-top: 12px; padding: 12px; border-radius: 12px; background: rgba(102,126,234,0.08);">
+                                    <label style="display: flex; align-items: center; gap: 10px; font-weight: 500;">
+                                        <input type="checkbox" id="translateEnableChunkSplit">
+                                        <span>Split long audio into 10–15 minute chunks before Gemini (requires ClearVoice enhancement)</span>
+                                    </label>
+                                    <div id="translateChunkSettings" style="display: none; margin-top: 10px;">
+                                        <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+                                            <div style="flex: 1 1 180px;">
+                                                <label for="translateChunkMinMinutes" style="font-weight: 500;">Minimum chunk length (minutes):</label>
+                                                <input type="number" id="translateChunkMinMinutes" value="10" min="1" max="45" step="1">
+                                                <small id="translateChunkMinHint" style="display:block;color:#666;margin-top:4px;"></small>
+                                            </div>
+                                            <div style="flex: 1 1 180px;">
+                                                <label for="translateChunkMaxMinutes" style="font-weight: 500;">Maximum chunk length (minutes):</label>
+                                                <input type="number" id="translateChunkMaxMinutes" value="15" min="1" max="45" step="1">
+                                                <small id="translateChunkMaxHint" style="display:block;color:#666;margin-top:4px;"></small>
+                                            </div>
+                                            <div style="flex: 1 1 200px;">
+                                                <label for="translateChunkMinSilenceMs" style="font-weight: 500;">Minimum silence gap (ms):</label>
+                                                <input type="number" id="translateChunkMinSilenceMs" value="1500" min="500" max="120000" step="100">
+                                                <small style="display:block;color:#666;margin-top:4px;">Lower values create more splits; higher values keep longer phrases.</small>
+                                            </div>
+                                        </div>
+                                        <div style="margin-top: 12px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
+                                            <button type="button" class="btn btn-secondary" id="translateSplitAudioBtn">✂️ Split Audio Now</button>
+                                            <small style="color: #666;">
+                                                We detect long silences on the enhanced vocal track so each chunk can be processed (and mixed back) independently, then concatenated later.
+                                            </small>
+                                        </div>
+                                    </div>
+                                    <div id="translateChunkSelection" style="display: none; margin-top: 12px; padding: 10px; border-radius: 10px; border: 1px dashed #7f85f5; background: rgba(102,126,234,0.08);">
+                                        <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+                                            <span id="translateChunkSelectionText" style="font-weight: 500;"></span>
+                                            <button type="button" class="btn btn-secondary" id="translateClearChunkBtn" style="background: transparent; color: #6370ff; border-color: #6370ff;">Clear Selection</button>
+                                        </div>
+                                    </div>
+                                    <div id="translateChunkResults" style="display: none; margin-top: 12px;">
+                                        <div id="translateChunkSummary" style="font-weight: 500; color: #0a7c4a; margin-bottom: 10px;"></div>
+                                        <div id="translateChunkList" style="display: flex; flex-direction: column; gap: 12px;"></div>
+                                    </div>
+                                    <div id="translateChunkBatchControls" style="display: none; margin-top: 12px; gap: 12px; flex-wrap: wrap; align-items: center;">
+                                        <label style="display: flex; align-items: center; gap: 8px; font-size: 0.95em; margin: 0;">
+                                            <input type="checkbox" id="translateChunkSelectPending">
+                                            <span>Select all pending chunks</span>
+                                        </label>
+                                        <button type="button" class="btn btn-secondary" id="translateGenerateChunksBtn" style="display: none;">⚡ Generate Selected Chunks</button>
+                                    </div>
+                                    <div id="translateChunkBatchStatus" class="status"></div>
+                                    <div id="translateSplitStatus" class="status"></div>
+                                    <div style="margin-top: 12px;">
+                                        <button type="button" class="btn btn-secondary" id="translateMergeChunksBtn" style="display: none;">🔗 Merge All Chunks</button>
+                                    </div>
+                                </div>
+                            </div>
                             <div class="form-group">
                                 <label for="translateDestLanguage">Destination Language:</label>
                                 <select id="translateDestLanguage" name="dest_language" required>
@@ -3968,33 +5407,10 @@ async def home():
                             </div>
                             <div class="form-group">
                                 <label for="translateOutputFormat">Output Format:</label>
-                                <select id="translateOutputFormat" name="response_format">
-                                    <option value="mp3" selected>MP3 (default)</option>
-                                    <option value="wav">WAV</option>
-                                    <option value="flac">FLAC</option>
-                                    <option value="aac">AAC</option>
-                                    <option value="opus">OPUS</option>
+                                <select id="translateOutputFormat" name="response_format" disabled>
+                                    <option value="mp3" selected>MP3 (optimized for storage & transfer)</option>
                                 </select>
-                            </div>
-                            <div class="form-group">
-                                <label>ClearVoice Preprocessing (Optional):</label>
-                                <div style="display: flex; gap: 16px; flex-wrap: wrap;">
-                                    <label style="display: flex; align-items: center; gap: 8px;">
-                                        <input type="checkbox" id="translateEnhancement">
-                                        <span>Enhance with MossFormer2_SE_48K</span>
-                                    </label>
-                                    <label style="display: flex; align-items: center; gap: 8px;">
-                                        <input type="checkbox" id="translateSuperResolution">
-                                        <span>Super Resolution with MossFormer2_SR_48K</span>
-                                    </label>
-                                    <label style="display: flex; align-items: center; gap: 8px;">
-                                        <input type="checkbox" id="translateMergeBack" disabled>
-                                        <span>Mix translated speech back into instrumental (requires enhancement)</span>
-                                    </label>
-                                </div>
-                                <small style="color: #666; margin-top: 5px; display: block;">
-                                    Defaults to off. Requires the ClearVoice package to be installed.
-                                </small>
+                                <small style="color:#666;display:block;margin-top:6px;">All outputs are delivered as MP3 to keep files lightweight.</small>
                             </div>
                             <div class="form-group">
                                 <label>Segment Merge Settings (Optional):</label>
@@ -4052,6 +5468,13 @@ async def home():
                                 </label>
                                 <small style="color: #666; margin-top: 6px; display: block;">
                                     Keeps the source vocal audio for silent segments (helpful for laughs or crowd reactions).
+                                </small>
+                            </div>
+                            <div class="form-group" id="translateSilenceVolumeGroup" style="display: none;">
+                                <label for="translateSilenceVolumePercent">Preserved silence volume (%)</label>
+                                <input type="number" id="translateSilenceVolumePercent" min="10" max="300" step="5" value="100" placeholder="Default 100%">
+                                <small style="color: #666; margin-top: 5px; display: block;">
+                                    Adjust how loud the preserved original audio should be when silence segments are kept.
                                 </small>
                             </div>
                             <div class="form-group">
@@ -4221,8 +5644,8 @@ async def home():
                         <ul style="margin-left: 20px; line-height: 1.6;">
                             <li><strong>POST /api/translate_audio</strong> - Translate speech audio and regenerate voice in the target language while preserving timing.
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
-                                    <li>Multipart form fields: <code>audio_file</code> (file), <code>dest_language</code> (string); optional <code>response_format</code> (mp3/wav/flac/aac/opus/ogg/webm), <code>prompt</code> (custom Gemini instructions), <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) to run ClearVoice preprocessing, <code>merge_backing_track</code> (bool) to blend the result with the extracted instrumental backing, <code>custom_backing_audio_file</code> (file) to override the instrumental even without enhancement, plus <code>min_speech_ms</code>/<code>max_merge_ms</code> to override segment-merging heuristics (set <code>max_merge_ms</code> to 0 to keep Gemini's original segmentation) and <code>segments_json</code> to supply pre-generated Gemini-like segments.</li>
-                                    <li>JSON alternative: <code>{"audio": "&lt;base64&gt;", "dest_language": "English", "audio_mime_type": "audio/wav", "custom_backing_audio": "&lt;base64 or url&gt;", "custom_backing_audio_mime_type": "audio/mp3", "response_format": "mp3", "enhance_voice": true, "super_resolution_voice": false, "merge_backing_track": true, "segments_json": "[...]", "min_speech_ms": 3000, "max_merge_ms": 0}</code></li>
+                                    <li>Multipart form fields: <code>audio_file</code> (file), <code>dest_language</code> (string); audio outputs are always MP3. Optional fields: <code>prompt</code> (custom Gemini instructions), <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) to run ClearVoice preprocessing, <code>merge_backing_track</code> (bool) to blend the result with the extracted instrumental backing, <code>custom_backing_audio_file</code> (file) to override the instrumental even without enhancement, plus <code>min_speech_ms</code>/<code>max_merge_ms</code> to override segment-merging heuristics (set <code>max_merge_ms</code> to 0 to keep Gemini's original segmentation) and <code>segments_json</code> to supply pre-generated Gemini-like segments.</li>
+                                    <li>JSON alternative: <code>{"audio": "&lt;base64&gt;", "dest_language": "English", "audio_mime_type": "audio/wav", "custom_backing_audio": "&lt;base64 or url&gt;", "custom_backing_audio_mime_type": "audio/mp3", "response_format": "mp3", "enhance_voice": true, "super_resolution_voice": false, "merge_backing_track": true, "segments_json": "[...]", "min_speech_ms": 3000, "max_merge_ms": 0}</code> (response_format is always mp3).</li>
                                     <li>Response: Audio stream. Inspect headers like <code>X-Translation-Model</code> and <code>X-Translation-Segments</code> for run metadata.</li>
                                 </ul>
                             </li>
@@ -4233,7 +5656,7 @@ async def home():
                             <li><strong>POST /speak</strong> - Generate speech using a registered speaker preset
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
                                     <li>Required: <code>text</code> (string), <code>name</code> (speaker name)</li>
-                                    <li>Optional: <code>response_format</code> (mp3/opus/aac/flac/wav/pcm, default: mp3)</li>
+                                    <li>Optional: <code>response_format</code> (always MP3 for compatibility)</li>
                                     <li>Optional: <code>emotion_text</code> (emotion description), <code>emotion_weight</code> (0.0-1.0)</li>
                                     <li>Optional: <code>diffusion_steps</code> (int, default: 10)</li>
                                     <li>Optional: <code>max_text_tokens_per_sentence</code> (int, 80-200, default: 120) - Controls text splitting</li>
@@ -4407,30 +5830,44 @@ async def home():
                         </table>
                     </div>
                 </div>
-            </div>
+            </main>
         </div>
+    </div>
 
         <script>
-            function switchTab(tabName) {
-                // Hide all tab contents
+            const CHUNK_SPLIT_MIN_SILENCE_MS = """ + str(CHUNK_SPLIT_MIN_SILENCE_MS) + """;
+            function switchTab(evtOrName, maybeTabName) {
+                const tabName = typeof evtOrName === 'string' ? evtOrName : maybeTabName;
+                const trigger = (evtOrName && evtOrName.currentTarget) ? evtOrName.currentTarget : null;
+                
                 document.querySelectorAll('.tab-content').forEach(content => {
                     content.classList.remove('active');
                 });
                 
-                // Remove active class from all tabs
                 document.querySelectorAll('.tab').forEach(tab => {
                     tab.classList.remove('active');
                 });
                 
-                // Show selected tab content
-                document.getElementById(tabName).classList.add('active');
+                const content = document.getElementById(tabName);
+                if (content) {
+                    content.classList.add('active');
+                }
                 
-                // Add active class to clicked tab
-                event.target.classList.add('active');
+                if (trigger) {
+                    trigger.classList.add('active');
+                } else {
+                    const fallbackTab = document.querySelector(`.tab[data-tab="${tabName}"]`);
+                    if (fallbackTab) {
+                        fallbackTab.classList.add('active');
+                    }
+                }
                 
-                // Load speakers if switching to speakers tab
                 if (tabName === 'speakers') {
                     loadSpeakerList();
+                }
+                
+                if (content && window.matchMedia('(max-width: 1024px)').matches) {
+                    content.scrollIntoView({ behavior: 'smooth', block: 'start' });
                 }
             }
 
@@ -4553,7 +5990,7 @@ async def home():
                             const description = info.description && info.description.trim() !== '' ? info.description : 'Speaker preset';
                             const previewUrl = info.preview_url;
                             const previewSection = previewUrl
-                                ? `<audio controls src="${previewUrl}" preload="metadata"></audio>`
+                                ? `<audio controls preload="none" src="${previewUrl}"></audio>`
                                 : `<small style="color: #888;">No preview available</small>`;
                             const safeName = JSON.stringify(name);
                             
@@ -4762,6 +6199,8 @@ async def home():
             const translateCustomBackingSummary = document.getElementById('translateCustomBackingSummary');
             const translateIgnoreNonSpeechEl = document.getElementById('translateIgnoreNonSpeech');
             const translatePreserveSilenceEl = document.getElementById('translatePreserveSilence');
+            const translateSilenceVolumeInput = document.getElementById('translateSilenceVolumePercent');
+            const translateSilenceVolumeGroup = document.getElementById('translateSilenceVolumeGroup');
             const translateSeparationPreview = document.getElementById('translateSeparationPreview');
             const translateMinSpeechInput = document.getElementById('translateMinSpeech');
             const translateMaxMergeInput = document.getElementById('translateMaxMerge');
@@ -4778,6 +6217,26 @@ async def home():
             const translateVolumeInput = document.getElementById('translateVolumePercent');
             const translateBackingVolumeInput = document.getElementById('translateBackingVolumePercent');
             const translateSpeakerAssignments = document.getElementById('translateSpeakerAssignments');
+            const translateEnableChunkSplit = document.getElementById('translateEnableChunkSplit');
+            const translateChunkSettings = document.getElementById('translateChunkSettings');
+            const translateSplitAudioBtn = document.getElementById('translateSplitAudioBtn');
+            const translateChunkMinInput = document.getElementById('translateChunkMinMinutes');
+            const translateChunkMaxInput = document.getElementById('translateChunkMaxMinutes');
+            const translateChunkMinSilenceInput = document.getElementById('translateChunkMinSilenceMs');
+            const translateChunkMinHint = document.getElementById('translateChunkMinHint');
+            const translateChunkMaxHint = document.getElementById('translateChunkMaxHint');
+            const translateChunkResults = document.getElementById('translateChunkResults');
+            const translateChunkSummary = document.getElementById('translateChunkSummary');
+            const translateChunkList = document.getElementById('translateChunkList');
+            const translateChunkSelectionBanner = document.getElementById('translateChunkSelection');
+            const translateChunkSelectionText = document.getElementById('translateChunkSelectionText');
+            const translateClearChunkBtn = document.getElementById('translateClearChunkBtn');
+            const translateMergeChunksBtn = document.getElementById('translateMergeChunksBtn');
+            const translateChunkBatchControls = document.getElementById('translateChunkBatchControls');
+            const translateChunkSelectPending = document.getElementById('translateChunkSelectPending');
+            const translateGenerateChunksBtn = document.getElementById('translateGenerateChunksBtn');
+            const translateChunkBatchStatus = document.getElementById('translateChunkBatchStatus');
+            const translateAudioInput = document.getElementById('translateAudioFile');
             let currentTranslateSessionId = null;
             let currentTranslateSegments = [];
             let translateSpeakerProfiles = [];
@@ -4794,6 +6253,854 @@ async def home():
             };
             const NON_SPEECH_PLACEHOLDER = '{non_speech_instruction}';
             let autoManualSegmentsApplied = false;
+            let translateChunkSessions = [];
+            let translateChunkBatchId = null;
+            let translateSelectedChunkId = null;
+            let translateChunkSelections = new Set();
+            let currentChunkSessionId = null;
+
+            function updateAudioInputRequirement() {
+                if (!translateAudioInput) {
+                    return;
+                }
+                const reuseCheckbox = document.getElementById('translateReuseSeparation');
+                const reuseCandidateActive =
+                    reuseCheckbox && reuseCheckbox.checked && (currentChunkSessionId || currentTranslateSessionId);
+                const needsFile = !currentChunkSessionId && !reuseCandidateActive;
+                translateAudioInput.required = needsFile;
+            }
+
+            function resetChunkResults() {
+                translateChunkSessions = [];
+                translateChunkBatchId = null;
+                translateSelectedChunkId = null;
+                currentChunkSessionId = null;
+                translateChunkSelections = new Set();
+                if (translateChunkSummary) {
+                    translateChunkSummary.textContent = 'Chunks will appear here after splitting.';
+                }
+                if (translateChunkList) {
+                    translateChunkList.innerHTML = '';
+                }
+                if (translateChunkResults) {
+                    translateChunkResults.style.display = 'none';
+                }
+                if (translateMergeChunksBtn) {
+                    translateMergeChunksBtn.style.display = 'none';
+                }
+                if (translateChunkSelectPending) {
+                    translateChunkSelectPending.checked = false;
+                    translateChunkSelectPending.disabled = true;
+                }
+                hideStatus('translateChunkBatchStatus');
+                hideStatus('translateSplitStatus');
+                updateChunkSelectionUI();
+                updateChunkBatchControlsVisibility();
+                updateAudioInputRequirement();
+            }
+
+            function toggleChunkControls(enabled) {
+                if (translateChunkSettings) {
+                    translateChunkSettings.style.display = enabled ? 'block' : 'none';
+                }
+                if (!enabled && translateChunkResults) {
+                    translateChunkResults.style.display = 'none';
+                } else if (enabled && translateChunkResults && translateChunkSessions.length) {
+                    translateChunkResults.style.display = 'block';
+                }
+                updateChunkBatchControlsVisibility();
+            }
+
+            function updateChunkLengthHints() {
+                if (!translateChunkMinHint && !translateChunkMaxHint) {
+                    return;
+                }
+                const seconds = CHUNK_SPLIT_MIN_SILENCE_MS / 1000;
+                const secondsLabel = Number.isInteger(seconds) ? seconds.toString() : seconds.toFixed(1);
+                const message = `Hard minimum silence gap: ${secondsLabel}s (${CHUNK_SPLIT_MIN_SILENCE_MS} ms)`;
+                if (translateChunkMinHint) {
+                    translateChunkMinHint.textContent = message;
+                }
+                if (translateChunkMaxHint) {
+                    translateChunkMaxHint.textContent = message;
+                }
+                if (translateChunkMinSilenceInput && !translateChunkMinSilenceInput.value) {
+                    translateChunkMinSilenceInput.value = CHUNK_SPLIT_MIN_SILENCE_MS;
+                }
+            }
+            updateChunkLengthHints();
+
+            function renderChunkResultsFromResponse(payload) {
+                if (payload && Array.isArray(payload.chunks)) {
+                    translateChunkSessions = payload.chunks.slice();
+                    translateChunkBatchId = payload.chunk_batch_id || translateChunkBatchId;
+                }
+                const validChunkIds = new Set(translateChunkSessions.map(chunk => chunk.session_id));
+                translateChunkSelections = new Set(
+                    Array.from(translateChunkSelections).filter(id => validChunkIds.has(id))
+                );
+                if (!translateChunkResults || !translateChunkSummary || !translateChunkList) {
+                    return;
+                }
+                if (!translateChunkSessions.length) {
+                    translateChunkSummary.textContent = 'Chunk split did not produce usable segments.';
+                    translateChunkResults.style.display = 'none';
+                    translateChunkList.innerHTML = '';
+                    if (translateMergeChunksBtn) {
+                        translateMergeChunksBtn.style.display = 'none';
+                    }
+                    updateChunkSelectionUI();
+                    return;
+                }
+                translateChunkResults.style.display =
+                    translateEnableChunkSplit && !translateEnableChunkSplit.checked ? 'none' : 'block';
+                const totalLabel =
+                    (payload && typeof payload.duration_label === 'string' && payload.duration_label) || '';
+                const summaryParts = [`Prepared ${translateChunkSessions.length} chunk(s)`];
+                if (totalLabel) {
+                    summaryParts.push(`Total ${totalLabel}`);
+                }
+                translateChunkSummary.textContent = summaryParts.join(' • ');
+                if (translateMergeChunksBtn) {
+                    translateMergeChunksBtn.style.display = translateChunkSessions.length > 1 ? 'inline-flex' : 'none';
+                }
+                const cacheBuster = Date.now();
+                translateChunkList.innerHTML = translateChunkSessions
+                    .map(chunk => {
+                        const isSelected = translateSelectedChunkId === chunk.session_id;
+                        const isBatchSelected = translateChunkSelections.has(chunk.session_id);
+                        const cardClasses = ['segment-card', 'chunk-card'];
+                        if (isSelected) {
+                            cardClasses.push('selected');
+                        }
+                        const borderStyle = isSelected ? 'border: 2px solid #6370ff; box-shadow: 0 0 0 2px rgba(99,112,255,0.2);' : '';
+                        const vocalsUrl = chunk.vocals_url
+                            ? `${chunk.vocals_url}?session=${chunk.session_id}&t=${cacheBuster}`
+                            : '';
+                        const backingUrl =
+                            chunk.backing_available && chunk.backing_url
+                                ? `${chunk.backing_url}?session=${chunk.session_id}&t=${cacheBuster}`
+                                : '';
+                        const translatedUrl = chunk.audio_url
+                            ? `${chunk.audio_url}?session=${chunk.session_id}&t=${cacheBuster}`
+                            : '';
+                        const audioSections = [];
+                        if (vocalsUrl) {
+                            audioSections.push(
+                                `<div style="margin-top:8px;">
+                                    <div style="font-size:0.8em;font-weight:600;margin-bottom:2px;">Vocal</div>
+                                    <audio controls preload="none" style="width: 100%;">
+                                        <source src="${vocalsUrl}" type="audio/mpeg">
+                                    </audio>
+                                 </div>`
+                            );
+                        }
+                        if (translatedUrl) {
+                            audioSections.push(
+                                `<div style="margin-top:8px;">
+                                    <div style="font-size:0.8em;font-weight:600;margin-bottom:2px;">Translated</div>
+                                    <audio controls preload="none" style="width: 100%;">
+                                        <source src="${translatedUrl}" type="audio/mpeg">
+                                    </audio>
+                                 </div>`
+                            );
+                        }
+                        const statusBadge = chunk.generated
+                            ? '<span style="background: rgba(16, 185, 129, 0.18); color: #0a7c4a; padding: 2px 8px; border-radius: 12px; font-size: 0.8em;">Generated</span>'
+                            : '<span style="background: rgba(251, 191, 36, 0.25); color: #9b6f00; padding: 2px 8px; border-radius: 12px; font-size: 0.8em;">Pending</span>';
+                        return `
+                            <div class="${cardClasses.join(' ')}" data-session-id="${chunk.session_id}" style="${borderStyle}">
+                                <div class="segment-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+                                    <div style="display:flex;align-items:center;gap:8px;">
+                                        <input type="checkbox" class="chunk-select-checkbox" data-session-id="${chunk.session_id}" ${isBatchSelected ? 'checked' : ''}>
+                                        <span>Chunk ${chunk.chunk_index ?? ''} • ${chunk.duration_label || ''}</span>
+                                    </div>
+                                    ${statusBadge}
+                                </div>
+                                <div style="font-size: 0.85em; color: #555;">${chunk.start_label || ''} → ${chunk.end_label || ''}</div>
+                                ${audioSections.join('')}
+                                <button type="button" class="btn btn-secondary chunk-use-btn" data-session-id="${chunk.session_id}" style="margin-top: 10px;">
+                                    Use This Chunk
+                                </button>
+                            </div>
+                        `;
+                    })
+                    .join('');
+                updateChunkSelectionUI();
+                updateChunkBatchControlsVisibility();
+            }
+
+            function updateChunkSelectionUI() {
+                if (!translateChunkSelectionBanner || !translateChunkSelectionText) {
+                    return;
+                }
+                if (!translateSelectedChunkId) {
+                    translateChunkSelectionBanner.style.display = 'none';
+                    translateChunkSelectionText.textContent = '';
+                    return;
+                }
+                const chunk = translateChunkSessions.find(entry => entry.session_id === translateSelectedChunkId);
+                if (!chunk) {
+                    translateChunkSelectionBanner.style.display = 'none';
+                    translateChunkSelectionText.textContent = '';
+                    return;
+                }
+                translateChunkSelectionBanner.style.display = 'block';
+                translateChunkSelectionText.textContent = `Using chunk ${chunk.chunk_index ?? ''} (${chunk.start_label || '00:00'} → ${chunk.end_label || '??'})`;
+            }
+
+            function syncPendingSelectToggle() {
+                if (!translateChunkSelectPending) {
+                    return;
+                }
+                const pendingChunks = translateChunkSessions.filter(chunk => !chunk.generated);
+                if (!pendingChunks.length) {
+                    translateChunkSelectPending.checked = false;
+                    translateChunkSelectPending.disabled = true;
+                    return;
+                }
+                translateChunkSelectPending.disabled = false;
+                const allSelected = pendingChunks.every(chunk => translateChunkSelections.has(chunk.session_id));
+                translateChunkSelectPending.checked = allSelected;
+            }
+
+            function updateChunkBatchControlsVisibility() {
+                if (!translateChunkBatchControls || !translateGenerateChunksBtn) {
+                    return;
+                }
+                const shouldShow =
+                    translateChunkSessions.length > 0 &&
+                    translateEnableChunkSplit &&
+                    translateEnableChunkSplit.checked;
+                translateChunkBatchControls.style.display = shouldShow ? 'flex' : 'none';
+                translateGenerateChunksBtn.style.display = shouldShow ? 'inline-flex' : 'none';
+                translateGenerateChunksBtn.disabled = translateChunkSelections.size === 0;
+                translateGenerateChunksBtn.textContent = translateChunkSelections.size
+                    ? `⚡ Generate Selected Chunks (${translateChunkSelections.size})`
+                    : '⚡ Generate Selected Chunks';
+                syncPendingSelectToggle();
+            }
+
+            function applyChunkGenerationMetadata(metadata, audioUrl, options = {}) {
+                if (!metadata || !metadata.chunk || !metadata.chunk.session_id) {
+                    return;
+                }
+                const { autoSelect = true } = options;
+                const chunkSessionId = metadata.chunk.session_id;
+                if (autoSelect) {
+                    currentChunkSessionId = chunkSessionId;
+                    translateSelectedChunkId = chunkSessionId;
+                }
+                if (!translateChunkBatchId && metadata.chunk.batch_id) {
+                    translateChunkBatchId = metadata.chunk.batch_id;
+                }
+                let chunkEntry = translateChunkSessions.find(entry => entry.session_id === chunkSessionId);
+                if (!chunkEntry) {
+                    const startMs = typeof metadata.chunk.start_ms === 'number' ? metadata.chunk.start_ms : 0;
+                    const endMs = typeof metadata.chunk.end_ms === 'number' ? metadata.chunk.end_ms : startMs;
+                    const durationMs = Math.max(0, endMs - startMs);
+                    chunkEntry = {
+                        chunk_index: metadata.chunk.chunk_index ?? metadata.chunk.index ?? translateChunkSessions.length + 1,
+                        session_id: chunkSessionId,
+                        reuse_session_id: chunkSessionId,
+                        start_ms: startMs,
+                        end_ms: endMs,
+                        duration_ms: durationMs,
+                        start_label: metadata.chunk.start_label || formatTimestamp(startMs),
+                        end_label: metadata.chunk.end_label || formatTimestamp(endMs),
+                        duration_label: metadata.chunk.duration_label || formatTimestamp(durationMs),
+                        generated: false,
+                        generated_at: null,
+                        audio_url: metadata.chunk.audio_url || null,
+                        output_format: metadata.chunk.output_format || null,
+                        output_filename: metadata.chunk.output_filename || null,
+                        backing_available:
+                            metadata.chunk.backing_available !== undefined
+                                ? Boolean(metadata.chunk.backing_available)
+                                : true,
+                        backing_source: metadata.chunk.backing_source || 'none',
+                        vocals_url: metadata.chunk.vocals_url || `/api/translate_vocals/${chunkSessionId}`,
+                        backing_url:
+                            metadata.chunk.backing_available === false
+                                ? null
+                                : metadata.chunk.backing_url || `/api/translate_backing_track/${chunkSessionId}`,
+                        batch_id: metadata.chunk.batch_id || translateChunkBatchId || null,
+                    };
+                    translateChunkSessions.push(chunkEntry);
+                }
+                chunkEntry.generated = true;
+                chunkEntry.generated_at = Date.now();
+                if (audioUrl) {
+                    chunkEntry.audio_url = audioUrl;
+                }
+                if (metadata.chunk.output_format) {
+                    chunkEntry.output_format = metadata.chunk.output_format;
+                }
+                if (metadata.chunk.output_filename) {
+                    chunkEntry.output_filename = metadata.chunk.output_filename;
+                }
+                renderChunkResultsFromResponse();
+                updateChunkSelectionUI();
+                updateChunkBatchControlsVisibility();
+            }
+
+            async function handleMergeChunks() {
+                if (!translateChunkSessions.length) {
+                    showStatus('Split audio into chunks before merging.', 'error', 'translateStatus');
+                    return;
+                }
+                const statusId = 'translateStatus';
+                const formatSelect = document.getElementById('translateOutputFormat');
+                const selectedFormat = (formatSelect && formatSelect.value ? formatSelect.value : 'mp3').toLowerCase();
+                const payload = {
+                    chunk_session_ids: translateChunkSessions.map(chunk => chunk.session_id),
+                    chunk_batch_id: translateChunkBatchId || null,
+                    response_format: selectedFormat,
+                    merge_backing_track: translateMergeBackEl && translateMergeBackEl.checked ? true : false,
+                };
+                try {
+                    showStatus('Merging chunk outputs... ⏳', 'success', statusId);
+                    const response = await fetch('/api/translate_merge_chunks', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload),
+                    });
+                    const data = await response.json();
+                    if (!response.ok || data.status !== 'ok') {
+                        const message = data.message || `Merge failed (${response.status})`;
+                        showStatus(message, 'error', statusId);
+                        return;
+                    }
+                    renderMergedAudioResult(data, selectedFormat);
+                    showStatus(data.message || 'Chunks merged successfully.', 'success', statusId);
+                } catch (error) {
+                    showStatus(`Merge failed: ${error.message}`, 'error', statusId);
+                }
+            }
+
+            async function handleGenerateSelectedChunks() {
+                const statusId = 'translateChunkBatchStatus';
+                hideStatus(statusId);
+                if (!translateChunkSelections.size) {
+                    showStatus('Select at least one pending chunk to generate.', 'error', statusId);
+                    return;
+                }
+                if (!translateDestLanguageSelect || !translateDestLanguageSelect.value.trim()) {
+                    showStatus('Select a destination language before generating chunks.', 'error', statusId);
+                    return;
+                }
+                const destLanguage = translateDestLanguageSelect.value.trim();
+                const formatSelect = document.getElementById('translateOutputFormat');
+                const selectedFormat = (formatSelect && formatSelect.value ? formatSelect.value : 'mp3').toLowerCase();
+                const payload = {
+                    chunk_session_ids: Array.from(translateChunkSelections),
+                    dest_language: destLanguage,
+                    response_format: selectedFormat,
+                };
+                if (translateGeminiModel && translateGeminiModel.value) {
+                    payload.gemini_model = translateGeminiModel.value;
+                }
+                if (translateGeminiApiKey && translateGeminiApiKey.value.trim()) {
+                    payload.gemini_api_key = translateGeminiApiKey.value.trim();
+                }
+                payload.merge_backing_track = translateMergeBackEl && translateMergeBackEl.checked ? true : false;
+                payload.ignore_non_speech = translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? true : false;
+                payload.preserve_silence_audio = translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? true : false;
+                if (translateVolumeInput && translateVolumeInput.value) {
+                    const volumeValue = parseFloat(translateVolumeInput.value);
+                    if (!Number.isNaN(volumeValue)) {
+                        payload.generated_volume_percent = volumeValue;
+                    }
+                }
+                if (translateBackingVolumeInput && translateBackingVolumeInput.value) {
+                    const backingValue = parseFloat(translateBackingVolumeInput.value);
+                    if (!Number.isNaN(backingValue)) {
+                        payload.backing_volume_percent = backingValue;
+                    }
+                }
+                if (
+                    translatePreserveSilenceEl &&
+                    translatePreserveSilenceEl.checked &&
+                    translateSilenceVolumeInput &&
+                    translateSilenceVolumeInput.value
+                ) {
+                    const silenceValue = parseFloat(translateSilenceVolumeInput.value);
+                    if (!Number.isNaN(silenceValue)) {
+                        payload.silence_volume_percent = silenceValue;
+                    }
+                }
+                try {
+                    if (translateGenerateChunksBtn) {
+                        translateGenerateChunksBtn.disabled = true;
+                    }
+                    await streamChunkBatchGenerationRequest(payload);
+                } catch (error) {
+                    const message = error && error.message ? error.message : 'Chunk batch generation failed.';
+                    showStatus(message, 'error', statusId);
+                } finally {
+                    if (translateGenerateChunksBtn) {
+                        translateGenerateChunksBtn.disabled = false;
+                    }
+                    updateChunkBatchControlsVisibility();
+                }
+            }
+
+            async function streamChunkBatchGenerationRequest(payload) {
+                const statusId = 'translateChunkBatchStatus';
+                showStatus('Scheduling chunk generation... ⏳', 'info', statusId);
+                const response = await fetch('/api/translate_generate_chunks', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+
+                const readError = async () => {
+                    const contentType = response.headers.get('Content-Type') || '';
+                    if (contentType.includes('application/json')) {
+                        try {
+                            const errorData = await response.json();
+                            return errorData.message || errorData.error;
+                        } catch (jsonError) {
+                            console.warn('Failed to parse chunk batch error response:', jsonError);
+                        }
+                    }
+                    try {
+                        return await response.text();
+                    } catch (textError) {
+                        console.warn('Failed to read chunk batch error response:', textError);
+                    }
+                    return null;
+                };
+
+                if (!response.ok) {
+                    const message = (await readError()) || `Chunk generation failed (${response.status})`;
+                    showStatus(message, 'error', statusId);
+                    throw new Error(message);
+                }
+
+                if (!response.body) {
+                    const message = 'Chunk generation failed: streaming not supported in this browser.';
+                    showStatus(message, 'error', statusId);
+                    throw new Error(message);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                const newline = '\\n';
+                let buffer = '';
+                let completed = false;
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+                    buffer += decoder.decode(value, { stream: true });
+                    let newlineIndex = buffer.indexOf(newline);
+                    while (newlineIndex !== -1) {
+                        const line = buffer.slice(0, newlineIndex).trim();
+                        buffer = buffer.slice(newlineIndex + 1);
+                        newlineIndex = buffer.indexOf(newline);
+                        if (!line) {
+                            continue;
+                        }
+                        let eventData;
+                        try {
+                            eventData = JSON.parse(line);
+                        } catch (parseError) {
+                            console.warn('Failed to parse chunk batch event:', parseError, line);
+                            continue;
+                        }
+                        const eventType = eventData.event || 'status';
+                        if (eventType === 'status') {
+                            const message = eventData.message || 'Processing chunks...';
+                            showStatus(message, 'info', statusId);
+                        } else if (eventType === 'chunk_waiting') {
+                            const waitSeconds = Math.ceil(eventData.delay_seconds || 0);
+                            showStatus(
+                                `Chunk ${eventData.chunk_index ?? ''} scheduled (starts in ~${waitSeconds}s).`,
+                                'info',
+                                statusId
+                            );
+                        } else if (eventType === 'chunk_start') {
+                            showStatus(
+                                `Chunk ${eventData.chunk_index ?? ''} generating...`,
+                                'success',
+                                statusId
+                            );
+                        } else if (eventType === 'chunk_complete') {
+                            if (eventData.metadata) {
+                                applyChunkGenerationMetadata(eventData.metadata, eventData.audio_url, { autoSelect: false });
+                            }
+                            if (eventData.chunk_session_id) {
+                                translateChunkSelections.delete(eventData.chunk_session_id);
+                            }
+                            const successMessage =
+                                eventData.message || `Chunk ${eventData.chunk_index ?? ''} generated successfully.`;
+                            showStatus(successMessage, 'success', statusId);
+                            updateChunkBatchControlsVisibility();
+                        } else if (eventType === 'chunk_error') {
+                            const message = eventData.message || 'Chunk generation failed.';
+                            showStatus(message, 'error', statusId);
+                        } else if (eventType === 'complete') {
+                            completed = true;
+                            const detailParts = [];
+                            if (typeof eventData.completed_chunks === 'number') {
+                                detailParts.push(`${eventData.completed_chunks} succeeded`);
+                            }
+                            if (typeof eventData.failed_chunks === 'number') {
+                                detailParts.push(`${eventData.failed_chunks} failed`);
+                            }
+                            const summaryMessage = eventData.message || 'Chunk batch generation finished.';
+                            const detailMessage = detailParts.length ? ` (${detailParts.join(', ')})` : '';
+                            showStatus(`${summaryMessage}${detailMessage}`, 'success', statusId);
+                        }
+                    }
+                }
+
+                if (!completed) {
+                    const message = 'Chunk batch generation stream ended unexpectedly.';
+                    showStatus(message, 'error', statusId);
+                    throw new Error(message);
+                }
+            }
+
+            function renderMergedAudioResult(data, format) {
+                const resultDiv = document.getElementById('translateResult');
+                if (!resultDiv) {
+                    return;
+                }
+                const audioUrl = data.audio_url;
+                if (!audioUrl) {
+                    return;
+                }
+                const mediaType = getMediaTypeForFormat(format);
+                const downloadName = data.file_name || `merged_chunks.${format}`;
+                resultDiv.innerHTML = `
+                    <h3>🔗 Merged Chunk Output</h3>
+                    <audio controls preload="none" style="width: 100%; margin: 10px 0;">
+                        <source src="${audioUrl}" type="${mediaType}">
+                    </audio>
+                    <a class="btn" href="${audioUrl}" download="${downloadName}">💾 Download Merged Audio</a>
+                `;
+            }
+
+            function getMediaTypeForFormat(format) {
+                switch (format) {
+                    case 'mp3':
+                        return 'audio/mpeg';
+                    case 'wav':
+                        return 'audio/wav';
+                    case 'flac':
+                        return 'audio/flac';
+                    case 'aac':
+                        return 'audio/aac';
+                    case 'opus':
+                        return 'audio/opus';
+                    case 'ogg':
+                        return 'audio/ogg';
+                    case 'webm':
+                        return 'audio/webm';
+                    default:
+                        return 'audio/mpeg';
+                }
+            }
+
+            async function handleSplitAudioRequest() {
+                if (!translateSplitAudioBtn) {
+                    return;
+                }
+                const statusId = 'translateSplitStatus';
+                hideStatus(statusId);
+                resetChunkResults();
+                const audioInput = document.getElementById('translateAudioFile');
+                if (!audioInput || !audioInput.files || !audioInput.files.length) {
+                    showStatus('Select a source audio file before splitting.', 'error', statusId);
+                    return;
+                }
+                const formData = new FormData();
+                formData.append('audio_file', audioInput.files[0]);
+                if (translateDestLanguageSelect && translateDestLanguageSelect.value.trim()) {
+                    formData.append('dest_language', translateDestLanguageSelect.value.trim());
+                }
+                if (translateChunkMinInput && translateChunkMinInput.value) {
+                    formData.append('chunk_min_minutes', translateChunkMinInput.value);
+                }
+                if (translateChunkMaxInput && translateChunkMaxInput.value) {
+                    formData.append('chunk_max_minutes', translateChunkMaxInput.value);
+                }
+                if (translateChunkMinSilenceInput && translateChunkMinSilenceInput.value) {
+                    formData.append('min_silence_ms', translateChunkMinSilenceInput.value);
+                }
+                formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
+                formData.append('enhance_voice', 'true');
+
+                try {
+                    translateSplitAudioBtn.disabled = true;
+                    translateChunkSummary && (translateChunkSummary.textContent = 'Splitting audio...');
+                    showStatus('Splitting audio into manageable chunks...', 'info', statusId);
+                    await streamSplitAudioRequest(formData, statusId);
+                } catch (error) {
+                    console.error('Chunk split error:', error);
+                    showStatus(`Chunk split error: ${error.message}`, 'error', statusId);
+                } finally {
+                    translateSplitAudioBtn.disabled = false;
+                }
+            }
+
+            async function streamSplitAudioRequest(formData, statusId) {
+                const response = await fetch('/api/translate_split_audio', {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                const parseErrorPayload = async () => {
+                    const contentType = response.headers.get('Content-Type') || '';
+                    if (contentType.includes('application/json')) {
+                        try {
+                            const data = await response.json();
+                            return data.message || data.error || null;
+                        } catch (err) {
+                            console.warn('Failed to parse split error response:', err);
+                        }
+                    }
+                    try {
+                        return await response.text();
+                    } catch (err) {
+                        console.warn('Failed to read split error response:', err);
+                    }
+                    return null;
+                };
+
+                if (!response.ok) {
+                    const errorMessage =
+                        (await parseErrorPayload()) || `Chunk split failed (HTTP ${response.status}).`;
+                    showStatus(errorMessage, 'error', statusId);
+                    throw new Error(errorMessage);
+                }
+
+                if (!response.body) {
+                    const message = 'Chunk split failed: streaming not supported in this browser.';
+                    showStatus(message, 'error', statusId);
+                    throw new Error(message);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                const newlineDelimiter = String.fromCharCode(10);
+                let buffer = '';
+                let splitCompleted = false;
+                let lastStatusMessage = '';
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+                    buffer += decoder.decode(value, { stream: true });
+                    let newlineIndex = buffer.indexOf(newlineDelimiter);
+                    while (newlineIndex !== -1) {
+                        const line = buffer.slice(0, newlineIndex).trim();
+                        buffer = buffer.slice(newlineIndex + 1);
+                        newlineIndex = buffer.indexOf(newlineDelimiter);
+                        if (!line) {
+                            continue;
+                        }
+                        let eventData;
+                        try {
+                            eventData = JSON.parse(line);
+                        } catch (parseError) {
+                            console.warn('Failed to parse split event:', parseError, line);
+                            continue;
+                        }
+                        const eventType = eventData.event || 'status';
+                        if (eventType === 'status') {
+                            const message = eventData.message || 'Processing...';
+                            lastStatusMessage = message;
+                            showStatus(message, 'info', statusId);
+                        } else if (eventType === 'heartbeat') {
+                            const heartbeatMessage = lastStatusMessage
+                                ? `Still splitting... ⏳ (Last step: ${lastStatusMessage})`
+                                : 'Still splitting... ⏳';
+                            showStatus(heartbeatMessage, 'info', statusId);
+                        } else if (eventType === 'error') {
+                            const message = eventData.message || 'Chunk split failed.';
+                            showStatus(message, 'error', statusId);
+                            throw new Error(message);
+                        } else if (eventType === 'complete') {
+                            splitCompleted = true;
+                            const payload = {
+                                chunks: Array.isArray(eventData.chunks) ? eventData.chunks : [],
+                                chunk_batch_id: eventData.chunk_batch_id || null,
+                                duration_label: eventData.duration_label,
+                                duration_ms: eventData.duration_ms,
+                            };
+                            renderChunkResultsFromResponse(payload);
+                            if (translateChunkResults && translateEnableChunkSplit && translateEnableChunkSplit.checked) {
+                                translateChunkResults.style.display = 'block';
+                            }
+                            const successMessage =
+                                eventData.message ||
+                                `Prepared ${payload.chunks.length} chunk(s) for advanced processing.`;
+                            showStatus(successMessage, 'success', statusId);
+                        }
+                    }
+                }
+
+                if (!splitCompleted) {
+                    const message = 'Chunk split stream ended unexpectedly.';
+                    showStatus(message, 'error', statusId);
+                    throw new Error(message);
+                }
+            }
+
+            function applyChunkSession(chunk) {
+                if (!chunk) {
+                    return;
+                }
+                currentTranslateSessionId = chunk.session_id;
+                currentChunkSessionId = chunk.session_id;
+                translateSelectedChunkId = chunk.session_id;
+                if (!translateChunkBatchId && chunk.batch_id) {
+                    translateChunkBatchId = chunk.batch_id;
+                }
+                if (translateAudioInput && translateAudioInput.value) {
+                    translateAudioInput.value = '';
+                }
+                updateAudioInputRequirement();
+                translateBackingAvailableFromSession = Boolean(chunk.backing_available);
+                updateCustomBackingSummary();
+                syncTranslateMergeBackState();
+                const metadata = {
+                    session_id: chunk.session_id,
+                    reuse_session_id: chunk.session_id,
+                    backing_track: {
+                        available: chunk.backing_available,
+                        source: chunk.backing_source || 'none',
+                    },
+                    separation: {
+                        vocals_available: true,
+                        vocals_url: chunk.vocals_url,
+                        backing_available: chunk.backing_available,
+                        backing_url: chunk.backing_url,
+                        backing_source: chunk.backing_source || 'none',
+                    },
+                };
+                autoApplyTranslateMetadata(metadata, chunk.session_id);
+                renderChunkResultsFromResponse();
+                updateChunkSelectionUI();
+                const reuseCheckbox = document.getElementById('translateReuseSeparation');
+                if (reuseCheckbox) {
+                    reuseCheckbox.checked = true;
+                }
+                showStatus(
+                    `Chunk ${chunk.chunk_index} ready. Enable advanced mode and reuse the separation to process this portion.`,
+                    'success',
+                    'translateStatus'
+                );
+            }
+
+            resetChunkResults();
+            updateAudioInputRequirement();
+
+            if (translateEnableChunkSplit) {
+                translateEnableChunkSplit.addEventListener('change', () => {
+                    const enabled = translateEnableChunkSplit.checked;
+                    if (enabled && translateEnhanceEl && !translateEnhanceEl.checked) {
+                        translateEnhanceEl.checked = true;
+                        syncTranslateMergeBackState();
+                    }
+                    toggleChunkControls(enabled);
+                });
+                toggleChunkControls(translateEnableChunkSplit.checked);
+            }
+
+            const translateReuseCheckbox = document.getElementById('translateReuseSeparation');
+            if (translateReuseCheckbox) {
+                translateReuseCheckbox.addEventListener('change', () => {
+                    updateAudioInputRequirement();
+                });
+            }
+
+            if (translateSplitAudioBtn) {
+                translateSplitAudioBtn.addEventListener('click', handleSplitAudioRequest);
+            }
+
+            if (translateChunkList) {
+                translateChunkList.addEventListener('click', event => {
+                    const target = event.target.closest('.chunk-use-btn');
+                    if (!target) {
+                        return;
+                    }
+                    const sessionId = target.dataset.sessionId;
+                    const chunk = translateChunkSessions.find(entry => entry.session_id === sessionId);
+                    if (!chunk) {
+                        showStatus('Chunk metadata missing. Please split the audio again.', 'error', 'translateStatus');
+                        return;
+                    }
+                    applyChunkSession(chunk);
+                });
+                translateChunkList.addEventListener('change', event => {
+                    const checkbox = event.target.closest('.chunk-select-checkbox');
+                    if (!checkbox) {
+                        return;
+                    }
+                    const sessionId = checkbox.dataset.sessionId;
+                    if (!sessionId) {
+                        return;
+                    }
+                    if (checkbox.checked) {
+                        translateChunkSelections.add(sessionId);
+                    } else {
+                        translateChunkSelections.delete(sessionId);
+                    }
+                    hideStatus('translateChunkBatchStatus');
+                    updateChunkBatchControlsVisibility();
+                });
+            }
+
+            if (translateClearChunkBtn) {
+                translateClearChunkBtn.addEventListener('click', () => {
+                    currentChunkSessionId = null;
+                    translateSelectedChunkId = null;
+                    updateChunkSelectionUI();
+                    updateAudioInputRequirement();
+                    showStatus('Chunk selection cleared. Upload a file or choose another chunk to continue.', 'success', 'translateStatus');
+                });
+            }
+
+            if (translateChunkSelectPending) {
+                translateChunkSelectPending.addEventListener('change', () => {
+                    const pendingChunks = translateChunkSessions.filter(chunk => !chunk.generated);
+                    if (!pendingChunks.length) {
+                        translateChunkSelectPending.checked = false;
+                        return;
+                    }
+                    if (translateChunkSelectPending.checked) {
+                        pendingChunks.forEach(chunk => translateChunkSelections.add(chunk.session_id));
+                    } else {
+                        pendingChunks.forEach(chunk => translateChunkSelections.delete(chunk.session_id));
+                    }
+                    hideStatus('translateChunkBatchStatus');
+                    updateChunkBatchControlsVisibility();
+                });
+            }
+
+            if (translateMergeChunksBtn) {
+                translateMergeChunksBtn.addEventListener('click', handleMergeChunks);
+            }
+
+            if (translateGenerateChunksBtn) {
+                translateGenerateChunksBtn.addEventListener('click', handleGenerateSelectedChunks);
+            }
+
+            if (translateAudioInput) {
+                translateAudioInput.addEventListener('change', () => {
+                    if (translateChunkSessions.length) {
+                        resetChunkResults();
+                    }
+                });
+            }
 
             function formatTimestamp(ms) {
                 const totalMs = Math.max(0, Math.round(ms || 0));
@@ -4854,9 +7161,27 @@ async def home():
                 }
             }
 
+            function enforceEnhancementForSuperRes() {
+                if (!translateEnhanceEl) {
+                    return;
+                }
+                const superEnabled = translateSuperEl && translateSuperEl.checked;
+                if (superEnabled && !translateEnhanceEl.checked) {
+                    translateEnhanceEl.checked = true;
+                }
+                translateEnhanceEl.disabled = Boolean(superEnabled);
+                syncTranslateMergeBackState();
+            }
+
             if (translateEnhanceEl) {
                 translateEnhanceEl.addEventListener('change', syncTranslateMergeBackState);
                 syncTranslateMergeBackState();
+            }
+            if (translateSuperEl) {
+                translateSuperEl.addEventListener('change', enforceEnhancementForSuperRes);
+                enforceEnhancementForSuperRes();
+            } else {
+                enforceEnhancementForSuperRes();
             }
             if (translateCustomBackingInput) {
                 translateCustomBackingInput.addEventListener('change', () => {
@@ -4877,24 +7202,23 @@ async def home():
             if (translateDestLanguageSelect) {
                 translateDestLanguageSelect.addEventListener('change', refreshPromptTemplates);
             }
-            function syncPreserveSilenceState() {
-                if (!translatePreserveSilenceEl) {
+            function syncSilenceVolumeUI() {
+                if (!translateSilenceVolumeGroup) {
                     return;
                 }
-                const ignoreEnabled = translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked;
-                translatePreserveSilenceEl.disabled = !ignoreEnabled;
-                if (!ignoreEnabled) {
-                    translatePreserveSilenceEl.checked = false;
-                }
+                const enabled = translatePreserveSilenceEl && translatePreserveSilenceEl.checked;
+                translateSilenceVolumeGroup.style.display = enabled ? 'block' : 'none';
+            }
+            if (translatePreserveSilenceEl) {
+                translatePreserveSilenceEl.addEventListener('change', () => {
+                    syncSilenceVolumeUI();
+                });
+                syncSilenceVolumeUI();
             }
             if (translateIgnoreNonSpeechEl) {
                 translateIgnoreNonSpeechEl.addEventListener('change', () => {
                     refreshPromptTemplates();
-                    syncPreserveSilenceState();
                 });
-                syncPreserveSilenceState();
-            } else {
-                syncPreserveSilenceState();
             }
 
             function appendSegmentParameters(formData) {
@@ -4923,6 +7247,16 @@ async def home():
                     const backingValue = (translateBackingVolumeInput.value || '').trim();
                     if (backingValue) {
                         formData.append('backing_volume_percent', backingValue);
+                    }
+                }
+                if (
+                    translatePreserveSilenceEl &&
+                    translatePreserveSilenceEl.checked &&
+                    translateSilenceVolumeInput
+                ) {
+                    const silenceValue = (translateSilenceVolumeInput.value || '').trim();
+                    if (silenceValue) {
+                        formData.append('silence_volume_percent', silenceValue);
                     }
                 }
             }
@@ -5232,7 +7566,7 @@ async def home():
                         previewControls.innerHTML = `
                             <button type="button" class="btn segment-preview-btn">⚡ Preview Segment</button>
                             <small class="segment-preview-status"></small>
-                            <audio class="segment-preview-audio" controls style="width: 100%; display: none; margin-top: 8px;"></audio>
+                            <audio class="segment-preview-audio" controls preload="none" style="width: 100%; display: none; margin-top: 8px;"></audio>
                         `;
                         body.appendChild(previewControls);
                         const previewButton = previewControls.querySelector('.segment-preview-btn');
@@ -5579,7 +7913,7 @@ async def home():
                             </div>
                             <div class="speaker-assignment-preview" data-speaker-id="${speakerId}">
                                 <small class="speaker-preview-message"></small>
-                                <audio controls class="speaker-preview-audio" style="display:none"></audio>
+                                <audio controls preload="none" class="speaker-preview-audio" style="display:none"></audio>
                             </div>
                         </div>
                     `;
@@ -5880,6 +8214,13 @@ async def home():
                         translateBackingVolumeInput.value = backingValue;
                     }
                 }
+                if (
+                    translateSilenceVolumeInput &&
+                    typeof metadata.silence_volume_percent === 'number'
+                ) {
+                    translateSilenceVolumeInput.value = metadata.silence_volume_percent;
+                    syncSilenceVolumeUI();
+                }
                 if (translateManualSegmentsToggle && translateManualSegmentsInput) {
                     let manualText = '';
                     if (typeof metadata.gemini_raw_text === 'string' && metadata.gemini_raw_text.trim()) {
@@ -5915,7 +8256,12 @@ async def home():
                     }
                     speakerOverridesDirty = false;
                 }
+                if (metadata.chunk && metadata.chunk.session_id) {
+                    currentChunkSessionId = metadata.chunk.session_id;
+                    translateSelectedChunkId = metadata.chunk.session_id;
+                }
                 renderSpeakerAssignments();
+                updateChunkSelectionUI();
             }
 
             function syncSegmentRulesFromMetadata(rules) {
@@ -5984,15 +8330,17 @@ async def home():
                         return;
                     }
 
+                    const hasChunkSelection = Boolean(currentChunkSessionId);
                     const selectedFormat = (formatSelect.value || 'mp3').toLowerCase();
 
                     const advancedEnabled = translateAdvancedToggle && translateAdvancedToggle.checked;
                     const reuseSeparationCheckbox = document.getElementById('translateReuseSeparation');
+                    const reuseCandidateSessionId = currentChunkSessionId || currentTranslateSessionId;
                     if (
                         advancedEnabled &&
                         reuseSeparationCheckbox &&
                         reuseSeparationCheckbox.checked &&
-                        !currentTranslateSessionId
+                        !reuseCandidateSessionId
                     ) {
                         showStatus('Analyze audio once before reusing separated tracks.', 'error', statusId);
                         return;
@@ -6001,10 +8349,14 @@ async def home():
                         advancedEnabled &&
                         reuseSeparationCheckbox &&
                         reuseSeparationCheckbox.checked &&
-                        currentTranslateSessionId
+                        reuseCandidateSessionId
                     );
 
-                    if ((!audioInput.files || audioInput.files.length === 0) && !reuseSeparationEnabled) {
+                    if (
+                        (!audioInput.files || audioInput.files.length === 0) &&
+                        !reuseSeparationEnabled &&
+                        !hasChunkSelection
+                    ) {
                         showStatus('Please select a source audio file.', 'error', statusId);
                         return;
                     }
@@ -6013,9 +8365,11 @@ async def home():
                         resetAdvancedPanel(false);
                         const formData = new FormData();
                         if (reuseSeparationEnabled) {
-                            formData.append('reuse_session_id', currentTranslateSessionId);
-                        } else {
+                            formData.append('reuse_session_id', reuseCandidateSessionId);
+                        } else if (audioInput.files && audioInput.files[0]) {
                             formData.append('audio_file', audioInput.files[0]);
+                        } else if (hasChunkSelection) {
+                            formData.append('reuse_session_id', currentChunkSessionId);
                         }
                         if (translateCustomBackingInput && translateCustomBackingInput.files.length > 0) {
                             formData.append('custom_backing_audio_file', translateCustomBackingInput.files[0]);
@@ -6027,6 +8381,9 @@ async def home():
                         formData.append('merge_backing_track', translateMergeBackEl && translateMergeBackEl.checked ? 'true' : 'false');
                         formData.append('ignore_non_speech', translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? 'true' : 'false');
                         formData.append('preserve_silence_audio', translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? 'true' : 'false');
+                        if (translatePreserveSilenceEl && translatePreserveSilenceEl.checked && translateSilenceVolumeInput) {
+                            formData.append('silence_volume_percent', translateSilenceVolumeInput.value || '100');
+                        }
                         if (translateGeminiModel && translateGeminiModel.value) {
                             formData.append('gemini_model', translateGeminiModel.value);
                         }
@@ -6067,7 +8424,11 @@ async def home():
                     }
 
                     const formData = new FormData();
-                    formData.append('audio_file', audioInput.files[0]);
+                    if (hasChunkSelection) {
+                        formData.append('reuse_session_id', currentChunkSessionId);
+                    } else {
+                        formData.append('audio_file', audioInput.files[0]);
+                    }
                     if (translateCustomBackingInput && translateCustomBackingInput.files.length > 0) {
                         formData.append('custom_backing_audio_file', translateCustomBackingInput.files[0]);
                     }
@@ -6078,6 +8439,9 @@ async def home():
                     formData.append('merge_backing_track', translateMergeBackEl && translateMergeBackEl.checked ? 'true' : 'false');
                     formData.append('ignore_non_speech', translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? 'true' : 'false');
                     formData.append('preserve_silence_audio', translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? 'true' : 'false');
+                    if (translatePreserveSilenceEl && translatePreserveSilenceEl.checked && translateSilenceVolumeInput) {
+                        formData.append('silence_volume_percent', translateSilenceVolumeInput.value || '100');
+                    }
                     if (translateGeminiModel && translateGeminiModel.value) {
                         formData.append('gemini_model', translateGeminiModel.value);
                     }
@@ -6166,6 +8530,17 @@ async def home():
                         const backingValue = parseFloat(translateBackingVolumeInput.value);
                         if (!Number.isNaN(backingValue)) {
                             payload.backing_volume_percent = backingValue;
+                        }
+                    }
+                    if (
+                        translatePreserveSilenceEl &&
+                        translatePreserveSilenceEl.checked &&
+                        translateSilenceVolumeInput &&
+                        translateSilenceVolumeInput.value
+                    ) {
+                        const silenceValue = parseFloat(translateSilenceVolumeInput.value);
+                        if (!Number.isNaN(silenceValue)) {
+                            payload.silence_volume_percent = silenceValue;
                         }
                     }
                     if (speakerOverridesDirty) {
@@ -6296,6 +8671,7 @@ async def home():
                                 statusMessage += ` • Gemini model: ${metadata.gemini_model}`;
                             }
                             showStatus(statusMessage, 'success', statusId);
+                            applyChunkGenerationMetadata(metadata, audioUrl);
                             autoApplyTranslateMetadata(metadata, metadata.session_id || null);
                         }
                     }
@@ -6365,11 +8741,10 @@ async def home():
                     if (translateIgnoreNonSpeechEl && data.metadata && typeof data.metadata.ignore_non_speech === 'boolean') {
                         translateIgnoreNonSpeechEl.checked = !!data.metadata.ignore_non_speech;
                         refreshPromptTemplates();
-                        syncPreserveSilenceState();
                     }
                     if (translatePreserveSilenceEl && data.metadata && typeof data.metadata.preserve_silence_audio === 'boolean') {
                         translatePreserveSilenceEl.checked = !!data.metadata.preserve_silence_audio;
-                        syncPreserveSilenceState();
+                        syncSilenceVolumeUI();
                     }
 
                     const metadata = data.metadata || {};
@@ -6541,6 +8916,7 @@ async def home():
                         statusMessage += ` • Generated ${metadata.selected_generated_count}, preserved ${metadata.selected_preserved_count}`;
                     }
                     showStatus(statusMessage, 'success', statusId);
+                    applyChunkGenerationMetadata(metadata, audioUrl);
 
                     const segmentMap = new Map(segmentsPayload.map(seg => [seg.index, seg]));
                     currentTranslateSegments = currentTranslateSegments.map(seg => {
@@ -6679,7 +9055,7 @@ async def home():
                         
                         document.getElementById('audioResult').innerHTML = `
                             <h3>🎵 Generated Speech (${duration}s)</h3>
-                        <audio controls autoplay style="width: 100%; margin: 10px 0;">
+                        <audio controls autoplay preload="none" style="width: 100%; margin: 10px 0;">
                                 <source src="${audioUrl}" type="audio/mpeg">
                             </audio>
                             <br>
@@ -7085,6 +9461,691 @@ async def api_prompt_templates():
     }
 
 
+@app.post("/api/translate_split_audio")
+async def api_translate_split_audio(
+    request: Request,
+    dest_language: Optional[str] = Form(None),
+    audio: Optional[str] = Form(None),
+    audio_mime_type: Optional[str] = Form(None),
+    chunk_min_minutes: Optional[float] = Form(None),
+    chunk_max_minutes: Optional[float] = Form(None),
+    min_silence_ms: Optional[int] = Form(None),
+    silence_threshold_db: Optional[float] = Form(None),
+    super_resolution_voice: Optional[bool] = Form(False),
+    audio_file: Optional[UploadFile] = File(None),
+):
+    """API: Split long audio into ClearVoice-enhanced chunks for reuse."""
+    if ClearVoice is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": "ClearVoice package is required for audio chunking. Install the `clearvoice` package to enable this feature.",
+            },
+        )
+
+    try:
+        payload: Optional[Dict[str, Any]] = None
+        content_type = request.headers.get("content-type", "")
+        if (
+            audio_file is None
+            and (audio is None or not audio.strip())
+            and "application/json" in content_type.lower()
+        ):
+            try:
+                payload = await request.json()
+            except Exception as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": f"Invalid JSON payload: {str(exc)}"},
+                )
+
+        if payload is not None:
+            dest_language = payload.get("dest_language", dest_language)
+            audio = payload.get("audio", audio)
+            audio_mime_type = payload.get("audio_mime_type", audio_mime_type)
+            chunk_min_minutes = payload.get("chunk_min_minutes", chunk_min_minutes)
+            chunk_max_minutes = payload.get("chunk_max_minutes", chunk_max_minutes)
+            min_silence_ms = payload.get("min_silence_ms", min_silence_ms)
+            silence_threshold_db = payload.get("silence_threshold_db", silence_threshold_db)
+            super_resolution_voice = payload.get("super_resolution_voice", super_resolution_voice)
+
+        audio_reference_value = (audio or "").strip()
+        if audio_file is None and not audio_reference_value:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "Source audio is required for chunk splitting.",
+                },
+            )
+
+        dest_language_value = (dest_language or "").strip() or "unspecified"
+        apply_super_resolution = _coerce_to_bool(super_resolution_voice)
+        min_minutes = _coerce_positive_float(
+            chunk_min_minutes,
+            CHUNK_SPLIT_DEFAULT_MIN_MINUTES,
+            min_value=CHUNK_SPLIT_MIN_MINUTES,
+            max_value=CHUNK_SPLIT_MAX_MINUTES,
+        )
+        max_minutes = _coerce_positive_float(
+            chunk_max_minutes,
+            CHUNK_SPLIT_DEFAULT_MAX_MINUTES,
+            min_value=min_minutes,
+            max_value=CHUNK_SPLIT_MAX_MINUTES,
+        )
+        if max_minutes < min_minutes:
+            max_minutes = min_minutes
+        min_chunk_ms = int(min_minutes * 60_000)
+        max_chunk_ms = int(max_minutes * 60_000)
+        min_chunk_ms = max(60_000, min_chunk_ms)
+        max_chunk_ms = max(min_chunk_ms, max_chunk_ms)
+
+        min_silence_ms_value = _coerce_positive_int(
+            min_silence_ms,
+            CHUNK_SPLIT_MIN_SILENCE_MS,
+            min_value=500,
+            max_value=120_000,
+        )
+        silence_threshold_value = _coerce_float_range(
+            silence_threshold_db,
+            CHUNK_SPLIT_SILENCE_THRESHOLD_DB,
+            min_value=-80.0,
+            max_value=-10.0,
+        )
+
+        preloaded_audio_bytes: Optional[bytes] = None
+        uploaded_filename: Optional[str] = None
+        audio_mime_type_value = audio_mime_type
+        audio_file_for_pipeline = audio_file
+
+        if audio_file is not None:
+            try:
+                audio_io = await load_audio_bytes_from_request(audio_file, None)
+            except HTTPException as exc:
+                return JSONResponse(
+                    status_code=exc.status_code,
+                    content={"status": "error", "message": exc.detail},
+                )
+            preloaded_audio_bytes = audio_io.read()
+            if not preloaded_audio_bytes:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": "Uploaded audio file is empty."},
+                )
+            uploaded_filename = audio_file.filename
+            audio_mime_type_value = audio_file.content_type or audio_mime_type_value
+            audio_file_for_pipeline = None
+
+        split_request_summary = {
+            "dest_language": dest_language_value,
+            "chunk_min_minutes": min_minutes,
+            "chunk_max_minutes": max_minutes,
+            "min_silence_ms": min_silence_ms_value,
+            "silence_threshold_db": silence_threshold_value,
+            "super_resolution": apply_super_resolution,
+        }
+
+        async def split_stream():
+            queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+
+            async def emit(event_type: str, **payload: Any) -> None:
+                event = {
+                    "event": event_type,
+                    "timestamp": time.time(),
+                    **payload,
+                }
+                await queue.put(event)
+
+            async def emit_status(**payload: Any) -> None:
+                await emit("status", **payload)
+
+            async def heartbeat_task():
+                try:
+                    while True:
+                        await asyncio.sleep(10)
+                        await emit_status(stage="heartbeat", message="Still splitting audio...")
+                except asyncio.CancelledError:
+                    pass
+
+            async def run_pipeline():
+                heartbeat = asyncio.create_task(heartbeat_task())
+                try:
+                    await emit_status(stage="start", message="Split request accepted.", summary=split_request_summary)
+
+                    (
+                        processed_audio,
+                        input_mime_type_value,
+                        _processed_bytes,
+                        _gemini_mime_type,
+                        backing_track_audio,
+                        _merge_flag,
+                        backing_track_source,
+                    ) = await _prepare_audio_assets(
+                        reuse_source_session=None,
+                        audio_file=audio_file_for_pipeline,
+                        audio_reference=audio_reference_value if audio_reference_value else None,
+                        preloaded_audio_bytes=preloaded_audio_bytes,
+                        source_audio_filename=uploaded_filename,
+                        audio_mime_type_value=audio_mime_type_value,
+                        apply_enhancement=True,
+                        apply_super_resolution=apply_super_resolution,
+                        requested_merge_backing=False,
+                        emit_status=emit_status,
+                    )
+
+                    await emit_status(stage="chunking", message="Analyzing silence to plan chunk ranges...")
+                    chunk_ranges, silence_stats = _plan_chunk_ranges(
+                        processed_audio,
+                        min_chunk_ms=min_chunk_ms,
+                        max_chunk_ms=max_chunk_ms,
+                        min_silence_ms=min_silence_ms_value,
+                        silence_threshold_db=silence_threshold_value,
+                    )
+
+                    if not chunk_ranges:
+                        chunk_ranges = [
+                            {
+                                "start_ms": 0,
+                                "end_ms": len(processed_audio),
+                                "cut_reason": "full_audio",
+                                "silence_midpoint_ms": None,
+                            }
+                        ]
+
+                    chunk_entries: List[Dict[str, Any]] = []
+                    total_duration_ms = len(processed_audio)
+                    gemini_model_name = _get_gemini_model_name()
+                    chunk_batch_id = uuid.uuid4().hex
+                    _persist_chunk_batch_media(chunk_batch_id, processed_audio, "vocals_full")
+                    if backing_track_audio is not None:
+                        _persist_chunk_batch_media(chunk_batch_id, backing_track_audio, "backing_full")
+
+                    await emit_status(
+                        stage="chunking",
+                        message=f"Creating up to {len(chunk_ranges)} chunk session(s)...",
+                    )
+                    created_chunks = 0
+
+                    for chunk_idx, entry in enumerate(chunk_ranges, start=1):
+                        start_ms = entry["start_ms"]
+                        end_ms = entry["end_ms"]
+                        duration_ms = max(0, end_ms - start_ms)
+                        if duration_ms < CHUNK_SPLIT_MIN_CHUNK_MS:
+                            continue
+                        chunk_audio = processed_audio[start_ms:end_ms]
+
+                        chunk_session = await _create_translate_session(
+                            chunk_audio,
+                            dest_language_value,
+                            prompt="",
+                            translate_enabled=True,
+                            response_format=TRANSLATE_DEFAULT_OUTPUT_FORMAT,
+                            bitrate=TRANSLATE_DEFAULT_BITRATE,
+                            input_mime_type=input_mime_type_value,
+                            clearvoice_settings={"enhancement": True, "super_resolution": apply_super_resolution},
+                            base_segments=[],
+                            gemini_chunks=[],
+                            gemini_model=gemini_model_name,
+                            gemini_api_key=None,
+                            backing_track_audio=None,
+                            backing_track_source="none",
+                            merge_with_backing=False,
+                            ignore_non_speech=False,
+                            preserve_silence_audio=False,
+                            generated_volume_percent=DEFAULT_GENERATED_VOLUME_PERCENT,
+                            backing_volume_percent=DEFAULT_GENERATED_VOLUME_PERCENT,
+                            chunk_parent_id=chunk_batch_id,
+                            chunk_index=chunk_idx,
+                            chunk_start_ms=start_ms,
+                            chunk_end_ms=end_ms,
+                            chunk_cut_reason=entry.get("cut_reason"),
+                            chunk_silence_midpoint_ms=entry.get("silence_midpoint_ms"),
+                            persist_media=True,
+                        )
+
+                        chunk_entry = _serialize_chunk_session(chunk_session)
+                        chunk_entries.append(chunk_entry)
+                        created_chunks += 1
+                        await emit_status(
+                            stage="chunking",
+                            message=f"Chunk {created_chunks} created (target {len(chunk_ranges)}).",
+                        )
+
+                    if not chunk_entries and total_duration_ms >= CHUNK_SPLIT_MIN_CHUNK_MS:
+                        await emit_status(stage="chunking", message="Fallback: keeping full audio as single chunk.")
+                        fallback_session = await _create_translate_session(
+                            processed_audio,
+                            dest_language_value,
+                            prompt="",
+                            translate_enabled=True,
+                            response_format=TRANSLATE_DEFAULT_OUTPUT_FORMAT,
+                            bitrate=TRANSLATE_DEFAULT_BITRATE,
+                            input_mime_type=input_mime_type_value,
+                            clearvoice_settings={"enhancement": True, "super_resolution": apply_super_resolution},
+                            base_segments=[],
+                            gemini_chunks=[],
+                            gemini_model=gemini_model_name,
+                            gemini_api_key=None,
+                            backing_track_audio=None,
+                            backing_track_source="none",
+                            merge_with_backing=False,
+                            ignore_non_speech=False,
+                            preserve_silence_audio=False,
+                            generated_volume_percent=DEFAULT_GENERATED_VOLUME_PERCENT,
+                            backing_volume_percent=DEFAULT_GENERATED_VOLUME_PERCENT,
+                            chunk_parent_id=chunk_batch_id,
+                            chunk_index=1,
+                            chunk_start_ms=0,
+                            chunk_end_ms=total_duration_ms,
+                            chunk_cut_reason="full_audio",
+                            persist_media=True,
+                        )
+                        chunk_entries.append(_serialize_chunk_session(fallback_session))
+
+                    if not chunk_entries:
+                        raise TranslateWorkflowHttpError(
+                            400,
+                            {
+                                "status": "error",
+                                "message": "Unable to derive valid chunks from the provided audio.",
+                            },
+                        )
+
+                    response_payload = {
+                        "status": "ok",
+                        "message": f"Prepared {len(chunk_entries)} chunk(s) for advanced processing.",
+                        "chunk_count": len(chunk_entries),
+                        "duration_ms": total_duration_ms,
+                        "duration_label": _format_ms_to_timestamp(total_duration_ms),
+                        "chunks": chunk_entries,
+                        "chunk_batch_id": chunk_batch_id,
+                        "strategy": {
+                            "min_chunk_ms": min_chunk_ms,
+                            "max_chunk_ms": max_chunk_ms,
+                            "min_minutes": min_minutes,
+                            "max_minutes": max_minutes,
+                            "min_silence_ms": min_silence_ms_value,
+                            "silence_threshold_db": silence_threshold_value,
+                            "silence_count": silence_stats.get("silence_count", 0),
+                            "silence_metrics": silence_stats,
+                        },
+                        "clearvoice": {
+                            "enhancement": True,
+                            "super_resolution": apply_super_resolution,
+                            "backing_available": backing_track_audio is not None,
+                            "backing_source": backing_track_source,
+                        },
+                        "session_ttl_seconds": ADVANCED_TRANSLATE_SESSION_TTL_SECONDS,
+                    }
+
+                    await emit("complete", **response_payload)
+
+                except TranslateWorkflowHttpError as http_error:
+                    await emit(
+                        "error",
+                        status_code=http_error.status_code,
+                        message=http_error.content.get("message") or "Chunk splitting failed.",
+                        details=http_error.content,
+                    )
+                except Exception as exc:
+                    traceback.print_exc()
+                    await emit(
+                        "error",
+                        status_code=500,
+                        message=f"Failed to split audio: {str(exc)}",
+                    )
+                finally:
+                    heartbeat.cancel()
+                    try:
+                        await heartbeat
+                    except asyncio.CancelledError:
+                        pass
+                    await queue.put(None)
+
+            asyncio.create_task(run_pipeline())
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+
+        return StreamingResponse(split_stream(), media_type="application/json")
+
+    except TranslateWorkflowHttpError as http_error:
+        return JSONResponse(status_code=http_error.status_code, content=http_error.content)
+    except Exception as exc:
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Failed to split audio: {str(exc)}"},
+        )
+
+
+@app.post("/api/translate_merge_chunks")
+async def api_translate_merge_chunks(payload: MergeChunksRequest):
+    """API: Merge multiple chunk sessions back into a single audio file."""
+    try:
+        session_ids: List[str] = [
+            sid for sid in (payload.chunk_session_ids or []) if isinstance(sid, str) and sid.strip()
+        ]
+        chunk_batch_id = (payload.chunk_batch_id or "").strip()
+
+        sessions: List[TranslateSessionData] = []
+        if session_ids:
+            for sid in session_ids:
+                session = await _get_translate_session(sid)
+                if session is None:
+                    return JSONResponse(
+                        status_code=404,
+                        content={"status": "error", "message": f"Chunk session '{sid}' not found or expired."},
+                    )
+                if session.chunk_parent_id is None:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"status": "error", "message": f"Session '{sid}' is not a chunk session."},
+                    )
+                sessions.append(session)
+        elif chunk_batch_id:
+            sessions = await _list_chunk_sessions(chunk_batch_id)
+            if not sessions:
+                return JSONResponse(
+                    status_code=404,
+                    content={"status": "error", "message": "No chunk sessions found for this batch."},
+                )
+            sessions.sort(key=lambda s: (s.chunk_index or 0, s.chunk_start_ms or 0))
+        else:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "Provide chunk_session_ids (ordered list) or chunk_batch_id to merge.",
+                },
+            )
+
+        merge_backing_request = _coerce_to_bool(payload.merge_backing_track)
+        merged_audio: Optional[AudioSegment] = None
+        chunk_results: List[Dict[str, Any]] = []
+        for session in sessions:
+            segment_audio = _load_chunk_audio_for_merge(session)
+            if segment_audio is None:
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "status": "error",
+                        "message": f"Chunk session '{session.session_id}' has no audio available.",
+                    },
+                )
+            chunk_results.append(
+                {
+                    "session_id": session.session_id,
+                    "chunk_index": session.chunk_index,
+                    "generated": bool(session.chunk_generated),
+                    "duration_ms": len(segment_audio),
+                    "source": "generated" if session.chunk_generated else "original",
+                    "audio_url": _chunk_output_url(session) if session.chunk_generated else None,
+                }
+            )
+            merged_audio = segment_audio if merged_audio is None else merged_audio + segment_audio
+
+        if merged_audio is None:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "No audio chunks were provided to merge."},
+            )
+
+        response_format_value = TRANSLATE_DEFAULT_OUTPUT_FORMAT
+        bitrate_value = payload.bitrate or TRANSLATE_DEFAULT_BITRATE
+        final_audio = merged_audio
+        if merge_backing_request:
+            batch_id = chunk_batch_id or (sessions[0].chunk_parent_id if sessions else None)
+            if batch_id:
+                backing_path = _chunk_batch_media_path(batch_id, "backing_full")
+                if os.path.exists(backing_path):
+                    backing_ext = os.path.splitext(backing_path)[1].lstrip(".") or None
+                    full_backing_audio = AudioSegment.from_file(backing_path, format=backing_ext)
+                    backing_len = len(full_backing_audio)
+                    vocal_len = len(merged_audio)
+                    if backing_len >= vocal_len:
+                        final_audio = full_backing_audio.overlay(merged_audio)
+                    else:
+                        print(
+                            f"⚠️ Backing track ({backing_len} ms) shorter than merged vocals ({vocal_len} ms); using vocal timeline as base."
+                        )
+                        final_audio = merged_audio.overlay(full_backing_audio)
+                else:
+                    print(f"⚠️ Full backing track not found at {backing_path}; exporting vocals only.")
+        merged_bytes = await _export_audio_segment_bytes(
+            final_audio,
+            fmt=response_format_value,
+            bitrate=bitrate_value if response_format_value in {"mp3", "ogg", "opus", "aac", "webm"} else None,
+        )
+
+        output_filename = f"translate_merge_{uuid.uuid4().hex}.{response_format_value}"
+        output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
+        with open(output_path, "wb") as outfile:
+            outfile.write(merged_bytes)
+
+        audio_url = f"/api/translate_outputs/{output_filename}"
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ok",
+                "message": f"Merged {len(chunk_results)} chunk(s).",
+                "audio_url": audio_url,
+                "file_name": output_filename,
+                "response_format": response_format_value,
+                "chunk_results": chunk_results,
+                "chunk_batch_id": chunk_batch_id or sessions[0].chunk_parent_id,
+            },
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Failed to merge chunks: {str(exc)}"},
+        )
+
+
+@app.post("/api/translate_generate_chunks")
+async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
+    """API: Generate translated audio for multiple chunk sessions in parallel."""
+    try:
+        session_ids = [sid.strip() for sid in payload.chunk_session_ids if isinstance(sid, str) and sid.strip()]
+        if not session_ids:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "Select at least one chunk session to generate."},
+            )
+
+        sessions: List[TranslateSessionData] = []
+        for sid in session_ids:
+            session = await _get_translate_session(sid)
+            if session is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"status": "error", "message": f"Chunk session '{sid}' not found or expired."},
+                )
+            if session.chunk_parent_id is None:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": f"Session '{sid}' is not a chunk session."},
+                )
+            sessions.append(session)
+
+        config_template = sessions[0]
+        dest_language_value = (payload.dest_language or config_template.dest_language or "").strip()
+        if not dest_language_value:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "Destination language (dest_language) is required."},
+            )
+
+        response_format_value = (payload.response_format or config_template.response_format or TRANSLATE_DEFAULT_OUTPUT_FORMAT).lower()
+        bitrate_value = payload.bitrate or config_template.bitrate or TRANSLATE_DEFAULT_BITRATE
+        gemini_model_value = _normalize_gemini_model_name(payload.gemini_model or config_template.gemini_model)
+        gemini_api_key_value = (payload.gemini_api_key or config_template.gemini_api_key or "").strip()
+        ignore_non_speech_flag = _coerce_to_bool(
+            payload.ignore_non_speech if payload.ignore_non_speech is not None else config_template.ignore_non_speech
+        )
+        preserve_silence_flag = _coerce_to_bool(
+            payload.preserve_silence_audio
+            if payload.preserve_silence_audio is not None
+            else config_template.preserve_silence_audio
+        )
+        generated_volume_percent_value = _coerce_volume_percent(
+            payload.generated_volume_percent,
+            config_template.generated_volume_percent,
+        )
+        backing_volume_percent_value = _coerce_volume_percent(
+            payload.backing_volume_percent,
+            config_template.backing_volume_percent,
+        )
+        silence_volume_percent_value = _coerce_volume_percent(
+            payload.silence_volume_percent
+            if payload.silence_volume_percent is not None
+            else config_template.silence_volume_percent,
+            config_template.silence_volume_percent,
+        )
+        merge_backing_requested = _coerce_to_bool(
+            payload.merge_backing_track
+            if payload.merge_backing_track is not None
+            else config_template.merge_with_backing
+        )
+
+        summary_payload = {
+            "chunks": len(sessions),
+            "dest_language": dest_language_value,
+            "response_format": response_format_value,
+            "bitrate": bitrate_value,
+            "gemini_model": gemini_model_value,
+            "merge_backing": merge_backing_requested,
+        }
+
+        async def chunk_generate_stream():
+            queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+
+            async def emit(event_type: str, **payload_data: Any) -> None:
+                event = {
+                    "event": event_type,
+                    "timestamp": time.time(),
+                    **payload_data,
+                }
+                await queue.put(event)
+
+            async def run_batch():
+                await emit(
+                    "status",
+                    stage="start",
+                    message=f"Queued {len(sessions)} chunk(s) for generation.",
+                    summary=summary_payload,
+                )
+
+                success_count = 0
+                failure_count = 0
+                counter_lock = asyncio.Lock()
+
+                async def handle_chunk(session: TranslateSessionData, order_index: int):
+                    nonlocal success_count, failure_count
+                    delay_seconds = order_index * CHUNK_BATCH_GENERATE_DELAY_SECONDS
+                    if delay_seconds > 0:
+                        await emit(
+                            "chunk_waiting",
+                            chunk_session_id=session.session_id,
+                            chunk_index=session.chunk_index,
+                            delay_seconds=delay_seconds,
+                        )
+                        await asyncio.sleep(delay_seconds)
+
+                    await emit(
+                        "chunk_start",
+                        chunk_session_id=session.session_id,
+                        chunk_index=session.chunk_index,
+                    )
+
+                    try:
+                        audio_url, file_name, metadata = await _generate_chunk_audio_from_session(
+                            session,
+                            dest_language=dest_language_value,
+                            response_format=response_format_value,
+                            bitrate=bitrate_value,
+                            gemini_model=gemini_model_value,
+                            gemini_api_key=gemini_api_key_value,
+                            ignore_non_speech=ignore_non_speech_flag,
+                            preserve_silence_audio=preserve_silence_flag,
+                            generated_volume_percent=generated_volume_percent_value,
+                            backing_volume_percent=backing_volume_percent_value,
+                            merge_backing_track=merge_backing_requested,
+                            silence_volume_percent=silence_volume_percent_value,
+                        )
+                        async with counter_lock:
+                            success_count += 1
+                        await emit(
+                            "chunk_complete",
+                            chunk_session_id=session.session_id,
+                            chunk_index=session.chunk_index,
+                            audio_url=audio_url,
+                            file_name=file_name,
+                            metadata=metadata,
+                        )
+                    except TranslateWorkflowHttpError as http_error:
+                        async with counter_lock:
+                            failure_count += 1
+                        await emit(
+                            "chunk_error",
+                            chunk_session_id=session.session_id,
+                            chunk_index=session.chunk_index,
+                            status_code=http_error.status_code,
+                            message=http_error.content.get("message") or "Chunk generation failed.",
+                            details=http_error.content,
+                        )
+                    except Exception as exc:
+                        async with counter_lock:
+                            failure_count += 1
+                        traceback.print_exc()
+                        await emit(
+                            "chunk_error",
+                            chunk_session_id=session.session_id,
+                            chunk_index=session.chunk_index,
+                            status_code=500,
+                            message=f"Chunk generation failed: {str(exc)}",
+                        )
+
+                tasks = [
+                    asyncio.create_task(handle_chunk(session, idx))
+                    for idx, session in enumerate(sessions)
+                ]
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+                await emit(
+                    "complete",
+                    message="Chunk batch generation finished.",
+                    total_chunks=len(sessions),
+                    completed_chunks=success_count,
+                    failed_chunks=failure_count,
+                )
+                await queue.put(None)
+
+            asyncio.create_task(run_batch())
+
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+
+        return StreamingResponse(chunk_generate_stream(), media_type="application/json")
+    except TranslateWorkflowHttpError as http_error:
+        return JSONResponse(status_code=http_error.status_code, content=http_error.content)
+    except Exception as exc:
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Failed to generate chunk audios: {str(exc)}"},
+        )
+
+
 @app.post("/api/translate_segments")
 async def api_translate_segments(
     request: Request,
@@ -7109,11 +10170,13 @@ async def api_translate_segments(
     preserve_silence_audio: Optional[bool] = Form(False),
     generated_volume_percent: Optional[float] = Form(None),
     backing_volume_percent: Optional[float] = Form(None),
+    silence_volume_percent: Optional[float] = Form(None),
     reuse_session_id: Optional[str] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
     custom_backing_audio_file: Optional[UploadFile] = File(None),
 ):
     """API: Prepare translation segments for advanced translate/edit workflow."""
+    reuse_session_id_value: Optional[str] = reuse_session_id
     try:
         payload: Optional[Dict[str, Any]] = None
         dest_language_value = dest_language
@@ -7137,7 +10200,7 @@ async def api_translate_segments(
         preserve_silence_audio_value = preserve_silence_audio
         generated_volume_percent_value = generated_volume_percent
         backing_volume_percent_value = backing_volume_percent
-        reuse_session_id_value = reuse_session_id
+        silence_volume_percent_value = silence_volume_percent
 
         content_type = request.headers.get("content-type", "")
         if (
@@ -7185,6 +10248,10 @@ async def api_translate_segments(
                 "backing_volume_percent",
                 backing_volume_percent_value,
             )
+            silence_volume_percent_value = payload.get(
+                "silence_volume_percent",
+                silence_volume_percent_value,
+            )
             reuse_session_id_value = payload.get("reuse_session_id", reuse_session_id_value)
 
         dest_language_value = (dest_language_value or "").strip()
@@ -7194,20 +10261,17 @@ async def api_translate_segments(
                 content={"status": "error", "message": "Destination language (dest_language) is required."},
             )
 
-        try:
-            response_format_value = _normalize_response_format(response_format_value)
-        except ValueError as exc:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": str(exc)},
-            )
-
+        response_format_value = TRANSLATE_DEFAULT_OUTPUT_FORMAT
         bitrate_value = bitrate_value or TRANSLATE_DEFAULT_BITRATE
         translate_enabled = _coerce_to_bool(translate_flag_value if translate_flag_value is not None else True)
         ignore_non_speech_flag = _coerce_to_bool(ignore_non_speech_value)
         preserve_silence_audio_flag = _coerce_to_bool(preserve_silence_audio_value)
         apply_enhancement = _coerce_to_bool(enhance_voice_value)
         apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
+        if apply_super_resolution and not apply_enhancement:
+            apply_enhancement = True
+        if apply_super_resolution and not apply_enhancement:
+            apply_enhancement = True
         custom_backing_present = bool(custom_backing_audio_file) or bool((custom_backing_audio_value or "").strip())
         merge_backing_requested_raw = _coerce_to_bool(merge_backing_track_value)
         min_speech_duration = _coerce_positive_int(
@@ -7228,6 +10292,10 @@ async def api_translate_segments(
             backing_volume_percent_value,
             DEFAULT_GENERATED_VOLUME_PERCENT,
         )
+        silence_volume_percent_value = _coerce_volume_percent(
+            silence_volume_percent_value,
+            DEFAULT_SILENCE_VOLUME_PERCENT,
+        )
         reuse_source_session: Optional[TranslateSessionData] = None
         reuse_session_id_value = (reuse_session_id_value or "").strip()
         if reuse_session_id_value:
@@ -7240,12 +10308,14 @@ async def api_translate_segments(
                         "message": "Reuse session not found or expired. Please re-upload the audio.",
                     },
                 )
-        reuse_backing_available = bool(reuse_source_session and reuse_source_session.backing_track_audio)
+        reuse_backing_available = bool(reuse_source_session and _session_has_backing_audio(reuse_source_session))
         requested_merge_backing = _coerce_merge_backing_flag(
             merge_backing_requested_raw,
             apply_enhancement,
             custom_backing_present or reuse_backing_available,
         )
+        if reuse_source_session is not None and reuse_source_session.chunk_parent_id:
+            requested_merge_backing = False
         resolved_gemini_model = _normalize_gemini_model_name(gemini_model_value)
         gemini_api_key_value = (gemini_api_key_value or "").strip()
 
@@ -7264,6 +10334,20 @@ async def api_translate_segments(
             "backing_volume_percent": backing_volume_percent_value,
             "translate_enabled": translate_enabled,
         }
+        reuse_session_for_segments = reuse_source_session
+        print(
+            "[translate_segments] dest=%s reuse_session=%s chunk_index=%s upload=%s format=%s backing=%s merge_backing=%s"
+            % (
+                dest_language_value,
+                bool(reuse_session_for_segments),
+                getattr(reuse_session_for_segments, "chunk_index", None),
+                bool(audio_file and not reuse_session_for_segments),
+                response_format_value,
+                custom_backing_present
+                or bool(reuse_session_for_segments and _session_has_backing_audio(reuse_session_for_segments)),
+                requested_merge_backing,
+            )
+        )
 
         async def translate_stream():
             queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
@@ -7291,6 +10375,13 @@ async def api_translate_segments(
                 heartbeat = asyncio.create_task(heartbeat_task())
                 try:
                     await emit_status(stage="start", message="Segment request accepted.", summary=request_summary)
+                    print(
+                        "[translate_segments] pipeline start reuse_session=%s chunk_id=%s"
+                        % (
+                            reuse_session_for_segments.session_id if reuse_session_for_segments else None,
+                            getattr(reuse_session_for_segments, "chunk_index", None),
+                        )
+                    )
 
                     (
                         original_audio,
@@ -7301,7 +10392,7 @@ async def api_translate_segments(
                         merge_with_backing,
                         backing_track_source,
                     ) = await _prepare_audio_assets(
-                        reuse_source_session=reuse_source_session,
+                        reuse_source_session=reuse_session_for_segments,
                         audio_file=audio_file,
                         audio_reference=audio_reference,
                         audio_mime_type_value=audio_mime_type_value,
@@ -7337,6 +10428,7 @@ async def api_translate_segments(
                         preserve_silence_audio_flag=preserve_silence_audio_flag,
                         generated_volume_percent_value=generated_volume_percent_value,
                         backing_volume_percent_value=backing_volume_percent_value,
+                        silence_volume_percent_value=silence_volume_percent_value,
                         backing_track_audio=backing_track_audio,
                         backing_track_source=backing_track_source,
                         merge_with_backing=merge_with_backing,
@@ -7346,12 +10438,13 @@ async def api_translate_segments(
                         resolved_gemini_model=resolved_gemini_model,
                         gemini_api_key_value=gemini_api_key_value or None,
                         emit_status=emit_status,
+                        source_chunk_session=reuse_session_for_segments,
                     )
 
                     metadata = segment_result.metadata
                     if segment_result.gemini_raw_text is not None:
                         metadata["gemini_raw_text"] = segment_result.gemini_raw_text
-                    if reuse_source_session is not None:
+                    if reuse_session_for_segments is not None:
                         metadata["reuse_source_session_id"] = reuse_session_id_value
 
                     await emit(
@@ -7362,6 +10455,14 @@ async def api_translate_segments(
                         metadata=metadata,
                         gemini_raw_segments=segment_result.gemini_chunks,
                         separation=metadata.get("separation"),
+                    )
+                    print(
+                        "[translate_segments] complete session_id=%s chunk_id=%s segments=%s"
+                        % (
+                            segment_result.session.session_id,
+                            getattr(reuse_session_for_segments, "chunk_index", None),
+                            len(segment_result.ui_segments),
+                        )
                     )
 
                 except TranslateWorkflowHttpError as http_error:
@@ -7421,29 +10522,19 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
         if payload.merge_backing_track is not None:
             merge_preference = _coerce_to_bool(payload.merge_backing_track)
             session.merge_with_backing = merge_preference
-        merge_with_backing = merge_preference and (session.backing_track_audio is not None)
-        if merge_preference and session.backing_track_audio is None:
+        merge_with_backing = merge_preference and _session_has_backing_audio(session)
+        if merge_preference and not _session_has_backing_audio(session):
             print("⚠️ Merge-back preference is enabled but no backing track is stored for this session.")
 
-        allowed_formats = {"mp3", "wav", "flac", "aac", "opus", "ogg", "webm"}
-        response_format_value = (
-            payload.response_format or session.response_format or TRANSLATE_DEFAULT_OUTPUT_FORMAT
-        ).lower()
-        if response_format_value not in allowed_formats:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "status": "error",
-                    "message": f"Unsupported response_format '{response_format_value}'. Allowed: {', '.join(sorted(allowed_formats))}",
-                },
-            )
+        response_format_value = TRANSLATE_DEFAULT_OUTPUT_FORMAT
 
         bitrate_value = payload.bitrate or session.bitrate or TRANSLATE_DEFAULT_BITRATE
-        max_duration = len(session.original_audio)
+        max_duration = _session_audio_duration_ms(session)
         base_segment_map = {seg.get("index"): seg for seg in session.base_segments}
 
         volume_percent = session.generated_volume_percent or DEFAULT_GENERATED_VOLUME_PERCENT
         backing_volume_percent = session.backing_volume_percent or DEFAULT_GENERATED_VOLUME_PERCENT
+        silence_volume_percent = session.silence_volume_percent or DEFAULT_SILENCE_VOLUME_PERCENT
         if payload.generated_volume_percent is not None:
             volume_percent = _coerce_volume_percent(
                 payload.generated_volume_percent,
@@ -7456,6 +10547,16 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                 backing_volume_percent,
             )
             session.backing_volume_percent = backing_volume_percent
+        if payload.silence_volume_percent is not None:
+            silence_volume_percent = _coerce_volume_percent(
+                payload.silence_volume_percent,
+                silence_volume_percent,
+            )
+            session.silence_volume_percent = silence_volume_percent
+
+        chunk_source_session: Optional[TranslateSessionData] = None
+        if session.chunk_source_session_id:
+            chunk_source_session = await _get_translate_session(session.chunk_source_session_id)
 
         async def generate_stream():
             queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
@@ -7478,6 +10579,8 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                         await emit_status(stage="heartbeat", message="Still synthesizing segments...", session_id=session.session_id)
                 except asyncio.CancelledError:
                     pass
+
+            chunk_session_for_generation = chunk_source_session
 
             async def run_pipeline():
                 heartbeat = asyncio.create_task(heartbeat_task())
@@ -7593,18 +10696,19 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                     )
 
                     audio_payload, media_type, metadata = await _synthesize_translated_audio(
-                        session.original_audio,
+                        _get_session_original_audio(session),
                         final_segments,
                         session.dest_language,
                         response_format=response_format_value,
                         bitrate=bitrate_value,
                         input_mime_type=session.input_mime_type,
                         clearvoice_settings=session.clearvoice_settings,
-                        backing_track_audio=session.backing_track_audio,
+                        backing_track_audio=_get_session_backing_audio(session),
                         backing_track_source=session.backing_track_source,
                         merge_with_backing=merge_with_backing,
                         preserve_silence_audio=session.preserve_silence_audio,
                         generated_volume_percent=volume_percent,
+                        silence_volume_percent=session.silence_volume_percent,
                         speaker_overrides=session.speaker_overrides,
                         backing_volume_percent=backing_volume_percent,
                     )
@@ -7658,15 +10762,55 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                             f"super_resolution={str(clearvoice_settings.get('super_resolution', False)).lower()}"
                         )
                     headers["X-Translation-Backing"] = (
-                        f"available={str(bool(session.backing_track_audio)).lower()};merged={str(merge_with_backing).lower()}"
+                        f"available={str(_session_has_backing_audio(session)).lower()};merged={str(merge_with_backing).lower()}"
                     )
 
                     output_filename = f"translate_{uuid.uuid4().hex}.{response_format_value}"
                     output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
                     with open(output_path, "wb") as outfile:
                         outfile.write(audio_payload)
-
                     audio_url = f"/api/translate_outputs/{output_filename}"
+
+                    if chunk_session_for_generation and chunk_session_for_generation.chunk_parent_id:
+                        _mark_chunk_generated(
+                            chunk_session_for_generation,
+                            output_path,
+                            output_filename,
+                            response_format_value,
+                        )
+                        chunk_meta = metadata.get("chunk") or {}
+                        chunk_meta.update(
+                            {
+                                "session_id": chunk_session_for_generation.session_id,
+                                "chunk_index": chunk_session_for_generation.chunk_index,
+                                "start_ms": chunk_session_for_generation.chunk_start_ms,
+                                "end_ms": chunk_session_for_generation.chunk_end_ms,
+                                "start_label": _format_ms_to_timestamp(chunk_session_for_generation.chunk_start_ms or 0),
+                                "end_label": _format_ms_to_timestamp(chunk_session_for_generation.chunk_end_ms or 0),
+                                "duration_label": _format_ms_to_timestamp(
+                                    max(
+                                        0,
+                                        (chunk_session_for_generation.chunk_end_ms or 0)
+                                        - (chunk_session_for_generation.chunk_start_ms or 0),
+                                    )
+                                ),
+                                "batch_id": chunk_session_for_generation.chunk_parent_id,
+                                "cut_reason": chunk_session_for_generation.chunk_cut_reason,
+                                "silence_midpoint_ms": chunk_session_for_generation.chunk_silence_midpoint_ms,
+                                "backing_available": bool(chunk_session_for_generation.backing_track_audio),
+                                "backing_source": chunk_session_for_generation.backing_track_source or "none",
+                                "vocals_url": f"/api/translate_vocals/{chunk_session_for_generation.session_id}",
+                                "backing_url": (
+                                    f"/api/translate_backing_track/{chunk_session_for_generation.session_id}"
+                                    if chunk_session_for_generation.backing_track_audio is not None
+                                    else None
+                                ),
+                                "audio_url": audio_url,
+                                "output_format": response_format_value,
+                                "output_filename": output_filename,
+                            }
+                        )
+                        metadata["chunk"] = chunk_meta
 
                     await emit(
                         "complete",
@@ -7740,7 +10884,7 @@ async def api_translate_segment_preview(payload: SegmentPreviewRequest):
                 content={"status": "error", "message": "Only speech segments can be previewed."},
             )
 
-        max_duration = len(session.original_audio)
+        max_duration = _session_audio_duration_ms(session)
         start_ms = max(0, int(seg_input.start_ms))
         end_ms = max(0, int(seg_input.end_ms))
         if end_ms > max_duration:
@@ -7814,7 +10958,7 @@ async def api_translate_segment_preview(payload: SegmentPreviewRequest):
             backing_volume = _coerce_volume_percent(payload.backing_volume_percent, backing_volume)
 
         audio_bytes, media_type, metadata = await _synthesize_translated_audio(
-            session.original_audio,
+            _get_session_original_audio(session),
             [segment_payload],
             session.dest_language,
             response_format=session.response_format or TRANSLATE_DEFAULT_OUTPUT_FORMAT,
@@ -7825,6 +10969,7 @@ async def api_translate_segment_preview(payload: SegmentPreviewRequest):
             merge_with_backing=False,
             preserve_silence_audio=session.preserve_silence_audio,
             generated_volume_percent=volume_percent,
+             silence_volume_percent=session.silence_volume_percent,
             speaker_overrides=override_payload,
             backing_volume_percent=backing_volume,
             pad_to_original=False,
@@ -7863,7 +11008,8 @@ async def api_translate_backing_track(session_id: str):
             status_code=404,
             content={"status": "error", "message": "Translate session not found or expired."},
         )
-    if session.backing_track_audio is None:
+    backing_audio = _get_session_backing_audio(session)
+    if backing_audio is None:
         return JSONResponse(
             status_code=404,
             content={"status": "error", "message": "No backing track is available for this session."},
@@ -7871,7 +11017,7 @@ async def api_translate_backing_track(session_id: str):
 
     try:
         buffer = BytesIO()
-        session.backing_track_audio.export(buffer, format="mp3", bitrate="128k")
+        backing_audio.export(buffer, format="mp3", bitrate="128k")
         audio_bytes = buffer.getvalue()
     except Exception as exc:
         return JSONResponse(
@@ -7895,7 +11041,9 @@ async def api_translate_vocals(session_id: str):
             status_code=404,
             content={"status": "error", "message": "Translate session not found or expired."},
         )
-    if session.original_audio is None:
+    try:
+        original_audio = _get_session_original_audio(session)
+    except RuntimeError:
         return JSONResponse(
             status_code=404,
             content={"status": "error", "message": "No separated vocals are available for this session."},
@@ -7903,7 +11051,7 @@ async def api_translate_vocals(session_id: str):
 
     try:
         buffer = BytesIO()
-        session.original_audio.export(buffer, format="mp3", bitrate="128k")
+        original_audio.export(buffer, format="mp3", bitrate="128k")
         audio_bytes = buffer.getvalue()
     except Exception as exc:
         return JSONResponse(
@@ -7967,10 +11115,12 @@ async def api_translate_audio(
     preserve_silence_audio: Optional[bool] = Form(False),
     generated_volume_percent: Optional[float] = Form(None),
     backing_volume_percent: Optional[float] = Form(None),
+    reuse_session_id: Optional[str] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
     custom_backing_audio_file: Optional[UploadFile] = File(None),
 ):
     """API: Translate speech audio to a target language and return synthesized audio."""
+    reuse_session_id_value: Optional[str] = reuse_session_id
     try:
         payload: Optional[Dict[str, Any]] = None
         dest_language_value = dest_language
@@ -8063,6 +11213,25 @@ async def api_translate_audio(
                 if translate_req.backing_volume_percent is not None
                 else backing_volume_percent_value
             )
+            silence_volume_percent_value = (
+                translate_req.silence_volume_percent
+                if translate_req.silence_volume_percent is not None
+                else silence_volume_percent_value
+            )
+            reuse_session_id_value = translate_req.reuse_session_id or reuse_session_id_value
+
+        reuse_source_session: Optional[TranslateSessionData] = None
+        reuse_session_id_value = (reuse_session_id_value or "").strip()
+        if reuse_session_id_value:
+            reuse_source_session = await _get_translate_session(reuse_session_id_value)
+            if reuse_source_session is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "status": "error",
+                        "message": "Reuse session not found or expired. Please re-upload the audio.",
+                    },
+                )
 
         dest_language_value = (dest_language_value or "").strip()
         if not dest_language_value:
@@ -8071,14 +11240,7 @@ async def api_translate_audio(
                 content={"status": "error", "message": "Destination language (dest_language) is required."},
             )
 
-        try:
-            response_format_value = _normalize_response_format(response_format_value)
-        except ValueError as exc:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": str(exc)},
-            )
-
+        response_format_value = TRANSLATE_DEFAULT_OUTPUT_FORMAT
         bitrate_value = bitrate_value or TRANSLATE_DEFAULT_BITRATE
         ignore_non_speech_flag = _coerce_to_bool(ignore_non_speech_value)
         preserve_silence_audio_flag = _coerce_to_bool(preserve_silence_audio_value)
@@ -8086,11 +11248,14 @@ async def api_translate_audio(
         apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
         custom_backing_present = bool(custom_backing_audio_file) or bool((custom_backing_audio_value or "").strip())
         merge_backing_requested_raw = _coerce_to_bool(merge_backing_track_value)
+        reuse_backing_available = bool(reuse_source_session and _session_has_backing_audio(reuse_source_session))
         requested_merge_backing = _coerce_merge_backing_flag(
             merge_backing_requested_raw,
             apply_enhancement,
-            custom_backing_present,
+            custom_backing_present or reuse_backing_available,
         )
+        if reuse_source_session is not None and reuse_source_session.chunk_parent_id:
+            requested_merge_backing = False
         min_speech_duration = _coerce_positive_int(
             min_speech_duration_value,
             MIN_SPEECH_DURATION_MS,
@@ -8109,22 +11274,29 @@ async def api_translate_audio(
             backing_volume_percent_value,
             DEFAULT_GENERATED_VOLUME_PERCENT,
         )
+        silence_volume_percent_value = _coerce_volume_percent(
+            silence_volume_percent_value,
+            DEFAULT_SILENCE_VOLUME_PERCENT,
+        )
         resolved_gemini_model = _normalize_gemini_model_name(gemini_model_value)
         gemini_api_key_value = (gemini_api_key_value or "").strip()
 
-        audio_io = await load_audio_bytes_from_request(audio_file, audio_reference)
-        if audio_io is None:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "No audio provided for translation."},
-            )
 
-        audio_bytes = audio_io.read()
-        if not audio_bytes:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "Provided audio data is empty."},
-            )
+        audio_bytes: Optional[bytes] = None
+        if reuse_source_session is None:
+            audio_io = await load_audio_bytes_from_request(audio_file, audio_reference)
+            if audio_io is None:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": "No audio provided for translation."},
+                )
+
+            audio_bytes = audio_io.read()
+            if not audio_bytes:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": "Provided audio data is empty."},
+                )
 
         input_mime_type = audio_mime_type_value or (audio_file.content_type if audio_file else None) or "audio/wav"
 
@@ -8140,7 +11312,23 @@ async def api_translate_audio(
             "preserve_silence_audio": preserve_silence_audio_flag,
             "generated_volume_percent": generated_volume_percent_value,
             "backing_volume_percent": backing_volume_percent_value,
+            "silence_volume_percent": silence_volume_percent_value,
+            "reuse_session": bool(reuse_source_session),
         }
+        reuse_session_for_translate = reuse_source_session
+        print(
+            "[translate_audio] dest=%s reuse_session=%s chunk_index=%s upload=%s format=%s backing=%s merge_backing=%s"
+            % (
+                dest_language_value,
+                bool(reuse_session_for_translate),
+                getattr(reuse_session_for_translate, "chunk_index", None),
+                bool(audio_file and not reuse_session_for_translate),
+                response_format_value,
+                custom_backing_present
+                or bool(reuse_session_for_translate and _session_has_backing_audio(reuse_session_for_translate)),
+                requested_merge_backing,
+            )
+        )
 
         async def translate_stream():
             queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
@@ -8168,6 +11356,13 @@ async def api_translate_audio(
                 heartbeat = asyncio.create_task(heartbeat_task())
                 try:
                     await emit_status(stage="start", message="Translate request accepted.", summary=request_summary)
+                    print(
+                        "[translate_audio] pipeline start reuse_session=%s chunk_id=%s"
+                        % (
+                            reuse_session_for_translate.session_id if reuse_session_for_translate else None,
+                            getattr(reuse_session_for_translate, "chunk_index", None),
+                        )
+                    )
 
                     session: Optional[TranslateSessionData] = None
                     (
@@ -8179,9 +11374,9 @@ async def api_translate_audio(
                         merge_with_backing,
                         backing_track_source,
                     ) = await _prepare_audio_assets(
-                        reuse_source_session=None,
-                        audio_file=audio_file,
-                        audio_reference=audio_reference,
+                        reuse_source_session=reuse_session_for_translate,
+                        audio_file=None if reuse_session_for_translate else audio_file,
+                        audio_reference=None if reuse_session_for_translate else audio_reference,
                         preloaded_audio_bytes=audio_bytes,
                         audio_mime_type_value=input_mime_type,
                         apply_enhancement=apply_enhancement,
@@ -8217,6 +11412,7 @@ async def api_translate_audio(
                         preserve_silence_audio_flag=preserve_silence_audio_flag,
                         generated_volume_percent_value=generated_volume_percent_value,
                         backing_volume_percent_value=backing_volume_percent_value,
+                        silence_volume_percent_value=silence_volume_percent_value,
                         backing_track_audio=backing_track_audio,
                         backing_track_source=backing_track_source,
                         merge_with_backing=merge_with_backing,
@@ -8226,6 +11422,7 @@ async def api_translate_audio(
                         resolved_gemini_model=resolved_gemini_model,
                         gemini_api_key_value=gemini_api_key_value or None,
                         emit_status=emit_status,
+                        source_chunk_session=reuse_session_for_translate,
                     )
                     session = segment_result.session
                     segments = segment_result.segments
@@ -8251,6 +11448,7 @@ async def api_translate_audio(
                         merge_with_backing=merge_with_backing,
                         preserve_silence_audio=preserve_silence_audio_flag,
                         generated_volume_percent=generated_volume_percent_value,
+                        silence_volume_percent=silence_volume_percent_value,
                         backing_volume_percent=backing_volume_percent_value,
                     )
 
@@ -8260,6 +11458,7 @@ async def api_translate_audio(
                     metadata["preserve_silence_audio"] = preserve_silence_audio_flag
                     metadata["generated_volume_percent"] = generated_volume_percent_value
                     metadata["backing_volume_percent"] = backing_volume_percent_value
+                    metadata["silence_volume_percent"] = silence_volume_percent_value
                     metadata["gemini_raw_segments"] = segment_result.gemini_chunks
                     if segment_result.gemini_raw_text is not None:
                         metadata["gemini_raw_text"] = segment_result.gemini_raw_text
@@ -8308,8 +11507,48 @@ async def api_translate_audio(
                     output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
                     with open(output_path, "wb") as outfile:
                         outfile.write(audio_payload)
-
                     audio_url = f"/api/translate_outputs/{output_filename}"
+
+                    if reuse_session_for_translate and reuse_session_for_translate.chunk_parent_id:
+                        _mark_chunk_generated(
+                            reuse_session_for_translate,
+                            output_path,
+                            output_filename,
+                            response_format_value,
+                        )
+                        chunk_meta = metadata.get("chunk") or {}
+                        chunk_meta.update(
+                            {
+                                "session_id": reuse_session_for_translate.session_id,
+                                "chunk_index": reuse_session_for_translate.chunk_index,
+                                "start_ms": reuse_session_for_translate.chunk_start_ms,
+                                "end_ms": reuse_session_for_translate.chunk_end_ms,
+                                "start_label": _format_ms_to_timestamp(reuse_session_for_translate.chunk_start_ms or 0),
+                                "end_label": _format_ms_to_timestamp(reuse_session_for_translate.chunk_end_ms or 0),
+                                "duration_label": _format_ms_to_timestamp(
+                                    max(
+                                        0,
+                                        (reuse_session_for_translate.chunk_end_ms or 0)
+                                        - (reuse_session_for_translate.chunk_start_ms or 0),
+                                    )
+                                ),
+                                "batch_id": reuse_session_for_translate.chunk_parent_id,
+                                "cut_reason": reuse_session_for_translate.chunk_cut_reason,
+                                "silence_midpoint_ms": reuse_session_for_translate.chunk_silence_midpoint_ms,
+                                "backing_available": _session_has_backing_audio(reuse_session_for_translate),
+                                "backing_source": reuse_session_for_translate.backing_track_source or "none",
+                                "vocals_url": f"/api/translate_vocals/{reuse_session_for_translate.session_id}",
+                                "backing_url": (
+                                    f"/api/translate_backing_track/{reuse_session_for_translate.session_id}"
+                                    if _session_has_backing_audio(reuse_session_for_translate)
+                                    else None
+                                ),
+                                "audio_url": audio_url,
+                                "output_format": response_format_value,
+                                "output_filename": output_filename,
+                            }
+                        )
+                        metadata["chunk"] = chunk_meta
 
                     await emit(
                         "complete",
@@ -8319,6 +11558,16 @@ async def api_translate_audio(
                         headers=headers,
                         metadata=metadata,
                         file_name=output_filename,
+                    )
+                    print(
+                        "[translate_audio] complete audio_url=%s chunk_id=%s generated=%s"
+                        % (
+                            audio_url,
+                            getattr(reuse_session_for_translate, "session_id", None)
+                            if reuse_session_for_translate
+                            else (session.session_id if session else None),
+                            bool(reuse_session_for_translate and reuse_session_for_translate.chunk_parent_id),
+                        )
                     )
 
                 except TranslateWorkflowHttpError as http_error:
