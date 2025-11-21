@@ -153,6 +153,7 @@ DEFAULT_SILENCE_VOLUME_PERCENT = DEFAULT_GENERATED_VOLUME_PERCENT
 DEFAULT_EMOTION_WEIGHT = 0.6
 ALLOWED_GEMINI_MODELS = {"gemini-flash-latest", "gemini-2.5-pro"}
 GEMINI_AUDIO_EXPORT_BITRATE = "128k"
+GEMINI_CACHE_VERSION = 1
 SPEAKER_PREVIEW_DIR = Path("speaker_presets") / "previews"
 SPEAKER_PREVIEW_BITRATE = "128k"
 CHUNK_SPLIT_DEFAULT_MIN_MINUTES = 10.0
@@ -694,6 +695,9 @@ async def _build_translation_segments(
     gemini_api_key_value: Optional[str],
     emit_status: Optional[Callable[..., Awaitable[None]]] = None,
     source_chunk_session: Optional[TranslateSessionData] = None,
+    source_audio_filename: Optional[str] = None,
+    source_base_name: Optional[str] = None,
+    force_gemini_regenerate: bool = False,
 ) -> SegmentBuildResult:
     manual_chunk_data = None
     manual_speaker_profiles: List[Dict[str, Any]] = []
@@ -720,17 +724,24 @@ async def _build_translation_segments(
         )
 
     speaker_profiles: List[Dict[str, Any]] = []
+    gemini_cache_info: Dict[str, Any] = {}
     if manual_chunk_data is not None:
         gemini_chunks = manual_chunk_data
         speaker_profiles = manual_speaker_profiles or []
     else:
-        gemini_chunks, speaker_profiles, raw_gemini_response_text = await _gemini_transcribe_translate(
+        (
+            gemini_chunks,
+            speaker_profiles,
+            raw_gemini_response_text,
+            gemini_cache_info,
+        ) = await _gemini_transcribe_translate(
             processed_audio_bytes,
             gemini_mime_type,
             dest_language,
             final_prompt,
             model_name=resolved_gemini_model,
             api_key_override=gemini_api_key_value,
+            force_refresh=force_gemini_regenerate,
         )
     if raw_gemini_response_text is None and manual_raw_input:
         raw_gemini_response_text = manual_raw_input
@@ -785,6 +796,8 @@ async def _build_translation_segments(
         speaker_profiles=speaker_profiles,
         gemini_raw_text=raw_gemini_response_text,
         backing_track_source=backing_track_source,
+        source_audio_filename=source_audio_filename,
+        source_base_name=source_base_name,
     )
     if source_chunk_session and source_chunk_session.chunk_parent_id:
         session.chunk_parent_id = source_chunk_session.chunk_parent_id
@@ -835,7 +848,10 @@ async def _build_translation_segments(
             "max_merge_ms": max_merge_interval,
         },
         "manual_segments": manual_segments_used,
+        "force_gemini_regenerate": force_gemini_regenerate,
     }
+    if gemini_cache_info:
+        metadata["gemini_cache"] = gemini_cache_info
     chunk_reference = source_chunk_session if source_chunk_session else (session if session.chunk_parent_id else None)
     if chunk_reference:
         metadata["chunk"] = {
@@ -902,6 +918,8 @@ class TranslateSessionData:
     gemini_chunks: List[Dict[str, Any]]
     gemini_model: str
     gemini_api_key: Optional[str]
+    source_audio_filename: Optional[str] = None
+    source_base_name: Optional[str] = None
     original_audio_path: Optional[str] = None
     backing_track_audio: Optional[AudioSegment] = None
     backing_track_source: str = "none"
@@ -950,6 +968,70 @@ def _compute_file_md5(path: str) -> str:
         for chunk in iter(lambda: infile.read(8192), b""):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
+
+
+def _compute_bytes_md5(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+
+def _gemini_cache_key(
+    audio_bytes: bytes,
+    *,
+    dest_language: str,
+    prompt_text: str,
+    model_name: str,
+) -> Tuple[str, str]:
+    audio_hash = _compute_bytes_md5(audio_bytes)
+    normalized_prompt = (prompt_text or "").strip()
+    meta_blob = "|".join(
+        [
+            model_name.strip().lower(),
+            dest_language.strip().lower(),
+            normalized_prompt,
+        ]
+    )
+    meta_hash = hashlib.md5(meta_blob.encode("utf-8")).hexdigest()
+    cache_key = f"{audio_hash}_{meta_hash}"
+    return audio_hash, cache_key
+
+
+def _gemini_cache_path(cache_key: str) -> str:
+    safe_key = "".join(c for c in cache_key if c.isalnum() or c in {"_", "-"}).strip()
+    return os.path.join(GEMINI_CACHE_DIR, f"{safe_key}.json")
+
+
+def _load_gemini_cache_entry(cache_key: str) -> Optional[Dict[str, Any]]:
+    path = _gemini_cache_path(cache_key)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as infile:
+            data = json.load(infile)
+        if data.get("version") != GEMINI_CACHE_VERSION:
+            return None
+        return data
+    except Exception as exc:
+        print(f"⚠️ Failed to read Gemini cache '{path}': {exc}")
+        return None
+
+
+def _write_gemini_cache_entry(cache_key: str, record: Dict[str, Any]) -> Optional[str]:
+    os.makedirs(GEMINI_CACHE_DIR, exist_ok=True)
+    path = _gemini_cache_path(cache_key)
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix="gemini_cache_", suffix=".json", dir=GEMINI_CACHE_DIR)
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            json.dump(record, tmp_file, ensure_ascii=False)
+        os.replace(tmp_path, path)
+        return path
+    except Exception as exc:
+        print(f"⚠️ Failed to write Gemini cache '{path}': {exc}")
+        try:
+            if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+        return None
 
 
 def _persist_session_audio_segment(session_id: str, audio: AudioSegment, kind: str, fmt: str = "mp3") -> str:
@@ -1097,6 +1179,8 @@ TRANSLATE_SESSION_MEDIA_DIR = os.path.join("outputs", "translate_session_media")
 os.makedirs(TRANSLATE_SESSION_MEDIA_DIR, exist_ok=True)
 CLEARVOICE_CACHE_DIR = os.path.join("outputs", "clearvoice_cache")
 os.makedirs(CLEARVOICE_CACHE_DIR, exist_ok=True)
+GEMINI_CACHE_DIR = os.path.join("outputs", "gemini_cache")
+os.makedirs(GEMINI_CACHE_DIR, exist_ok=True)
 
 
 def _guess_media_type_from_extension(filename: str) -> str:
@@ -1785,6 +1869,112 @@ async def _normalize_uploaded_audio(source_path: str) -> str:
     return normalized_path
 
 
+INVALID_FILENAME_CHARS = set('<>:"/\\|?*')
+LANGUAGE_CODE_OVERRIDES = {
+    "chinese": "chn",
+    "zh": "chn",
+    "zh-cn": "chn",
+    "zh_cn": "chn",
+    "zh-tw": "cnt",
+    "english": "en",
+    "en": "en",
+    "spanish": "es",
+    "es": "es",
+    "japanese": "jp",
+    "ja": "jp",
+    "korean": "kr",
+    "ko": "kr",
+    "german": "de",
+    "de": "de",
+    "french": "fr",
+    "fr": "fr",
+}
+DEFAULT_BASE_FILENAME = "translated_audio"
+
+
+def _sanitize_base_filename(raw_name: Optional[str]) -> Optional[str]:
+    if not raw_name:
+        return None
+    base_name = os.path.splitext(os.path.basename(str(raw_name)))[0].strip().strip(".")
+    if not base_name:
+        return None
+    sanitized_chars: List[str] = []
+    for ch in base_name:
+        if ch in INVALID_FILENAME_CHARS or ord(ch) < 32:
+            sanitized_chars.append("_")
+        else:
+            sanitized_chars.append(ch)
+    sanitized = "".join(sanitized_chars).strip()
+    sanitized = re.sub(r"\s+", " ", sanitized)
+    sanitized = re.sub(r"_+", "_", sanitized)
+    sanitized = sanitized.strip(" _")
+    return sanitized or None
+
+
+def _normalize_base_filename(
+    candidate: Optional[str],
+    *,
+    fallback: Optional[str] = None,
+) -> str:
+    sanitized = _sanitize_base_filename(candidate)
+    if sanitized:
+        return sanitized
+    fallback_sanitized = _sanitize_base_filename(fallback)
+    if fallback_sanitized:
+        return fallback_sanitized
+    return f"{DEFAULT_BASE_FILENAME}_{uuid.uuid4().hex[:6]}"
+
+
+def _language_code_from_label(label: Optional[str]) -> str:
+    if not label:
+        return "translated"
+    normalized = label.strip().lower()
+    if not normalized:
+        return "translated"
+    override = LANGUAGE_CODE_OVERRIDES.get(normalized)
+    if override:
+        return override
+    compact = re.sub(r"[^a-z0-9]+", "", normalized)
+    if not compact:
+        return "translated"
+    if len(compact) <= 3:
+        return compact
+    return compact[:3]
+
+
+def _compose_output_stem(
+    base_name: str,
+    *,
+    chunk_index: Optional[int] = None,
+    extra: Optional[str] = None,
+) -> str:
+    parts: List[str] = [base_name]
+    if chunk_index is not None:
+        parts.append(f"chunk{int(chunk_index):02d}")
+    if extra:
+        parts.append(extra)
+    return "_".join(part for part in parts if part)
+
+
+def _determine_output_base_name(
+    *,
+    user_base: Optional[str],
+    upload_filename: Optional[str],
+    reuse_session: Optional[TranslateSessionData],
+) -> str:
+    if user_base:
+        normalized = _sanitize_base_filename(user_base)
+        if normalized:
+            return normalized
+    if upload_filename:
+        normalized = _sanitize_base_filename(upload_filename)
+        if normalized:
+            return normalized
+    if reuse_session and reuse_session.source_base_name:
+        return reuse_session.source_base_name
+    return _normalize_base_filename(None)
+
+
 async def _ensure_clearvoice_input_path(source_path: str) -> Tuple[str, bool]:
     """
     Ensure the ClearVoice input is a WAV file on disk.
@@ -1860,6 +2050,7 @@ async def _generate_chunk_audio_from_session(
     backing_volume_percent: float,
     merge_backing_track: bool,
     silence_volume_percent: float,
+    force_gemini_regenerate: bool = False,
 ) -> Tuple[str, str, Dict[str, Any]]:
     clearvoice_settings = chunk_session.clearvoice_settings or {}
     apply_enhancement = bool(clearvoice_settings.get("enhancement"))
@@ -1867,6 +2058,10 @@ async def _generate_chunk_audio_from_session(
     if apply_super_resolution and not apply_enhancement:
         apply_enhancement = True
         clearvoice_settings["enhancement"] = True
+    resolved_base_name = _normalize_base_filename(
+        chunk_session.source_base_name,
+        fallback=chunk_session.source_audio_filename,
+    )
 
     (
         original_audio,
@@ -1925,6 +2120,9 @@ async def _generate_chunk_audio_from_session(
         gemini_api_key_value=(gemini_api_key or "").strip() or None,
         emit_status=None,
         source_chunk_session=chunk_session,
+        source_audio_filename=chunk_session.source_audio_filename,
+        source_base_name=chunk_session.source_base_name,
+        force_gemini_regenerate=force_gemini_regenerate,
     )
 
     audio_payload, _media_type, synthesis_metadata = await _synthesize_translated_audio(
@@ -1953,12 +2151,39 @@ async def _generate_chunk_audio_from_session(
     metadata["backing_volume_percent"] = backing_volume_percent
     metadata["silence_volume_percent"] = silence_volume_percent
     metadata["gemini_model"] = gemini_model
+    metadata["output_base_name"] = resolved_base_name
 
-    output_filename = f"translate_chunk_{chunk_session.session_id}_{uuid.uuid4().hex}.{response_format}"
+    language_code = _language_code_from_label(dest_language)
+    base_stem = _compose_output_stem(resolved_base_name, chunk_index=chunk_session.chunk_index)
+    audio_stem = _compose_output_stem(
+        resolved_base_name,
+        chunk_index=chunk_session.chunk_index,
+        extra=language_code,
+    )
+    output_filename = f"{audio_stem}.{response_format}"
     output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
     with open(output_path, "wb") as outfile:
         outfile.write(audio_payload)
     audio_url = f"/api/translate_outputs/{output_filename}"
+
+    subtitle_translated = _export_srt_from_segments(
+        segment_result.segments,
+        base_name=base_stem,
+        suffix=language_code,
+        text_kind="translated",
+        empty_note="No speech segments were available for subtitle export.",
+    )
+    subtitle_original = _export_srt_from_segments(
+        segment_result.segments,
+        base_name=base_stem,
+        suffix="original",
+        text_kind="source",
+        empty_note="No speech segments were available for subtitle export.",
+    )
+    metadata["subtitle"] = subtitle_translated
+    metadata["subtitle_translated"] = subtitle_translated
+    metadata["subtitle_original"] = subtitle_original
+    metadata["language_code"] = language_code
 
     _mark_chunk_generated(chunk_session, output_path, output_filename, response_format)
     metadata["chunk"] = _serialize_chunk_session(chunk_session)
@@ -2475,7 +2700,10 @@ def _format_ms_to_srt_timestamp(milliseconds: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
 
 
-def _build_srt_entries_from_segments(segments: Optional[List[Dict[str, Any]]]) -> List[Tuple[int, int, str]]:
+def _build_srt_entries_from_segments(
+    segments: Optional[List[Dict[str, Any]]],
+    text_kind: Literal["translated", "source"] = "translated",
+) -> List[Tuple[int, int, str]]:
     entries: List[Tuple[int, int, str]] = []
     if not segments:
         return entries
@@ -2495,7 +2723,10 @@ def _build_srt_entries_from_segments(segments: Optional[List[Dict[str, Any]]]) -
             duration_ms = _coerce_segment_ms(segment.get("duration_ms")) or 0
             end_ms = start_ms + (duration_ms if duration_ms > 0 else 1000)
         end_ms = max(end_ms, start_ms + 1)
-        text_value = (segment.get("translated_text") or segment.get("source_text") or "").strip()
+        if text_kind == "source":
+            text_value = (segment.get("source_text") or "").strip()
+        else:
+            text_value = (segment.get("translated_text") or segment.get("source_text") or "").strip()
         if not text_value:
             continue
         sanitized_text = text_value.replace("\r\n", "\n").replace("\r", "\n")
@@ -2542,16 +2773,19 @@ def _offset_segments_for_merge(
 
 def _export_srt_from_segments(
     segments: Optional[List[Dict[str, Any]]],
-    audio_filename: str,
     *,
+    base_name: str,
+    suffix: Optional[str] = None,
+    text_kind: Literal["translated", "source"] = "translated",
     empty_note: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     try:
-        srt_entries = _build_srt_entries_from_segments(segments)
-        base_name, _ = os.path.splitext(audio_filename)
-        if not base_name:
-            base_name = os.path.basename(audio_filename) or "subtitle"
-        srt_filename = f"{base_name}.srt"
+        srt_entries = _build_srt_entries_from_segments(segments, text_kind=text_kind)
+        safe_base = _sanitize_base_filename(base_name) or DEFAULT_BASE_FILENAME
+        srt_stem = safe_base
+        if suffix:
+            srt_stem = f"{safe_base}_{suffix}"
+        srt_filename = f"{srt_stem}.srt"
         srt_path = os.path.join(TRANSLATE_OUTPUT_DIR, srt_filename)
         os.makedirs(TRANSLATE_OUTPUT_DIR, exist_ok=True)
         lines: List[str] = []
@@ -3060,8 +3294,14 @@ async def _create_translate_session(
     chunk_silence_midpoint_ms: Optional[int] = None,
     persist_media: bool = False,
     media_format: str = "wav",
+    source_audio_filename: Optional[str] = None,
+    source_base_name: Optional[str] = None,
 ) -> TranslateSessionData:
     session_id = uuid.uuid4().hex
+    resolved_base_name = _normalize_base_filename(
+        source_base_name,
+        fallback=source_audio_filename,
+    )
     session = TranslateSessionData(
         session_id=session_id,
         original_audio=original_audio,
@@ -3087,6 +3327,8 @@ async def _create_translate_session(
         speaker_profiles=copy.deepcopy(speaker_profiles or []),
         speaker_overrides=copy.deepcopy(speaker_overrides or {}),
         gemini_raw_text=gemini_raw_text,
+        source_audio_filename=source_audio_filename,
+        source_base_name=resolved_base_name,
         chunk_parent_id=chunk_parent_id,
         chunk_index=chunk_index,
         chunk_start_ms=chunk_start_ms,
@@ -3782,7 +4024,8 @@ async def _gemini_transcribe_translate(
     *,
     model_name: Optional[str] = None,
     api_key_override: Optional[str] = None,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+    force_refresh: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str, Dict[str, Any]]:
     if genai is None:
         raise RuntimeError(
             "The google-genai package is required for translation. Install it with `pip install google-genai`."
@@ -3803,6 +4046,33 @@ async def _gemini_transcribe_translate(
         )
 
     client = _get_gemini_client(api_key)
+    audio_hash, cache_key = _gemini_cache_key(
+        audio_bytes,
+        dest_language=dest_language,
+        prompt_text=prompt,
+        model_name=model_name,
+    )
+    cache_info: Dict[str, Any] = {
+        "audio_md5": audio_hash,
+        "hit": False,
+        "force_refresh": False,
+    }
+    if force_refresh:
+        cache_info["force_refresh"] = True
+    else:
+        cached = _load_gemini_cache_entry(cache_key)
+        cached_segments = cached.get("segments") if cached else None
+        if cached and isinstance(cached_segments, list):
+            cache_info["hit"] = True
+            cache_info["cache_file"] = os.path.basename(_gemini_cache_path(cache_key))
+            cache_info["created_at"] = cached.get("created_at")
+            print(f"♻️ Gemini cache hit for audio md5={audio_hash} (model={model_name}).")
+            return (
+                cached_segments,
+                cached.get("speaker_profiles") or [],
+                cached.get("raw_text"),
+                cache_info,
+            )
 
     user_content = types.Content(
         role="user",
@@ -3854,7 +4124,23 @@ async def _gemini_transcribe_translate(
         raise RuntimeError(f"Gemini request failed after {max_attempts} attempts: {last_error}")
 
     segments, speaker_profiles = _parse_gemini_json(raw_text)
-    return segments, speaker_profiles, raw_text
+    cache_record = {
+        "version": GEMINI_CACHE_VERSION,
+        "created_at": time.time(),
+        "audio_md5": audio_hash,
+        "dest_language": dest_language,
+        "model": model_name,
+        "prompt_hash": hashlib.md5(prompt.encode("utf-8")).hexdigest(),
+        "segments": segments,
+        "speaker_profiles": speaker_profiles,
+        "raw_text": raw_text,
+    }
+    cache_path = _write_gemini_cache_entry(cache_key, cache_record)
+    if cache_path:
+        cache_info["cache_file"] = os.path.basename(cache_path)
+        cache_info["stored"] = True
+        print(f"💾 Gemini cache stored for audio md5={audio_hash} (model={model_name}).")
+    return segments, speaker_profiles, raw_text, cache_info
 
 # Global TTS manager
 class TTSManager:
@@ -4167,6 +4453,10 @@ class TranslateRequest(BaseModel):
     audio: Optional[str] = Field(default=None, description="Base64-encoded audio or download URL.")
     dest_language: str = Field(..., description="Target language for translation, e.g., 'English'.")
     audio_mime_type: Optional[str] = Field(default=None, description="MIME type of the audio, e.g., 'audio/wav'.")
+    base_filename: Optional[str] = Field(
+        default=None,
+        description="Optional override for the base output filename (no extension).",
+    )
     prompt: Optional[str] = Field(default=None, description="Optional custom prompt for Gemini.")
     custom_backing_audio: Optional[str] = Field(
         default=None,
@@ -4214,6 +4504,10 @@ class TranslateRequest(BaseModel):
     gemini_api_key: Optional[str] = Field(
         default=None,
         description="Provide a Gemini API key for this request if environment key is not set.",
+    )
+    force_gemini_regenerate: Optional[bool] = Field(
+        default=False,
+        description="When true, bypass the Gemini cache and force a fresh analysis.",
     )
     ignore_non_speech: Optional[bool] = Field(
         default=False,
@@ -4417,6 +4711,10 @@ class ChunkBatchGenerateRequest(BaseModel):
         ge=MIN_GENERATED_VOLUME_PERCENT,
         le=MAX_GENERATED_VOLUME_PERCENT,
         description="Override preserved-silence loudness before merging (percentage, default 100%).",
+    )
+    force_gemini_regenerate: Optional[bool] = Field(
+        default=False,
+        description="Force Gemini to reprocess audio even if cache entries exist.",
     )
 
 
@@ -5530,6 +5828,13 @@ async def home():
                                                 Supported formats: WAV, MP3, M4A, FLAC, AAC, OGG, OPUS. Audio is processed locally then sent to Gemini for transcription.
                                             </small>
                                         </div>
+                                        <div class="form-group">
+                                            <label for="translateBaseFilename">Base Output Filename:</label>
+                                            <input type="text" id="translateBaseFilename" placeholder="Auto-filled from upload (no extension)">
+                                            <small style="color: #666; display: block; margin-top: 6px;">
+                                                Used for translated audio/SubRip filenames and FFmpeg helper commands. Leave blank to auto-fill when you upload.
+                                            </small>
+                                        </div>
                                         <div class="form-group" id="translateClearVoiceBlock">
                                             <label>ClearVoice Separation & Chunking:</label>
                                             <div style="display: flex; gap: 16px; flex-wrap: wrap;">
@@ -5638,6 +5943,15 @@ async def home():
                                             <input type="password" id="translateGeminiApiKey" name="gemini_api_key" placeholder="Use this key instead of the system default..." autocomplete="off">
                                             <small style="color: #666; display: block; margin-top: 6px;">
                                                 Provide a key if the server environment does not have one configured or you need to override it for this request.
+                                            </small>
+                                        </div>
+                                        <div class="form-group">
+                                            <label style="display: flex; align-items: center; gap: 10px;">
+                                                <input type="checkbox" id="translateForceGeminiRefresh">
+                                                <span>Force Gemini re-analysis (ignore cache)</span>
+                                            </label>
+                                            <small style="color: #666; margin-top: 6px; display: block;">
+                                                When enabled we will bypass the audio MD5 cache and ask Gemini to reprocess the uploaded audio even if a prior response exists.
                                             </small>
                                         </div>
                                         <div class="form-group">
@@ -5809,6 +6123,28 @@ async def home():
                             <div id="translateSegmentsList" class="segment-list"></div>
                         </div>
                         <div id="translateResult"></div>
+                        <div id="translateFfmpegPanel" style="display: none; margin-top: 20px; padding: 16px; border-radius: 12px; border: 1px solid rgba(99,112,255,0.3); background: rgba(99,112,255,0.05);">
+                            <h4 style="margin-top: 0;">🎬 FFmpeg Helper Commands</h4>
+                            <p style="color: #666; margin-bottom: 12px;">
+                                Commands auto-update when you change the base filename or destination language.
+                            </p>
+                            <div style="margin-bottom: 12px;">
+                                <label style="font-weight: 500;">Extract audio from original video:</label>
+                                <pre id="ffmpegExtractCmd" style="white-space: pre-wrap; word-break: break-all; background: #111; color: #0f0; padding: 10px; border-radius: 8px; margin: 6px 0 0 0;"></pre>
+                            </div>
+                            <div style="margin-bottom: 12px;">
+                                <label style="font-weight: 500;">Replace video audio with translated track:</label>
+                                <pre id="ffmpegReplaceCmd" style="white-space: pre-wrap; word-break: break-all; background: #111; color: #0f0; padding: 10px; border-radius: 8px; margin: 6px 0 0 0;"></pre>
+                            </div>
+                            <div>
+                                <label style="font-weight: 500;">Burn subtitles into video:</label>
+                                <pre id="ffmpegSubtitleCmd" style="white-space: pre-wrap; word-break: break-all; background: #111; color: #0f0; padding: 10px; border-radius: 8px; margin: 6px 0 0 0;"></pre>
+                            </div>
+                            <div style="margin-top: 12px;">
+                                <label style="font-weight: 500;">Burn original subtitles into video:</label>
+                                <pre id="ffmpegSubtitleOriginalCmd" style="white-space: pre-wrap; word-break: break-all; background: #111; color: #0f0; padding: 10px; border-radius: 8px; margin: 6px 0 0 0;"></pre>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -6448,6 +6784,7 @@ async def home():
             const translateCustomPrompt = document.getElementById('translateCustomPrompt');
             const translateGeminiModel = document.getElementById('translateGeminiModel');
             const translateGeminiApiKey = document.getElementById('translateGeminiApiKey');
+            const translateForceGeminiRefresh = document.getElementById('translateForceGeminiRefresh');
             const translateDestLanguageSelect = document.getElementById('translateDestLanguage');
             const translateEnhanceEl = document.getElementById('translateEnhancement');
             const translateSuperEl = document.getElementById('translateSuperResolution');
@@ -6496,6 +6833,12 @@ async def home():
             const translateGenerateChunksBtn = document.getElementById('translateGenerateChunksBtn');
             const translateChunkBatchStatus = document.getElementById('translateChunkBatchStatus');
             const translateAudioInput = document.getElementById('translateAudioFile');
+            const translateBaseFilenameInput = document.getElementById('translateBaseFilename');
+            const ffmpegPanel = document.getElementById('translateFfmpegPanel');
+            const ffmpegExtractCmd = document.getElementById('ffmpegExtractCmd');
+            const ffmpegReplaceCmd = document.getElementById('ffmpegReplaceCmd');
+            const ffmpegSubtitleCmd = document.getElementById('ffmpegSubtitleCmd');
+            const ffmpegSubtitleOriginalCmd = document.getElementById('ffmpegSubtitleOriginalCmd');
             let currentTranslateSessionId = null;
             let currentTranslateSegments = [];
             let translateSpeakerProfiles = [];
@@ -6517,6 +6860,31 @@ async def home():
             let translateSelectedChunkId = null;
             let translateChunkSelections = new Set();
             let currentChunkSessionId = null;
+            let translateLanguageCodeHint = null;
+
+            if (translateBaseFilenameInput) {
+                translateBaseFilenameInput.addEventListener('input', () => {
+                    translateBaseFilenameInput.dataset.userEdited = 'true';
+                    updateFfmpegCommands();
+                });
+            }
+            if (translateAudioInput) {
+                translateAudioInput.addEventListener('change', () => {
+                    if (
+                        translateBaseFilenameInput &&
+                        translateAudioInput.files &&
+                        translateAudioInput.files[0]
+                    ) {
+                        const autoBase = deriveBaseFromFilename(translateAudioInput.files[0].name);
+                        if (autoBase) {
+                            translateBaseFilenameInput.value = autoBase;
+                            translateBaseFilenameInput.dataset.userEdited = 'false';
+                        }
+                    }
+                    updateFfmpegCommands();
+                });
+            }
+            updateFfmpegCommands();
 
             translateStepToggles.forEach((toggle) => {
                 const step = toggle.closest('.translate-step');
@@ -6760,6 +7128,17 @@ async def home():
                 if (!metadata || !metadata.chunk || !metadata.chunk.session_id) {
                     return;
                 }
+                if (metadata.output_base_name && translateBaseFilenameInput) {
+                    translateBaseFilenameInput.value = metadata.output_base_name;
+                    translateBaseFilenameInput.dataset.userEdited = 'false';
+                }
+                if (metadata.language_code) {
+                    translateLanguageCodeHint = metadata.language_code;
+                }
+                updateFfmpegCommands({
+                    baseName: metadata.output_base_name,
+                    languageCode: metadata.language_code,
+                });
                 const { autoSelect = true } = options;
                 const chunkSessionId = metadata.chunk.session_id;
                 if (autoSelect) {
@@ -6881,6 +7260,7 @@ async def home():
                 payload.merge_backing_track = translateMergeBackEl && translateMergeBackEl.checked ? true : false;
                 payload.ignore_non_speech = translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? true : false;
                 payload.preserve_silence_audio = translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? true : false;
+                payload.force_gemini_regenerate = !!(translateForceGeminiRefresh && translateForceGeminiRefresh.checked);
                 if (translateVolumeInput && translateVolumeInput.value) {
                     const volumeValue = parseFloat(translateVolumeInput.value);
                     if (!Number.isNaN(volumeValue)) {
@@ -7049,6 +7429,17 @@ async def home():
                 if (!audioUrl) {
                     return;
                 }
+                if (data.base_output_name && translateBaseFilenameInput) {
+                    translateBaseFilenameInput.value = data.base_output_name;
+                    translateBaseFilenameInput.dataset.userEdited = 'false';
+                }
+                if (data.language_code) {
+                    translateLanguageCodeHint = data.language_code;
+                }
+                updateFfmpegCommands({
+                    baseName: data.base_output_name,
+                    languageCode: data.language_code,
+                });
                 const mediaType = getMediaTypeForFormat(format);
                 const downloadName = data.file_name || `merged_chunks.${format}`;
                 const subtitleUrl = data.subtitle_url || (data.subtitle && data.subtitle.url) || null;
@@ -7056,9 +7447,20 @@ async def home():
                     data.subtitle_file_name ||
                     (data.subtitle && data.subtitle.filename) ||
                     downloadName.replace(/\\.[^.]+$/, '.srt');
+                const originalSubtitleUrl =
+                    data.original_subtitle_url ||
+                    (data.subtitle_original && data.subtitle_original.url) ||
+                    null;
+                const originalSubtitleFileName =
+                    data.original_subtitle_file_name ||
+                    (data.subtitle_original && data.subtitle_original.filename) ||
+                    downloadName.replace(/\\.[^.]+$/, '_original.srt');
                 let downloadButtons = `<a class="btn" href="${audioUrl}" download="${downloadName}">💾 Download Merged Audio</a>`;
                 if (subtitleUrl) {
-                    downloadButtons += ` <a class="btn btn-secondary" href="${subtitleUrl}" download="${subtitleFileName}">📝 Subtitles (.srt)</a>`;
+                    downloadButtons += ` <a class="btn btn-secondary" href="${subtitleUrl}" download="${subtitleFileName}">📝 Translated Subtitles (.srt)</a>`;
+                }
+                if (originalSubtitleUrl) {
+                    downloadButtons += ` <a class="btn btn-secondary" href="${originalSubtitleUrl}" download="${originalSubtitleFileName}">📜 Original Subtitles (.srt)</a>`;
                 }
                 resultDiv.innerHTML = `
                     <h3>🔗 Merged Chunk Output</h3>
@@ -7092,6 +7494,119 @@ async def home():
                 }
             }
 
+            const FILENAME_FORBIDDEN_CHARS = /[<>:"/\\|?*]/g;
+            const LANGUAGE_CODE_OVERRIDES = {
+                chinese: 'chn',
+                'zh-cn': 'chn',
+                zh: 'chn',
+                english: 'en',
+                en: 'en',
+                spanish: 'es',
+                es: 'es',
+                japanese: 'jp',
+                ja: 'jp',
+                korean: 'kr',
+                ko: 'kr',
+                german: 'de',
+                de: 'de',
+                french: 'fr',
+                fr: 'fr',
+            };
+
+            function normalizeBaseFilenameInput(value) {
+                if (!value) {
+                    return '';
+                }
+                let stem = `${value}`.replace(/\\s+/g, ' ').trim();
+                if (!stem) {
+                    return '';
+                }
+                stem = stem.replace(FILENAME_FORBIDDEN_CHARS, '_').replace(/__+/g, '_');
+                stem = stem.replace(/^[.]+|[.]+$/g, '');
+                return stem;
+            }
+
+            function deriveBaseFromFilename(filename) {
+                if (!filename) {
+                    return '';
+                }
+                const lastSlash = Math.max(filename.lastIndexOf('/'), filename.lastIndexOf('\\\\'));
+                const lastDot = filename.lastIndexOf('.');
+                const withoutExt = lastDot > lastSlash ? filename.slice(0, lastDot) : filename;
+                return normalizeBaseFilenameInput(withoutExt);
+            }
+
+            function getLanguageCodeForFilename(label) {
+                if (!label) {
+                    return 'translated';
+                }
+                const lower = label.trim().toLowerCase();
+                if (!lower) {
+                    return 'translated';
+                }
+                if (LANGUAGE_CODE_OVERRIDES[lower]) {
+                    return LANGUAGE_CODE_OVERRIDES[lower];
+                }
+                const compact = lower.replace(/[^a-z0-9]+/g, '');
+                if (!compact) {
+                    return 'translated';
+                }
+                return compact.length <= 3 ? compact : compact.slice(0, 3);
+            }
+
+            function updateFfmpegCommands(options = {}) {
+                if (!ffmpegPanel || !ffmpegExtractCmd || !ffmpegReplaceCmd || !ffmpegSubtitleCmd) {
+                    return;
+                }
+                const baseCandidate =
+                    options.baseName !== undefined
+                        ? options.baseName
+                        : translateBaseFilenameInput
+                        ? translateBaseFilenameInput.value
+                        : '';
+                const normalizedBase = normalizeBaseFilenameInput(baseCandidate);
+                if (translateBaseFilenameInput && options.baseName !== undefined && normalizedBase) {
+                    translateBaseFilenameInput.value = normalizedBase;
+                }
+                if (!normalizedBase) {
+                    ffmpegPanel.style.display = 'none';
+                    ffmpegExtractCmd.textContent = '';
+                    ffmpegReplaceCmd.textContent = '';
+                    ffmpegSubtitleCmd.textContent = '';
+                    if (ffmpegSubtitleOriginalCmd) {
+                        ffmpegSubtitleOriginalCmd.textContent = '';
+                    }
+                    return;
+                }
+                const languageLabel =
+                    options.languageLabel ||
+                    (translateDestLanguageSelect && translateDestLanguageSelect.value.trim()) ||
+                    '';
+                const preferredCode =
+                    options.languageCode ||
+                    translateLanguageCodeHint ||
+                    getLanguageCodeForFilename(languageLabel);
+                const languageCode = preferredCode || 'translated';
+                if (options.languageCode) {
+                    translateLanguageCodeHint = options.languageCode;
+                }
+                const baseMp4 = `"${normalizedBase}.mp4"`;
+                const baseM4a = `"${normalizedBase}.m4a"`;
+                const translatedMp3 = `"${normalizedBase}_${languageCode}.mp3"`;
+                const translatedMp4 = `"${normalizedBase}_${languageCode}.mp4"`;
+                const translatedSrt = `"${normalizedBase}_${languageCode}.srt"`;
+                const srtBurnedMp4 = `"${normalizedBase}_${languageCode}_srt.mp4"`;
+                const originalSrt = `"${normalizedBase}_original.srt"`;
+                const originalSrtBurned = `"${normalizedBase}_original_srt.mp4"`;
+                ffmpegPanel.style.display = 'block';
+                ffmpegExtractCmd.textContent = `ffmpeg -i ${baseMp4} -vn -acodec copy ${baseM4a}`;
+                ffmpegReplaceCmd.textContent = `ffmpeg -i ${baseMp4} -i ${translatedMp3} -c:v copy -c:a aac -map 0:v:0 -map 1:a:0 ${translatedMp4}`;
+                ffmpegSubtitleCmd.textContent = `ffmpeg -i ${translatedMp4} -vf subtitles=${translatedSrt} ${srtBurnedMp4}`;
+                if (ffmpegSubtitleOriginalCmd) {
+                    ffmpegSubtitleOriginalCmd.textContent = `ffmpeg -i ${baseMp4} -vf subtitles=${originalSrt} ${originalSrtBurned}`;
+                }
+            }
+
             async function handleSplitAudioRequest() {
                 if (!translateSplitAudioBtn) {
                     return;
@@ -7120,6 +7635,9 @@ async def home():
                 }
                 formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
                 formData.append('enhance_voice', 'true');
+                if (translateBaseFilenameInput && translateBaseFilenameInput.value.trim()) {
+                    formData.append('base_filename', translateBaseFilenameInput.value.trim());
+                }
 
                 try {
                     translateSplitAudioBtn.disabled = true;
@@ -7222,6 +7740,17 @@ async def home():
                                 duration_ms: eventData.duration_ms,
                             };
                             renderChunkResultsFromResponse(payload);
+                            if (eventData.base_output_name && translateBaseFilenameInput) {
+                                translateBaseFilenameInput.value = eventData.base_output_name;
+                                translateBaseFilenameInput.dataset.userEdited = 'false';
+                                updateFfmpegCommands({
+                                    baseName: eventData.base_output_name,
+                                    languageLabel: translateDestLanguageSelect && translateDestLanguageSelect.value,
+                                    languageCode: eventData.language_code,
+                                });
+                            } else {
+                                updateFfmpegCommands();
+                            }
                             if (translateChunkResults && translateEnableChunkSplit && translateEnableChunkSplit.checked) {
                                 translateChunkResults.style.display = 'block';
                             }
@@ -7486,7 +8015,10 @@ async def home():
             }
             updateCustomBackingSummary();
             if (translateDestLanguageSelect) {
-                translateDestLanguageSelect.addEventListener('change', refreshPromptTemplates);
+                translateDestLanguageSelect.addEventListener('change', () => {
+                    refreshPromptTemplates();
+                    updateFfmpegCommands();
+                });
             }
             function syncSilenceVolumeUI() {
                 if (!translateSilenceVolumeGroup) {
@@ -8474,6 +9006,24 @@ async def home():
                 if (!metadata || typeof metadata !== 'object') {
                     return;
                 }
+                if (metadata.output_base_name && translateBaseFilenameInput) {
+                    translateBaseFilenameInput.value = metadata.output_base_name;
+                    translateBaseFilenameInput.dataset.userEdited = 'false';
+                }
+                if (metadata.language_code) {
+                    translateLanguageCodeHint = metadata.language_code;
+                }
+                updateFfmpegCommands({
+                    baseName: metadata.output_base_name,
+                    languageCode: metadata.language_code,
+                    languageLabel: metadata.dest_language,
+                });
+                if (
+                    translateForceGeminiRefresh &&
+                    typeof metadata.force_gemini_regenerate === 'boolean'
+                ) {
+                    translateForceGeminiRefresh.checked = !!metadata.force_gemini_regenerate;
+                }
                 const backingMeta = metadata.backing_track || {};
                 if (typeof backingMeta.available === 'boolean') {
                     translateBackingAvailableFromSession = Boolean(backingMeta.available);
@@ -8667,6 +9217,9 @@ async def home():
                         formData.append('merge_backing_track', translateMergeBackEl && translateMergeBackEl.checked ? 'true' : 'false');
                         formData.append('ignore_non_speech', translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? 'true' : 'false');
                         formData.append('preserve_silence_audio', translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? 'true' : 'false');
+                        if (translateBaseFilenameInput && translateBaseFilenameInput.value.trim()) {
+                            formData.append('base_filename', translateBaseFilenameInput.value.trim());
+                        }
                         if (translatePreserveSilenceEl && translatePreserveSilenceEl.checked && translateSilenceVolumeInput) {
                             formData.append('silence_volume_percent', translateSilenceVolumeInput.value || '100');
                         }
@@ -8675,6 +9228,9 @@ async def home():
                         }
                         if (translateGeminiApiKey && translateGeminiApiKey.value.trim()) {
                             formData.append('gemini_api_key', translateGeminiApiKey.value.trim());
+                        }
+                        if (translateForceGeminiRefresh && translateForceGeminiRefresh.checked) {
+                            formData.append('force_gemini_regenerate', 'true');
                         }
                         if (translateDebugTranslate) {
                             formData.append('translate_text', translateDebugTranslate.checked ? 'true' : 'false');
@@ -8725,6 +9281,9 @@ async def home():
                     formData.append('merge_backing_track', translateMergeBackEl && translateMergeBackEl.checked ? 'true' : 'false');
                     formData.append('ignore_non_speech', translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? 'true' : 'false');
                     formData.append('preserve_silence_audio', translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? 'true' : 'false');
+                    if (translateBaseFilenameInput && translateBaseFilenameInput.value.trim()) {
+                        formData.append('base_filename', translateBaseFilenameInput.value.trim());
+                    }
                     if (translatePreserveSilenceEl && translatePreserveSilenceEl.checked && translateSilenceVolumeInput) {
                         formData.append('silence_volume_percent', translateSilenceVolumeInput.value || '100');
                     }
@@ -8733,6 +9292,9 @@ async def home():
                     }
                     if (translateGeminiApiKey && translateGeminiApiKey.value.trim()) {
                         formData.append('gemini_api_key', translateGeminiApiKey.value.trim());
+                    }
+                    if (translateForceGeminiRefresh && translateForceGeminiRefresh.checked) {
+                        formData.append('force_gemini_regenerate', 'true');
                     }
                     appendSegmentParameters(formData);
                     appendManualSegments(formData);
@@ -8949,9 +9511,24 @@ async def home():
                                 eventData.subtitle_file_name ||
                                 (eventData.metadata && eventData.metadata.subtitle && eventData.metadata.subtitle.filename) ||
                                 'translated_speech.srt';
+                            const originalSubtitleUrl =
+                                eventData.original_subtitle_url ||
+                                (eventData.metadata &&
+                                    eventData.metadata.subtitle_original &&
+                                    eventData.metadata.subtitle_original.url) ||
+                                null;
+                            const originalSubtitleFileName =
+                                eventData.original_subtitle_file_name ||
+                                (eventData.metadata &&
+                                    eventData.metadata.subtitle_original &&
+                                    eventData.metadata.subtitle_original.filename) ||
+                                'translated_speech_original.srt';
                             let downloadButtons = `<a href="${audioUrl}" download="${downloadName}" class="btn">💾 Download</a>`;
                             if (subtitleUrl) {
-                                downloadButtons += `<a href="${subtitleUrl}" download="${subtitleFileName}" class="btn btn-secondary" style="margin-left: 10px;">📝 Subtitles (.srt)</a>`;
+                                downloadButtons += `<a href="${subtitleUrl}" download="${subtitleFileName}" class="btn btn-secondary" style="margin-left: 10px;">📝 Translated Subtitles (.srt)</a>`;
+                            }
+                            if (originalSubtitleUrl) {
+                                downloadButtons += `<a href="${originalSubtitleUrl}" download="${originalSubtitleFileName}" class="btn btn-secondary" style="margin-left: 10px;">📜 Original Subtitles (.srt)</a>`;
                             }
                             resultDiv.innerHTML = `
                                 <audio controls src="${audioUrl}" style="width: 100%; margin-top: 20px;"></audio>
@@ -9035,6 +9612,13 @@ async def home():
 
                     if (data.metadata && data.metadata.gemini_model && translateGeminiModel) {
                         translateGeminiModel.value = data.metadata.gemini_model;
+                    }
+                    if (
+                        translateForceGeminiRefresh &&
+                        data.metadata &&
+                        typeof data.metadata.force_gemini_regenerate === 'boolean'
+                    ) {
+                        translateForceGeminiRefresh.checked = !!data.metadata.force_gemini_regenerate;
                     }
                     if (translateIgnoreNonSpeechEl && data.metadata && typeof data.metadata.ignore_non_speech === 'boolean') {
                         translateIgnoreNonSpeechEl.checked = !!data.metadata.ignore_non_speech;
@@ -9194,17 +9778,29 @@ async def home():
                     }
 
                     const downloadName = data.file_name || `translated_speech.${selectedFormat}`;
+                    const metadata = data.metadata || {};
                     const subtitleUrl =
                         data.subtitle_url ||
-                        (metadata && metadata.subtitle && metadata.subtitle.url) ||
+                        (metadata.subtitle && metadata.subtitle.url) ||
                         null;
                     const subtitleFileName =
                         data.subtitle_file_name ||
-                        (metadata && metadata.subtitle && metadata.subtitle.filename) ||
+                        (metadata.subtitle && metadata.subtitle.filename) ||
                         'translated_speech.srt';
+                    const originalSubtitleUrl =
+                        data.original_subtitle_url ||
+                        (metadata.subtitle_original && metadata.subtitle_original.url) ||
+                        null;
+                    const originalSubtitleFileName =
+                        data.original_subtitle_file_name ||
+                        (metadata.subtitle_original && metadata.subtitle_original.filename) ||
+                        'translated_speech_original.srt';
                     let downloadButtons = `<a href="${audioUrl}" download="${downloadName}" class="btn">💾 Download</a>`;
                     if (subtitleUrl) {
-                        downloadButtons += `<a href="${subtitleUrl}" download="${subtitleFileName}" class="btn btn-secondary" style="margin-left: 10px;">📝 Subtitles (.srt)</a>`;
+                        downloadButtons += `<a href="${subtitleUrl}" download="${subtitleFileName}" class="btn btn-secondary" style="margin-left: 10px;">📝 Translated Subtitles (.srt)</a>`;
+                    }
+                    if (originalSubtitleUrl) {
+                        downloadButtons += `<a href="${originalSubtitleUrl}" download="${originalSubtitleFileName}" class="btn btn-secondary" style="margin-left: 10px;">📜 Original Subtitles (.srt)</a>`;
                     }
                     if (resultDiv) {
                         resultDiv.innerHTML = `
@@ -9215,7 +9811,6 @@ async def home():
                         `;
                     }
 
-                    const metadata = data.metadata || {};
                     let statusMessage = '✅ Advanced translation complete!';
                     if (typeof metadata.segment_count === 'number') {
                         statusMessage += ` (${metadata.segment_count} segments)`;
@@ -9777,6 +10372,7 @@ async def api_translate_split_audio(
     dest_language: Optional[str] = Form(None),
     audio: Optional[str] = Form(None),
     audio_mime_type: Optional[str] = Form(None),
+    base_filename: Optional[str] = Form(None),
     chunk_min_minutes: Optional[float] = Form(None),
     chunk_max_minutes: Optional[float] = Form(None),
     min_silence_ms: Optional[int] = Form(None),
@@ -9814,6 +10410,7 @@ async def api_translate_split_audio(
             dest_language = payload.get("dest_language", dest_language)
             audio = payload.get("audio", audio)
             audio_mime_type = payload.get("audio_mime_type", audio_mime_type)
+            base_filename = payload.get("base_filename", base_filename)
             chunk_min_minutes = payload.get("chunk_min_minutes", chunk_min_minutes)
             chunk_max_minutes = payload.get("chunk_max_minutes", chunk_max_minutes)
             min_silence_ms = payload.get("min_silence_ms", min_silence_ms)
@@ -9868,6 +10465,7 @@ async def api_translate_split_audio(
         uploaded_filename: Optional[str] = None
         audio_mime_type_value = audio_mime_type
         audio_file_for_pipeline = audio_file
+        base_filename_value = base_filename
 
         if audio_file is not None:
             try:
@@ -9887,6 +10485,12 @@ async def api_translate_split_audio(
             audio_mime_type_value = audio_file.content_type or audio_mime_type_value
             audio_file_for_pipeline = None
 
+        resolved_base_name = _determine_output_base_name(
+            user_base=base_filename_value,
+            upload_filename=uploaded_filename,
+            reuse_session=None,
+        )
+
         split_request_summary = {
             "dest_language": dest_language_value,
             "chunk_min_minutes": min_minutes,
@@ -9894,6 +10498,7 @@ async def api_translate_split_audio(
             "min_silence_ms": min_silence_ms_value,
             "silence_threshold_db": silence_threshold_value,
             "super_resolution": apply_super_resolution,
+            "base_output_name": resolved_base_name,
         }
 
         async def split_stream():
@@ -10012,6 +10617,8 @@ async def api_translate_split_audio(
                             chunk_cut_reason=entry.get("cut_reason"),
                             chunk_silence_midpoint_ms=entry.get("silence_midpoint_ms"),
                             persist_media=True,
+                            source_audio_filename=uploaded_filename,
+                            source_base_name=resolved_base_name,
                         )
 
                         chunk_entry = _serialize_chunk_session(chunk_session)
@@ -10050,6 +10657,8 @@ async def api_translate_split_audio(
                             chunk_end_ms=total_duration_ms,
                             chunk_cut_reason="full_audio",
                             persist_media=True,
+                            source_audio_filename=uploaded_filename,
+                            source_base_name=resolved_base_name,
                         )
                         chunk_entries.append(_serialize_chunk_session(fallback_session))
 
@@ -10087,6 +10696,8 @@ async def api_translate_split_audio(
                             "backing_source": backing_track_source,
                         },
                         "session_ttl_seconds": ADVANCED_TRANSLATE_SESSION_TTL_SECONDS,
+                        "source_audio_filename": uploaded_filename,
+                        "base_output_name": resolved_base_name,
                     }
 
                     await emit("complete", **response_payload)
@@ -10242,18 +10853,36 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
             bitrate=bitrate_value if response_format_value in {"mp3", "ogg", "opus", "aac", "webm"} else None,
         )
 
-        output_filename = f"translate_merge_{uuid.uuid4().hex}.{response_format_value}"
+        template_session = sessions[0]
+        resolved_base_name = _normalize_base_filename(
+            template_session.source_base_name,
+            fallback=template_session.source_audio_filename,
+        )
+        language_code = _language_code_from_label(template_session.dest_language)
+        base_stem = _compose_output_stem(resolved_base_name)
+        audio_stem = _compose_output_stem(resolved_base_name, extra=language_code)
+        output_filename = f"{audio_stem}.{response_format_value}"
         output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
         with open(output_path, "wb") as outfile:
             outfile.write(merged_bytes)
 
         audio_url = f"/api/translate_outputs/{output_filename}"
-        subtitle_info = _export_srt_from_segments(
+        subtitle_translated = _export_srt_from_segments(
             merged_segments,
-            output_filename,
+            base_name=base_stem,
+            suffix=language_code,
+            text_kind="translated",
             empty_note="No merged speech segments were available for subtitle export.",
         )
-        subtitle_url = subtitle_info["url"] if subtitle_info else None
+        subtitle_original = _export_srt_from_segments(
+            merged_segments,
+            base_name=base_stem,
+            suffix="original",
+            text_kind="source",
+            empty_note="No merged speech segments were available for subtitle export.",
+        )
+        subtitle_url = subtitle_translated["url"] if subtitle_translated else None
+        original_subtitle_url = subtitle_original["url"] if subtitle_original else None
 
         return JSONResponse(
             status_code=200,
@@ -10266,8 +10895,14 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
                 "chunk_results": chunk_results,
                 "chunk_batch_id": chunk_batch_id or sessions[0].chunk_parent_id,
                 "subtitle_url": subtitle_url,
-                "subtitle_file_name": subtitle_info["filename"] if subtitle_info else None,
-                "subtitle": subtitle_info,
+                "subtitle_file_name": subtitle_translated["filename"] if subtitle_translated else None,
+                "subtitle": subtitle_translated,
+                "subtitle_translated": subtitle_translated,
+                "original_subtitle_url": original_subtitle_url,
+                "original_subtitle_file_name": subtitle_original["filename"] if subtitle_original else None,
+                "subtitle_original": subtitle_original,
+                "base_output_name": resolved_base_name,
+                "language_code": language_code,
             },
         )
     except Exception as exc:
@@ -10343,6 +10978,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
             if payload.merge_backing_track is not None
             else config_template.merge_with_backing
         )
+        force_gemini_regenerate_flag = _coerce_to_bool(payload.force_gemini_regenerate or False)
 
         summary_payload = {
             "chunks": len(sessions),
@@ -10351,6 +10987,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
             "bitrate": bitrate_value,
             "gemini_model": gemini_model_value,
             "merge_backing": merge_backing_requested,
+            "force_gemini_regenerate": force_gemini_regenerate_flag,
         }
 
         async def chunk_generate_stream():
@@ -10408,6 +11045,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
                             backing_volume_percent=backing_volume_percent_value,
                             merge_backing_track=merge_backing_requested,
                             silence_volume_percent=silence_volume_percent_value,
+                            force_gemini_regenerate=force_gemini_regenerate_flag,
                         )
                         async with counter_lock:
                             success_count += 1
@@ -10484,6 +11122,7 @@ async def api_translate_segments(
     bitrate: Optional[str] = Form(None),
     audio: Optional[str] = Form(None),
     audio_mime_type: Optional[str] = Form(None),
+    base_filename: Optional[str] = Form(None),
     custom_backing_audio: Optional[str] = Form(None),
     custom_backing_audio_mime_type: Optional[str] = Form(None),
     prompt: Optional[str] = Form(None),
@@ -10504,6 +11143,7 @@ async def api_translate_segments(
     reuse_session_id: Optional[str] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
     custom_backing_audio_file: Optional[UploadFile] = File(None),
+    force_gemini_regenerate: Optional[bool] = Form(False),
 ):
     """API: Prepare translation segments for advanced translate/edit workflow."""
     reuse_session_id_value: Optional[str] = reuse_session_id
@@ -10514,6 +11154,7 @@ async def api_translate_segments(
         bitrate_value = bitrate
         audio_reference = audio
         audio_mime_type_value = audio_mime_type
+        base_filename_value = base_filename
         custom_backing_audio_value = custom_backing_audio
         custom_backing_audio_mime_type_value = custom_backing_audio_mime_type
         prompt_override = prompt
@@ -10531,6 +11172,8 @@ async def api_translate_segments(
         generated_volume_percent_value = generated_volume_percent
         backing_volume_percent_value = backing_volume_percent
         silence_volume_percent_value = silence_volume_percent
+        uploaded_filename = audio_file.filename if audio_file else None
+        force_gemini_regen_value = force_gemini_regenerate
 
         content_type = request.headers.get("content-type", "")
         if (
@@ -10553,6 +11196,7 @@ async def api_translate_segments(
             bitrate_value = payload.get("bitrate", bitrate_value)
             audio_reference = payload.get("audio", audio_reference)
             audio_mime_type_value = payload.get("audio_mime_type", audio_mime_type_value)
+            base_filename_value = payload.get("base_filename", base_filename_value)
             custom_backing_audio_value = payload.get("custom_backing_audio", custom_backing_audio_value)
             custom_backing_audio_mime_type_value = payload.get(
                 "custom_backing_audio_mime_type",
@@ -10583,6 +11227,7 @@ async def api_translate_segments(
                 silence_volume_percent_value,
             )
             reuse_session_id_value = payload.get("reuse_session_id", reuse_session_id_value)
+            force_gemini_regen_value = payload.get("force_gemini_regenerate", force_gemini_regen_value)
 
         dest_language_value = (dest_language_value or "").strip()
         if not dest_language_value:
@@ -10626,6 +11271,7 @@ async def api_translate_segments(
             silence_volume_percent_value,
             DEFAULT_SILENCE_VOLUME_PERCENT,
         )
+        force_gemini_regenerate_flag = _coerce_to_bool(force_gemini_regen_value or False)
         reuse_source_session: Optional[TranslateSessionData] = None
         reuse_session_id_value = (reuse_session_id_value or "").strip()
         if reuse_session_id_value:
@@ -10649,6 +11295,16 @@ async def api_translate_segments(
         resolved_gemini_model = _normalize_gemini_model_name(gemini_model_value)
         gemini_api_key_value = (gemini_api_key_value or "").strip()
 
+        reuse_session_for_segments = reuse_source_session
+        session_source_filename = uploaded_filename or (
+            reuse_session_for_segments.source_audio_filename if reuse_session_for_segments else None
+        )
+        resolved_base_name = _determine_output_base_name(
+            user_base=base_filename_value,
+            upload_filename=session_source_filename,
+            reuse_session=reuse_session_for_segments,
+        )
+
         request_summary = {
             "dest_language": dest_language_value,
             "response_format": response_format_value,
@@ -10662,9 +11318,11 @@ async def api_translate_segments(
             "preserve_silence_audio": preserve_silence_audio_flag,
             "generated_volume_percent": generated_volume_percent_value,
             "backing_volume_percent": backing_volume_percent_value,
+            "silence_volume_percent": silence_volume_percent_value,
             "translate_enabled": translate_enabled,
+            "base_output_name": resolved_base_name,
+            "force_gemini_regenerate": force_gemini_regenerate_flag,
         }
-        reuse_session_for_segments = reuse_source_session
         print(
             "[translate_segments] dest=%s reuse_session=%s chunk_index=%s upload=%s format=%s backing=%s merge_backing=%s"
             % (
@@ -10725,6 +11383,7 @@ async def api_translate_segments(
                         reuse_source_session=reuse_session_for_segments,
                         audio_file=audio_file,
                         audio_reference=audio_reference,
+                        source_audio_filename=session_source_filename,
                         audio_mime_type_value=audio_mime_type_value,
                         apply_enhancement=apply_enhancement,
                         apply_super_resolution=apply_super_resolution,
@@ -10769,9 +11428,15 @@ async def api_translate_segments(
                         gemini_api_key_value=gemini_api_key_value or None,
                         emit_status=emit_status,
                         source_chunk_session=reuse_session_for_segments,
+                        source_audio_filename=session_source_filename,
+                        source_base_name=resolved_base_name,
+                        force_gemini_regenerate=force_gemini_regenerate_flag,
                     )
 
                     metadata = segment_result.metadata
+                    metadata["output_base_name"] = resolved_base_name
+                    if session_source_filename:
+                        metadata["source_audio_filename"] = session_source_filename
                     if segment_result.gemini_raw_text is not None:
                         metadata["gemini_raw_text"] = segment_result.gemini_raw_text
                     if reuse_session_for_segments is not None:
@@ -10847,6 +11512,10 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                 status_code=404,
                 content={"status": "error", "message": "Translate session not found or expired."},
             )
+        resolved_base_name = _normalize_base_filename(
+            session.source_base_name,
+            fallback=session.source_audio_filename,
+        )
 
         merge_preference = session.merge_with_backing
         if payload.merge_backing_track is not None:
@@ -11064,6 +11733,7 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                     metadata["selected_preserved_count"] = preserved_count
                     metadata["session_id"] = session.session_id
                     metadata["gemini_model"] = session.gemini_model or _get_gemini_model_name()
+                    metadata["output_base_name"] = resolved_base_name
 
                     await _update_translate_session_segments(session.session_id, sanitized_segments)
                     await _update_translate_session_metadata(
@@ -11095,19 +11765,43 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                         f"available={str(_session_has_backing_audio(session)).lower()};merged={str(merge_with_backing).lower()}"
                     )
 
-                    output_filename = f"translate_{uuid.uuid4().hex}.{response_format_value}"
+                    chunk_index_for_name = (
+                        chunk_session_for_generation.chunk_index
+                        if chunk_session_for_generation and chunk_session_for_generation.chunk_parent_id
+                        else None
+                    )
+                    language_code = _language_code_from_label(session.dest_language)
+                    base_stem = _compose_output_stem(resolved_base_name, chunk_index=chunk_index_for_name)
+                    audio_stem = _compose_output_stem(
+                        resolved_base_name,
+                        chunk_index=chunk_index_for_name,
+                        extra=language_code,
+                    )
+                    output_filename = f"{audio_stem}.{response_format_value}"
                     output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
                     with open(output_path, "wb") as outfile:
                         outfile.write(audio_payload)
                     audio_url = f"/api/translate_outputs/{output_filename}"
-                    subtitle_info = _export_srt_from_segments(
+                    subtitle_translated = _export_srt_from_segments(
                         final_segments,
-                        output_filename,
+                        base_name=base_stem,
+                        suffix=language_code,
+                        text_kind="translated",
                         empty_note="No translated speech segments were selected for subtitle export.",
                     )
-                    subtitle_url = subtitle_info["url"] if subtitle_info else None
-                    if subtitle_info:
-                        metadata["subtitle"] = subtitle_info
+                    subtitle_original = _export_srt_from_segments(
+                        final_segments,
+                        base_name=base_stem,
+                        suffix="original",
+                        text_kind="source",
+                        empty_note="No translated speech segments were selected for subtitle export.",
+                    )
+                    subtitle_url = subtitle_translated["url"] if subtitle_translated else None
+                    original_subtitle_url = subtitle_original["url"] if subtitle_original else None
+                    metadata["subtitle"] = subtitle_translated
+                    metadata["subtitle_translated"] = subtitle_translated
+                    metadata["subtitle_original"] = subtitle_original
+                    metadata["language_code"] = language_code
 
                     if chunk_session_for_generation and chunk_session_for_generation.chunk_parent_id:
                         _mark_chunk_generated(
@@ -11159,7 +11853,9 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                         metadata=metadata,
                         file_name=output_filename,
                         subtitle_url=subtitle_url,
-                        subtitle_file_name=subtitle_info["filename"] if subtitle_info else None,
+                        subtitle_file_name=subtitle_translated["filename"] if subtitle_translated else None,
+                        original_subtitle_url=original_subtitle_url,
+                        original_subtitle_file_name=subtitle_original["filename"] if subtitle_original else None,
                     )
 
                 except TranslateWorkflowHttpError as http_error:
@@ -11440,6 +12136,7 @@ async def api_translate_audio(
     bitrate: Optional[str] = Form(None),
     audio: Optional[str] = Form(None),
     audio_mime_type: Optional[str] = Form(None),
+    base_filename: Optional[str] = Form(None),
     custom_backing_audio: Optional[str] = Form(None),
     custom_backing_audio_mime_type: Optional[str] = Form(None),
     prompt: Optional[str] = Form(None),
@@ -11459,6 +12156,7 @@ async def api_translate_audio(
     reuse_session_id: Optional[str] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
     custom_backing_audio_file: Optional[UploadFile] = File(None),
+    force_gemini_regenerate: Optional[bool] = Form(False),
 ):
     """API: Translate speech audio to a target language and return synthesized audio."""
     reuse_session_id_value: Optional[str] = reuse_session_id
@@ -11467,6 +12165,7 @@ async def api_translate_audio(
         dest_language_value = dest_language
         audio_reference = audio
         audio_mime_type_value = audio_mime_type
+        base_filename_value = base_filename
         custom_backing_audio_value = custom_backing_audio
         custom_backing_audio_mime_type_value = custom_backing_audio_mime_type
         prompt_override = prompt
@@ -11485,6 +12184,7 @@ async def api_translate_audio(
         generated_volume_percent_value = generated_volume_percent
         backing_volume_percent_value = backing_volume_percent
         silence_volume_percent_value = silence_volume_percent
+        force_gemini_regen_value = force_gemini_regenerate
 
         content_type = request.headers.get("content-type", "")
         if (
@@ -11512,6 +12212,7 @@ async def api_translate_audio(
             dest_language_value = translate_req.dest_language
             audio_reference = translate_req.audio or audio_reference
             audio_mime_type_value = translate_req.audio_mime_type or audio_mime_type_value
+            base_filename_value = translate_req.base_filename or base_filename_value
             custom_backing_audio_value = translate_req.custom_backing_audio or custom_backing_audio_value
             custom_backing_audio_mime_type_value = (
                 translate_req.custom_backing_audio_mime_type or custom_backing_audio_mime_type_value
@@ -11561,6 +12262,11 @@ async def api_translate_audio(
                 else silence_volume_percent_value
             )
             reuse_session_id_value = translate_req.reuse_session_id or reuse_session_id_value
+            force_gemini_regen_value = (
+                translate_req.force_gemini_regenerate
+                if translate_req.force_gemini_regenerate is not None
+                else force_gemini_regen_value
+            )
 
         reuse_source_session: Optional[TranslateSessionData] = None
         reuse_session_id_value = (reuse_session_id_value or "").strip()
@@ -11622,8 +12328,10 @@ async def api_translate_audio(
         )
         resolved_gemini_model = _normalize_gemini_model_name(gemini_model_value)
         gemini_api_key_value = (gemini_api_key_value or "").strip()
+        force_gemini_regenerate_flag = _coerce_to_bool(force_gemini_regen_value or False)
 
 
+        uploaded_filename = audio_file.filename if audio_file else None
         audio_bytes: Optional[bytes] = None
         if reuse_source_session is None:
             audio_io = await load_audio_bytes_from_request(audio_file, audio_reference)
@@ -11642,6 +12350,16 @@ async def api_translate_audio(
 
         input_mime_type = audio_mime_type_value or (audio_file.content_type if audio_file else None) or "audio/wav"
 
+        reuse_session_for_translate = reuse_source_session
+        session_source_filename = uploaded_filename or (
+            reuse_session_for_translate.source_audio_filename if reuse_session_for_translate else None
+        )
+        resolved_base_name = _determine_output_base_name(
+            user_base=base_filename_value,
+            upload_filename=session_source_filename,
+            reuse_session=reuse_session_for_translate,
+        )
+
         request_summary = {
             "dest_language": dest_language_value,
             "response_format": response_format_value,
@@ -11656,8 +12374,9 @@ async def api_translate_audio(
             "backing_volume_percent": backing_volume_percent_value,
             "silence_volume_percent": silence_volume_percent_value,
             "reuse_session": bool(reuse_source_session),
+            "base_output_name": resolved_base_name,
+            "force_gemini_regenerate": force_gemini_regenerate_flag,
         }
-        reuse_session_for_translate = reuse_source_session
         print(
             "[translate_audio] dest=%s reuse_session=%s chunk_index=%s upload=%s format=%s backing=%s merge_backing=%s"
             % (
@@ -11720,6 +12439,7 @@ async def api_translate_audio(
                         audio_file=None if reuse_session_for_translate else audio_file,
                         audio_reference=None if reuse_session_for_translate else audio_reference,
                         preloaded_audio_bytes=audio_bytes,
+                        source_audio_filename=session_source_filename,
                         audio_mime_type_value=input_mime_type,
                         apply_enhancement=apply_enhancement,
                         apply_super_resolution=apply_super_resolution,
@@ -11765,6 +12485,9 @@ async def api_translate_audio(
                         gemini_api_key_value=gemini_api_key_value or None,
                         emit_status=emit_status,
                         source_chunk_session=reuse_session_for_translate,
+                         source_audio_filename=session_source_filename,
+                         source_base_name=resolved_base_name,
+                        force_gemini_regenerate=force_gemini_regenerate_flag,
                     )
                     session = segment_result.session
                     segments = segment_result.segments
@@ -11795,6 +12518,9 @@ async def api_translate_audio(
                     )
 
                     metadata = dict(segment_result.metadata)
+                    metadata["output_base_name"] = resolved_base_name
+                    if session_source_filename:
+                        metadata["source_audio_filename"] = session_source_filename
                     metadata.update(synthesis_metadata or {})
                     metadata["ignore_non_speech"] = ignore_non_speech_flag
                     metadata["preserve_silence_audio"] = preserve_silence_audio_flag
@@ -11845,19 +12571,48 @@ async def api_translate_audio(
                         ),
                     }
 
-                    output_filename = f"translate_{uuid.uuid4().hex}.{response_format_value}"
+                    chunk_index_for_name = (
+                        reuse_session_for_translate.chunk_index
+                        if reuse_session_for_translate and reuse_session_for_translate.chunk_parent_id
+                        else None
+                    )
+                    language_code = _language_code_from_label(dest_language_value)
+                    base_stem = _compose_output_stem(
+                        resolved_base_name,
+                        chunk_index=chunk_index_for_name,
+                    )
+                    audio_stem = _compose_output_stem(
+                        resolved_base_name,
+                        chunk_index=chunk_index_for_name,
+                        extra=language_code,
+                    )
+                    output_filename = f"{audio_stem}.{response_format_value}"
                     output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
                     with open(output_path, "wb") as outfile:
                         outfile.write(audio_payload)
                     audio_url = f"/api/translate_outputs/{output_filename}"
-                    subtitle_info = _export_srt_from_segments(
+                    subtitle_translated = _export_srt_from_segments(
                         segments,
-                        output_filename,
+                        base_name=base_stem,
+                        suffix=language_code,
+                        text_kind="translated",
                         empty_note="No speech segments were available for subtitle export.",
                     )
-                    subtitle_url = subtitle_info["url"] if subtitle_info else None
-                    if subtitle_info:
-                        metadata["subtitle"] = subtitle_info
+                    subtitle_original = _export_srt_from_segments(
+                        segments,
+                        base_name=base_stem,
+                        suffix="original",
+                        text_kind="source",
+                        empty_note="No speech segments were available for subtitle export.",
+                    )
+                    subtitle_url = subtitle_translated["url"] if subtitle_translated else None
+                    original_subtitle_url = subtitle_original["url"] if subtitle_original else None
+                    if subtitle_translated:
+                        metadata["subtitle"] = subtitle_translated
+                        metadata["subtitle_translated"] = subtitle_translated
+                    if subtitle_original:
+                        metadata["subtitle_original"] = subtitle_original
+                    metadata["language_code"] = language_code
 
                     if reuse_session_for_translate and reuse_session_for_translate.chunk_parent_id:
                         _mark_chunk_generated(
@@ -11909,7 +12664,9 @@ async def api_translate_audio(
                         metadata=metadata,
                         file_name=output_filename,
                         subtitle_url=subtitle_url,
-                        subtitle_file_name=subtitle_info["filename"] if subtitle_info else None,
+                        subtitle_file_name=subtitle_translated["filename"] if subtitle_translated else None,
+                        original_subtitle_url=original_subtitle_url,
+                        original_subtitle_file_name=subtitle_original["filename"] if subtitle_original else None,
                     )
                     print(
                         "[translate_audio] complete audio_url=%s chunk_id=%s generated=%s"
