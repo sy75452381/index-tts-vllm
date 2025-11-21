@@ -19,7 +19,7 @@ pip install clearvoice
 pip install google-genai
 sudo apt install ffmpeg
 hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
-python fastapi_webui_v2.py --use_torch_compile
+python fastapi_webui.py --use_torch_compile
 ```
 
 ## Project Introduction
