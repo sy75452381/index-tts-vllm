@@ -63,7 +63,7 @@ except ImportError:
 
 
 # FastAPI and web interface
-from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks, HTTPException, Depends
+from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks, HTTPException, Depends, Query
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, validator
 from urllib.parse import quote
@@ -807,7 +807,7 @@ async def _build_translation_segments(
         session.chunk_cut_reason = source_chunk_session.chunk_cut_reason
         session.chunk_silence_midpoint_ms = source_chunk_session.chunk_silence_midpoint_ms
         session.chunk_source_session_id = source_chunk_session.session_id
-    ui_segments = _serialize_segments_for_ui(segments, original_audio)
+    ui_segments = _serialize_segments_for_ui(segments, original_audio, session.session_id)
 
     metadata = {
         "dest_language": dest_language,
@@ -1034,6 +1034,138 @@ def _write_gemini_cache_entry(cache_key: str, record: Dict[str, Any]) -> Optiona
         return None
 
 
+def _split_audio_cache_key(
+    clearvoice_hash: str,
+    *,
+    min_chunk_minutes: float,
+    max_chunk_minutes: float,
+    min_silence_ms: int,
+    silence_threshold_db: float,
+) -> str:
+    """
+    Compute a cache key for split audio operations based on clearvoice hash + split settings.
+    Same audio (after clearvoice) + same settings = same split result.
+    """
+    settings_str = f"min={min_chunk_minutes}|max={max_chunk_minutes}|silence_ms={min_silence_ms}|threshold={silence_threshold_db}"
+    settings_hash = hashlib.md5(settings_str.encode("utf-8")).hexdigest()[:12]
+    return f"{clearvoice_hash}_{settings_hash}"
+
+
+def _split_audio_cache_path(cache_key: str, chunk_idx: int) -> str:
+    """Get path to cached split MP3 file for a specific chunk."""
+    safe_key = "".join(c for c in cache_key if c.isalnum() or c in {"_", "-"}).strip()
+    return os.path.join(SPLIT_AUDIO_CACHE_DIR, f"{safe_key}_chunk{chunk_idx:03d}.mp3")
+
+
+def _split_audio_metadata_path(cache_key: str) -> str:
+    """Get path to split audio metadata JSON file."""
+    safe_key = "".join(c for c in cache_key if c.isalnum() or c in {"_", "-"}).strip()
+    return os.path.join(SPLIT_AUDIO_CACHE_DIR, f"{safe_key}_metadata.json")
+
+
+def _load_split_audio_cache(cache_key: str) -> Optional[Dict[str, Any]]:
+    """
+    Load cached split audio metadata including chunk ranges and file paths.
+    Returns None if cache doesn't exist or is invalid.
+    """
+    metadata_path = _split_audio_metadata_path(cache_key)
+    if not os.path.exists(metadata_path):
+        return None
+    
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as infile:
+            metadata = json.load(infile)
+        
+        # Verify version
+        if metadata.get("version") != 1:
+            print(f"⚠️ Split audio cache version mismatch: {metadata_path}")
+            return None
+        
+        # Verify all chunk files exist
+        chunk_count = metadata.get("chunk_count", 0)
+        for chunk_idx in range(1, chunk_count + 1):
+            chunk_path = _split_audio_cache_path(cache_key, chunk_idx)
+            if not os.path.exists(chunk_path):
+                print(f"⚠️ Split audio cache incomplete, missing chunk {chunk_idx}: {chunk_path}")
+                return None
+        
+        return metadata
+    except Exception as exc:
+        print(f"⚠️ Failed to load split audio cache '{metadata_path}': {exc}")
+        return None
+
+
+def _save_split_audio_cache(
+    cache_key: str,
+    chunk_ranges: List[Dict[str, Any]],
+    chunk_audio_segments: List[AudioSegment],
+    silence_stats: Dict[str, Any],
+) -> None:
+    """
+    Save split audio chunks as MP3 files and metadata to cache.
+    
+    Args:
+        cache_key: Cache key identifying this split configuration
+        chunk_ranges: List of chunk range dictionaries with start_ms, end_ms, etc.
+        chunk_audio_segments: List of AudioSegment objects for each chunk
+        silence_stats: Statistics about silence detection
+    """
+    os.makedirs(SPLIT_AUDIO_CACHE_DIR, exist_ok=True)
+    
+    try:
+        # Save each chunk as MP3
+        chunk_files = []
+        for chunk_idx, (chunk_range, audio_segment) in enumerate(zip(chunk_ranges, chunk_audio_segments), start=1):
+            chunk_path = _split_audio_cache_path(cache_key, chunk_idx)
+            # Export as MP3
+            audio_segment.export(chunk_path, format="mp3", bitrate="128k")
+            chunk_files.append({
+                "chunk_index": chunk_idx,
+                "file_path": chunk_path,
+                "start_ms": chunk_range.get("start_ms"),
+                "end_ms": chunk_range.get("end_ms"),
+                "duration_ms": len(audio_segment),
+                "cut_reason": chunk_range.get("cut_reason"),
+                "silence_midpoint_ms": chunk_range.get("silence_midpoint_ms"),
+            })
+        
+        # Save metadata
+        metadata = {
+            "version": 1,
+            "created_at": time.time(),
+            "cache_key": cache_key,
+            "chunk_count": len(chunk_ranges),
+            "chunk_ranges": chunk_ranges,
+            "chunk_files": chunk_files,
+            "silence_stats": silence_stats,
+        }
+        
+        metadata_path = _split_audio_metadata_path(cache_key)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix="split_audio_",
+            suffix=".json",
+            dir=SPLIT_AUDIO_CACHE_DIR
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            json.dump(metadata, tmp_file, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, metadata_path)
+        
+        print(f"💾 Split audio cache stored: {len(chunk_ranges)} chunks → {os.path.basename(metadata_path)}")
+    except Exception as exc:
+        print(f"⚠️ Failed to save split audio cache: {exc}")
+        # Clean up partial cache
+        try:
+            metadata_path = _split_audio_metadata_path(cache_key)
+            if os.path.exists(metadata_path):
+                os.unlink(metadata_path)
+            for chunk_idx in range(1, len(chunk_ranges) + 1):
+                chunk_path = _split_audio_cache_path(cache_key, chunk_idx)
+                if os.path.exists(chunk_path):
+                    os.unlink(chunk_path)
+        except Exception:
+            pass
+
+
 def _persist_session_audio_segment(session_id: str, audio: AudioSegment, kind: str, fmt: str = "mp3") -> str:
     path = _session_media_path(session_id, kind, fmt)
     audio.export(path, format=fmt)
@@ -1181,6 +1313,8 @@ CLEARVOICE_CACHE_DIR = os.path.join("outputs", "clearvoice_cache")
 os.makedirs(CLEARVOICE_CACHE_DIR, exist_ok=True)
 GEMINI_CACHE_DIR = os.path.join("outputs", "gemini_cache")
 os.makedirs(GEMINI_CACHE_DIR, exist_ok=True)
+SPLIT_AUDIO_CACHE_DIR = os.path.join("outputs", "split_audio_cache")
+os.makedirs(SPLIT_AUDIO_CACHE_DIR, exist_ok=True)
 
 
 def _guess_media_type_from_extension(filename: str) -> str:
@@ -3214,9 +3348,49 @@ def _segment_audio_data_uri(
     return f"data:{mime_type};base64,{encoded}"
 
 
+def _save_segment_audio_preview(
+    session_id: str,
+    segment_index: int,
+    audio: AudioSegment,
+    start_ms: int,
+    end_ms: int,
+    fmt: str = "mp3",
+    bitrate: str = "128k",
+) -> Optional[str]:
+    """Save segment audio preview to file and return URL path."""
+    start = max(0, int(start_ms))
+    end = max(start, int(end_ms))
+    audio_len = len(audio)
+    if start >= audio_len or start == end:
+        return None
+    if end > audio_len:
+        end = audio_len
+    snippet = audio[start:end]
+    if len(snippet) == 0:
+        return None
+    
+    # Create filename for this segment preview
+    filename = f"{session_id}_segment_{segment_index}.{fmt}"
+    file_path = os.path.join(TRANSLATE_SESSION_MEDIA_DIR, filename)
+    
+    # Export audio to file
+    export_kwargs: Dict[str, Any] = {}
+    if fmt == "mp3":
+        export_kwargs["bitrate"] = bitrate
+    
+    try:
+        snippet.export(file_path, format=fmt, **export_kwargs)
+        # Return URL path that will be served by the API endpoint
+        return f"/api/segment_preview/{session_id}/{segment_index}"
+    except Exception as exc:
+        print(f"⚠️ Failed to save segment preview for session {session_id}, segment {segment_index}: {exc}")
+        return None
+
+
 def _serialize_segments_for_ui(
     segments: List[Dict[str, Any]],
     audio: AudioSegment,
+    session_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     ui_segments: List[Dict[str, Any]] = []
     for segment in segments:
@@ -3224,8 +3398,9 @@ def _serialize_segments_for_ui(
         start_ms = int(segment.get("start_ms", 0))
         end_ms = int(segment.get("end_ms", start_ms))
         duration_ms = int(segment.get("duration_ms", max(0, end_ms - start_ms)))
+        segment_index = segment.get("index")
         base_payload = {
-            "index": segment.get("index"),
+            "index": segment_index,
             "type": seg_type,
             "start_ms": start_ms,
             "end_ms": end_ms,
@@ -3241,9 +3416,13 @@ def _serialize_segments_for_ui(
         }
         if seg_type == "speech":
             base_payload["generate"] = True
-            preview = _segment_audio_data_uri(audio, start_ms, end_ms)
-            if preview:
-                base_payload["audio_preview"] = preview
+            # Provide preview URL path only - don't generate audio until client requests it
+            if session_id is not None and segment_index is not None:
+                # Provide a dedicated URL for original-audio playback
+                base_payload["audio_preview_url"] = (
+                    f"/api/segment_preview/{session_id}/{segment_index}?variant=original"
+                )
+            # Don't generate base64 previews automatically - too memory intensive
         else:
             base_payload["generate"] = False
         ui_segments.append(base_payload)
@@ -8342,14 +8521,15 @@ async def home():
                         `;
                         body.appendChild(translationGroup);
 
-                        if (segment.audio_preview) {
+                        if (segment.audio_preview_url) {
                             const audioWrapper = document.createElement('div');
                             audioWrapper.className = 'segment-audio-original';
                             audioWrapper.innerHTML = '<label>Original audio preview</label>';
                             const audioEl = document.createElement('audio');
                             audioEl.className = 'segment-audio';
                             audioEl.controls = true;
-                            audioEl.src = segment.audio_preview;
+                            audioEl.preload = 'none'; // Don't preload - only load when user plays
+                            audioEl.src = segment.audio_preview_url;
                             audioWrapper.appendChild(audioEl);
                             body.appendChild(audioWrapper);
                         }
@@ -10549,14 +10729,41 @@ async def api_translate_split_audio(
                         emit_status=emit_status,
                     )
 
-                    await emit_status(stage="chunking", message="Analyzing silence to plan chunk ranges...")
-                    chunk_ranges, silence_stats = _plan_chunk_ranges(
-                        processed_audio,
-                        min_chunk_ms=min_chunk_ms,
-                        max_chunk_ms=max_chunk_ms,
+                    # Compute cache key based on processed audio + split settings
+                    clearvoice_hash = _compute_bytes_md5(_processed_bytes)
+                    split_cache_key = _split_audio_cache_key(
+                        clearvoice_hash,
+                        min_chunk_minutes=min_minutes,
+                        max_chunk_minutes=max_minutes,
                         min_silence_ms=min_silence_ms_value,
                         silence_threshold_db=silence_threshold_value,
                     )
+                    
+                    print(f"🔍 Checking split audio cache: {split_cache_key}")
+                    cached_split_data = _load_split_audio_cache(split_cache_key)
+                    
+                    if cached_split_data:
+                        # Reuse cached split MP3 files and metadata!
+                        print(f"♻️ Split audio cache hit! Reusing {cached_split_data['chunk_count']} cached MP3 chunks.")
+                        await emit_status(
+                            stage="chunking",
+                            message=f"Reusing cached split audio ({cached_split_data['chunk_count']} chunks)...",
+                        )
+                        chunk_ranges = cached_split_data["chunk_ranges"]
+                        silence_stats = cached_split_data.get("silence_stats", {"cached": True})
+                        # Don't preload chunks - will load on-demand or reference cached files
+                        use_cached_chunks = True
+                    else:
+                        # No cache, analyze and split
+                        await emit_status(stage="chunking", message="Analyzing silence to plan chunk ranges...")
+                        chunk_ranges, silence_stats = _plan_chunk_ranges(
+                            processed_audio,
+                            min_chunk_ms=min_chunk_ms,
+                            max_chunk_ms=max_chunk_ms,
+                            min_silence_ms=min_silence_ms_value,
+                            silence_threshold_db=silence_threshold_value,
+                        )
+                        use_cached_chunks = False
 
                     if not chunk_ranges:
                         chunk_ranges = [
@@ -10581,6 +10788,9 @@ async def api_translate_split_audio(
                         message=f"Creating up to {len(chunk_ranges)} chunk session(s)...",
                     )
                     created_chunks = 0
+                    
+                    # Collect chunk audio segments for caching (if not using cache)
+                    new_chunk_segments = [] if not use_cached_chunks else None
 
                     for chunk_idx, entry in enumerate(chunk_ranges, start=1):
                         start_ms = entry["start_ms"]
@@ -10588,7 +10798,18 @@ async def api_translate_split_audio(
                         duration_ms = max(0, end_ms - start_ms)
                         if duration_ms < CHUNK_SPLIT_MIN_CHUNK_MS:
                             continue
-                        chunk_audio = processed_audio[start_ms:end_ms]
+                        
+                        # When using cache, reference cached file directly; otherwise split from full audio
+                        if use_cached_chunks:
+                            # Use cached MP3 - create minimal AudioSegment to satisfy interface
+                            # We'll set the path directly after session creation to avoid loading
+                            chunk_mp3_path = _split_audio_cache_path(split_cache_key, chunk_idx)
+                            # Create empty AudioSegment as placeholder (won't be used)
+                            chunk_audio = AudioSegment.silent(duration=duration_ms)
+                        else:
+                            # Split from processed audio and collect for caching
+                            chunk_audio = processed_audio[start_ms:end_ms]
+                            new_chunk_segments.append(chunk_audio)
 
                         chunk_session = await _create_translate_session(
                             chunk_audio,
@@ -10616,10 +10837,15 @@ async def api_translate_split_audio(
                             chunk_end_ms=end_ms,
                             chunk_cut_reason=entry.get("cut_reason"),
                             chunk_silence_midpoint_ms=entry.get("silence_midpoint_ms"),
-                            persist_media=True,
+                            persist_media=False,  # Never persist - either using cache or will save later
                             source_audio_filename=uploaded_filename,
                             source_base_name=resolved_base_name,
                         )
+                        
+                        # If using cache, point directly to cached MP3 file instead of keeping audio in memory
+                        if use_cached_chunks:
+                            chunk_session.original_audio = None  # Clear placeholder
+                            chunk_session.original_audio_path = chunk_mp3_path  # Point to cached file
 
                         chunk_entry = _serialize_chunk_session(chunk_session)
                         chunk_entries.append(chunk_entry)
@@ -10628,6 +10854,22 @@ async def api_translate_split_audio(
                             stage="chunking",
                             message=f"Chunk {created_chunks} created (target {len(chunk_ranges)}).",
                         )
+                    
+                    # Save to cache if we just split the audio (not using cache)
+                    if new_chunk_segments is not None and len(new_chunk_segments) > 0:
+                        await emit_status(stage="chunking", message="Caching split audio chunks...")
+                        try:
+                            # Run cache save in thread pool to avoid blocking
+                            await asyncio.get_event_loop().run_in_executor(
+                                executor,
+                                _save_split_audio_cache,
+                                split_cache_key,
+                                chunk_ranges,
+                                new_chunk_segments,
+                                silence_stats,
+                            )
+                        except Exception as exc:
+                            print(f"⚠️ Failed to cache split audio chunks: {exc}")
 
                     if not chunk_entries and total_duration_ms >= CHUNK_SPLIT_MIN_CHUNK_MS:
                         await emit_status(stage="chunking", message="Fallback: keeping full audio as single chunk.")
@@ -12014,13 +12256,28 @@ async def api_translate_segment_preview(payload: SegmentPreviewRequest):
         metadata["preview"] = True
         metadata["preview_segment_index"] = seg_input.index
 
-        audio_data_uri = f"data:{media_type};base64,{base64.b64encode(audio_bytes).decode('ascii')}"
+        # Save preview to file and return URL instead of base64
+        preview_filename = f"{session.session_id}_segment_{seg_input.index}_preview.mp3"
+        preview_path = os.path.join(TRANSLATE_SESSION_MEDIA_DIR, preview_filename)
+        
+        try:
+            with open(preview_path, "wb") as f:
+                f.write(audio_bytes)
+            cache_bust = int(time.time() * 1000)
+            audio_preview_url = (
+                f"/api/segment_preview/{session.session_id}/{seg_input.index}"
+                f"?variant=preview&ts={cache_bust}"
+            )
+        except Exception as exc:
+            print(f"⚠️ Failed to save preview to file, falling back to base64: {exc}")
+            audio_preview_url = f"data:{media_type};base64,{base64.b64encode(audio_bytes).decode('ascii')}"
+        
         return JSONResponse(
             status_code=200,
             content={
                 "status": "success",
                 "segment_index": seg_input.index,
-                "audio_preview": audio_data_uri,
+                "audio_preview": audio_preview_url,
                 "media_type": media_type,
                 "metadata": metadata,
             },
@@ -12941,6 +13198,93 @@ async def api_speaker_preview(speaker_name: str):
         media_type="audio/mpeg",
         filename=f"{speaker_name}_preview.mp3",
         headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/api/segment_preview/{session_id}/{segment_index}")
+async def api_segment_preview(
+    session_id: str,
+    segment_index: int,
+    variant: str = Query("auto"),
+    _ts: Optional[str] = Query(None),
+):
+    """API: Return MP3 preview for a translation segment (supports original vs translated variants)."""
+    safe_session_id = "".join(c for c in session_id if c.isalnum() or c in {"-", "_"})
+    variant_value = (variant or "auto").lower()
+    force_preview = variant_value == "preview"
+    force_original = variant_value == "original"
+
+    def _candidate_paths(suffix: str) -> List[str]:
+        candidates = [os.path.join(TRANSLATE_SESSION_MEDIA_DIR, f"{safe_session_id}_{suffix}")]
+        if safe_session_id != session_id:
+            candidates.append(os.path.join(TRANSLATE_SESSION_MEDIA_DIR, f"{session_id}_{suffix}"))
+        return candidates
+
+    def _resolve_existing_path(candidates: List[str]) -> Optional[str]:
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return None
+
+    preview_candidates = _candidate_paths(f"segment_{segment_index}_preview.mp3")
+    original_candidates = _candidate_paths(f"segment_{segment_index}.mp3")
+
+    file_path: Optional[str] = None
+    preview_path = _resolve_existing_path(preview_candidates)
+    if preview_path and not force_original:
+        file_path = preview_path
+
+    if file_path is None:
+        if force_preview:
+            raise HTTPException(status_code=404, detail="Preview audio not generated yet")
+        original_path = _resolve_existing_path(original_candidates)
+        if original_path:
+            file_path = original_path
+        else:
+            # Need to generate the original snippet on-demand
+            session = await _get_translate_session(session_id)
+            if not session:
+                raise HTTPException(status_code=404, detail="Session not found or expired")
+
+            segment = None
+            for seg in session.base_segments:
+                if seg.get("index") == segment_index:
+                    segment = seg
+                    break
+
+            if not segment:
+                raise HTTPException(status_code=404, detail=f"Segment {segment_index} not found in session")
+
+            try:
+                original_audio = _get_session_original_audio(session)
+                start_ms = int(segment.get("start_ms", 0))
+                end_ms = int(segment.get("end_ms", start_ms))
+
+                preview_result = _save_segment_audio_preview(
+                    session_id,
+                    segment_index,
+                    original_audio,
+                    start_ms,
+                    end_ms,
+                )
+
+                if preview_result:
+                    file_path = _resolve_existing_path(original_candidates)
+                    if not file_path:
+                        file_path = original_candidates[0]
+                        if not os.path.exists(file_path):
+                            raise HTTPException(status_code=500, detail="Generated preview file is missing")
+                else:
+                    raise HTTPException(status_code=500, detail="Failed to generate segment preview")
+            except Exception as exc:
+                print(f"⚠️ Failed to generate segment preview on-demand: {exc}")
+                raise HTTPException(status_code=500, detail=f"Failed to generate preview: {str(exc)}")
+    
+    return FileResponse(
+        file_path,
+        media_type="audio/mpeg",
+        filename=f"segment_{segment_index}.mp3",
+        headers={"Cache-Control": "public, max-age=3600"},
     )
 
 
