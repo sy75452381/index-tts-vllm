@@ -142,6 +142,7 @@ DEFAULT_GEMINI_TEMPERATURE = 0.2
 DEFAULT_GEMINI_TOP_P = 0.9
 TRANSLATE_DEFAULT_OUTPUT_FORMAT = "mp3"
 TRANSLATE_DEFAULT_BITRATE = "128k"
+CHUNK_SESSION_CREATION_CONCURRENCY = 4
 AUDIO_GENERATION_MARGIN_MS = 20
 TRANSLATION_TTS_CONCURRENCY = 20
 MIN_SPEECH_DURATION_MS = 3000
@@ -523,16 +524,29 @@ async def _prepare_audio_assets(
                 },
             )
         input_mime_type = reuse_source_session.input_mime_type or audio_mime_type_value or "audio/wav"
+        processed_audio_bytes: Optional[bytes] = None
+        reuse_audio_path = getattr(reuse_source_session, "original_audio_path", None)
+        if (
+            reuse_audio_path
+            and reuse_audio_path.lower().endswith(".mp3")
+            and os.path.exists(reuse_audio_path)
+        ):
+            processed_audio_bytes = _read_file_bytes(reuse_audio_path)
+            if processed_audio_bytes is None:
+                print(
+                    f"⚠️ Falling back to re-export for Gemini input; failed to read cached chunk '{reuse_audio_path}'."
+                )
         if emit_status:
             await emit_status(
                 stage="decode",
                 message=f"Reusing audio from session {reuse_source_session.session_id}.",
             )
-        processed_audio_bytes = await _export_audio_segment_bytes(
-            original_audio,
-            fmt="mp3",
-            bitrate=GEMINI_AUDIO_EXPORT_BITRATE,
-        )
+        if processed_audio_bytes is None:
+            processed_audio_bytes = await _export_audio_segment_bytes(
+                original_audio,
+                fmt="mp3",
+                bitrate=GEMINI_AUDIO_EXPORT_BITRATE,
+            )
         backing_track_audio = custom_backing_audio or _get_session_backing_audio(reuse_source_session)
         if custom_backing_audio is not None:
             backing_track_source = "custom"
@@ -698,6 +712,9 @@ async def _build_translation_segments(
     source_audio_filename: Optional[str] = None,
     source_base_name: Optional[str] = None,
     force_gemini_regenerate: bool = False,
+    initial_speaker_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    default_speaker_preset: Optional[str] = None,
+    default_emotion_weight: Optional[float] = None,
 ) -> SegmentBuildResult:
     manual_chunk_data = None
     manual_speaker_profiles: List[Dict[str, Any]] = []
@@ -761,6 +778,36 @@ async def _build_translation_segments(
         max_merge_interval_ms=max_merge_interval,
     )
 
+    detected_speaker_ids: Set[str] = set()
+    for segment in segments:
+        speaker_label = str(segment.get("speaker") or "").strip().lower()
+        if speaker_label:
+            detected_speaker_ids.add(speaker_label)
+
+    normalized_overrides = _normalize_speaker_overrides(
+        initial_speaker_overrides,
+        speaker_profiles,
+    )
+    normalized_default_speaker = (default_speaker_preset or "").strip()
+    normalized_default_emotion = _coerce_emotion_weight(
+        default_emotion_weight,
+        DEFAULT_EMOTION_WEIGHT,
+    )
+    if normalized_default_speaker:
+        if not detected_speaker_ids and speaker_profiles:
+            for profile in speaker_profiles:
+                profile_id = str(profile.get("id") or "").strip().lower()
+                if profile_id:
+                    detected_speaker_ids.add(profile_id)
+        for speaker_id in detected_speaker_ids:
+            if not speaker_id or speaker_id in normalized_overrides:
+                continue
+            normalized_overrides[speaker_id] = {
+                "preset_name": normalized_default_speaker,
+                "use_emotion_prompt": True,
+                "emotion_weight": normalized_default_emotion,
+            }
+
     if not translate_enabled:
         for segment in segments:
             if segment.get("type") != "speech":
@@ -794,10 +841,13 @@ async def _build_translation_segments(
         backing_volume_percent=backing_volume_percent_value,
         silence_volume_percent=silence_volume_percent_value,
         speaker_profiles=speaker_profiles,
+        speaker_overrides=normalized_overrides,
         gemini_raw_text=raw_gemini_response_text,
         backing_track_source=backing_track_source,
         source_audio_filename=source_audio_filename,
         source_base_name=source_base_name,
+        default_speaker_preset=normalized_default_speaker,
+        default_emotion_weight=normalized_default_emotion,
     )
     if source_chunk_session and source_chunk_session.chunk_parent_id:
         session.chunk_parent_id = source_chunk_session.chunk_parent_id
@@ -833,6 +883,8 @@ async def _build_translation_segments(
             "enhancement": apply_enhancement,
             "super_resolution": apply_super_resolution,
         },
+        "default_speaker_preset": normalized_default_speaker,
+        "default_emotion_weight": normalized_default_emotion,
         "backing_track": {
             "available": backing_track_audio is not None,
             "requested": merge_with_backing or False,
@@ -931,6 +983,8 @@ class TranslateSessionData:
     silence_volume_percent: float = DEFAULT_SILENCE_VOLUME_PERCENT
     speaker_profiles: List[Dict[str, Any]] = field(default_factory=list)
     speaker_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    default_speaker_preset: Optional[str] = None
+    default_emotion_weight: float = DEFAULT_EMOTION_WEIGHT
     gemini_raw_text: Optional[str] = None
     created_at: float = field(default_factory=lambda: time.time())
     chunk_parent_id: Optional[str] = None
@@ -972,6 +1026,15 @@ def _compute_file_md5(path: str) -> str:
 
 def _compute_bytes_md5(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
+
+
+def _read_file_bytes(path: str) -> Optional[bytes]:
+    try:
+        with open(path, "rb") as infile:
+            return infile.read()
+    except Exception as exc:
+        print(f"⚠️ Failed to read binary file '{path}': {exc}")
+        return None
 
 
 def _gemini_cache_key(
@@ -2185,6 +2248,8 @@ async def _generate_chunk_audio_from_session(
     merge_backing_track: bool,
     silence_volume_percent: float,
     force_gemini_regenerate: bool = False,
+    default_speaker_preset: Optional[str] = None,
+    default_emotion_weight: Optional[float] = None,
 ) -> Tuple[str, str, Dict[str, Any]]:
     clearvoice_settings = chunk_session.clearvoice_settings or {}
     apply_enhancement = bool(clearvoice_settings.get("enhancement"))
@@ -2257,6 +2322,9 @@ async def _generate_chunk_audio_from_session(
         source_audio_filename=chunk_session.source_audio_filename,
         source_base_name=chunk_session.source_base_name,
         force_gemini_regenerate=force_gemini_regenerate,
+        initial_speaker_overrides=chunk_session.speaker_overrides,
+        default_speaker_preset=default_speaker_preset,
+        default_emotion_weight=default_emotion_weight,
     )
 
     audio_payload, _media_type, synthesis_metadata = await _synthesize_translated_audio(
@@ -2275,6 +2343,8 @@ async def _generate_chunk_audio_from_session(
         silence_volume_percent=silence_volume_percent,
         speaker_overrides=chunk_session.speaker_overrides,
         backing_volume_percent=backing_volume_percent,
+        default_speaker_preset=default_speaker_preset,
+        default_emotion_weight=default_emotion_weight,
     )
 
     metadata = dict(segment_result.metadata)
@@ -2286,6 +2356,8 @@ async def _generate_chunk_audio_from_session(
     metadata["silence_volume_percent"] = silence_volume_percent
     metadata["gemini_model"] = gemini_model
     metadata["output_base_name"] = resolved_base_name
+    metadata["default_speaker_preset"] = default_speaker_preset
+    metadata["default_emotion_weight"] = default_emotion_weight
 
     language_code = _language_code_from_label(dest_language)
     base_stem = _compose_output_stem(resolved_base_name, chunk_index=chunk_session.chunk_index)
@@ -3475,12 +3547,20 @@ async def _create_translate_session(
     media_format: str = "wav",
     source_audio_filename: Optional[str] = None,
     source_base_name: Optional[str] = None,
+    default_speaker_preset: Optional[str] = None,
+    default_emotion_weight: Optional[float] = None,
 ) -> TranslateSessionData:
     session_id = uuid.uuid4().hex
     resolved_base_name = _normalize_base_filename(
         source_base_name,
         fallback=source_audio_filename,
     )
+    normalized_default_speaker = (default_speaker_preset or "").strip() or None
+    normalized_default_emotion = _coerce_emotion_weight(
+        default_emotion_weight,
+        DEFAULT_EMOTION_WEIGHT,
+    )
+
     session = TranslateSessionData(
         session_id=session_id,
         original_audio=original_audio,
@@ -3505,6 +3585,8 @@ async def _create_translate_session(
         silence_volume_percent=silence_volume_percent,
         speaker_profiles=copy.deepcopy(speaker_profiles or []),
         speaker_overrides=copy.deepcopy(speaker_overrides or {}),
+        default_speaker_preset=normalized_default_speaker,
+        default_emotion_weight=normalized_default_emotion,
         gemini_raw_text=gemini_raw_text,
         source_audio_filename=source_audio_filename,
         source_base_name=resolved_base_name,
@@ -3908,6 +3990,8 @@ async def _synthesize_translated_audio(
     speaker_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     backing_volume_percent: float = DEFAULT_GENERATED_VOLUME_PERCENT,
     pad_to_original: bool = True,
+    default_speaker_preset: Optional[str] = None,
+    default_emotion_weight: Optional[float] = None,
 ) -> Tuple[bytes, str, Dict[str, Any]]:
     tts = tts_manager.get_tts()
     frame_rate = int(original_audio.frame_rate or 22050)
@@ -3920,6 +4004,11 @@ async def _synthesize_translated_audio(
     override_map: Dict[str, Dict[str, Any]] = {
         str(key).lower(): value for key, value in (speaker_overrides or {}).items()
     }
+    normalized_default_speaker = (default_speaker_preset or "").strip()
+    normalized_default_emotion = _coerce_emotion_weight(
+        default_emotion_weight,
+        DEFAULT_EMOTION_WEIGHT,
+    )
     silence_volume_percent = _coerce_volume_percent(
         silence_volume_percent,
         DEFAULT_SILENCE_VOLUME_PERCENT,
@@ -3983,6 +4072,10 @@ async def _synthesize_translated_audio(
                     override_config.get("emotion_weight"),
                     DEFAULT_EMOTION_WEIGHT,
                 )
+        if not preset_name and normalized_default_speaker:
+            preset_name = normalized_default_speaker
+            use_emotion_prompt = True
+            speaker_emotion_weight = normalized_default_emotion
         segment_volume_percent: Optional[float] = None
         raw_segment_volume = segment.get("volume_percent")
         if raw_segment_volume is not None:
@@ -4714,6 +4807,14 @@ class TranslateRequest(BaseModel):
         default=None,
         description="Reuse a previous translate session (e.g., from chunk splitting) instead of uploading audio again.",
     )
+    default_speaker_preset: Optional[str] = Field(
+        default=None,
+        description="Optional speaker preset to apply to all detected voices (leave empty to clone originals).",
+    )
+    default_emotion_weight: Optional[float] = Field(
+        default=None,
+        description="Emotion weight (0.0-1.0) when using the original emotion prompt for the default speaker.",
+    )
 
 
 class SpeakerOverrideInput(BaseModel):
@@ -4894,6 +4995,14 @@ class ChunkBatchGenerateRequest(BaseModel):
     force_gemini_regenerate: Optional[bool] = Field(
         default=False,
         description="Force Gemini to reprocess audio even if cache entries exist.",
+    )
+    default_speaker_preset: Optional[str] = Field(
+        default=None,
+        description="Optional speaker preset to apply across all generated chunks.",
+    )
+    default_emotion_weight: Optional[float] = Field(
+        default=None,
+        description="Emotion weight (0.0-1.0) when cloning emotion prompts for the default speaker.",
     )
 
 
@@ -6084,6 +6193,7 @@ async def home():
                                                 <div id="translateSplitStatus" class="status"></div>
                                                 <div style="margin-top: 12px;">
                                                     <button type="button" class="btn btn-secondary" id="translateMergeChunksBtn" style="display: none;">🔗 Merge All Chunks</button>
+                                                    <div id="translateMergeStatus" class="status"></div>
                                                 </div>
                                             </div>
                                         </div>
@@ -6200,6 +6310,32 @@ async def home():
                                             </div>
                                             <small style="color: #666; margin-top: 5px; display: block;">
                                                 These values control Gemini segment stitching. Lower min duration keeps shorter phrases; higher max merge gap allows merging across longer silences, and setting the max gap to 0 skips automatic merging entirely.
+                                            </small>
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="translateDefaultSpeaker">Default Speaker (optional):</label>
+                                            <select id="translateDefaultSpeaker">
+                                                <option value="">Auto (clone original voice)</option>
+                                            </select>
+                                            <small style="color: #666; display: block; margin-top: 6px;">
+                                                Pick a speaker preset to apply across the translation. Leave on Auto to keep each detected speaker's original voice.
+                                            </small>
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="translateDefaultEmotionWeight">
+                                                Default emotion weight:
+                                                <span id="translateDefaultEmotionWeightValue">0.60</span>
+                                            </label>
+                                            <input
+                                                type="number"
+                                                id="translateDefaultEmotionWeight"
+                                                min="0"
+                                                max="1"
+                                                step="0.05"
+                                                value="0.6"
+                                            >
+                                            <small style="color: #666; display: block; margin-top: 6px;">
+                                                Controls how strongly the original emotional style is blended when using a default speaker preset.
                                             </small>
                                         </div>
                                         <div class="form-group">
@@ -6728,6 +6864,7 @@ async def home():
                         speakerPresetMeta = speakerMeta;
                         const roles = data.roles && data.roles.length ? data.roles : Object.keys(speakerMeta || {});
                         availableSpeakerPresets = roles || [];
+                        refreshDefaultSpeakerOptions();
                         (roles || []).forEach(speaker => {
                             const option = document.createElement('option');
                             option.value = speaker;
@@ -6919,37 +7056,52 @@ async def home():
             });
 
             // TTS Form
-            document.getElementById('ttsForm').addEventListener('submit', async function(e) {
-                e.preventDefault();
-                
-                const formData = new FormData(this);
-                const text = formData.get('text');
-                const speaker = formData.get('speaker');
-                const emotionText = document.getElementById('emotionText').value;
-                const emotionWeight = parseFloat(document.getElementById('emotionWeight').value);
-                const diffusionSteps = parseInt(document.getElementById('diffusionSteps').value);
-                const maxTextTokens = parseInt(document.getElementById('maxTextTokens').value);
-                const streamingMode = document.getElementById('streamingMode').checked;
-                
-                if (!text.trim()) {
-                    showStatus('Please enter some text to synthesize.', 'error');
-                    return;
-                }
-                
-                try {
-                    const startTime = performance.now();
+            const ttsForm = document.getElementById('ttsForm');
+            const generateBtn = document.getElementById('generateBtn');
+            const generateBtnDefaultHtml = generateBtn ? generateBtn.innerHTML : '';
+            if (ttsForm) {
+                ttsForm.addEventListener('submit', async function(e) {
+                    e.preventDefault();
                     
-                    if (streamingMode) {
-                        // Streaming mode
-                        await handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, formData, startTime);
-                    } else {
-                        // Regular mode
-                        await handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, formData, startTime);
+                    const formData = new FormData(this);
+                    const text = formData.get('text');
+                    const speaker = formData.get('speaker');
+                    const emotionText = document.getElementById('emotionText').value;
+                    const emotionWeight = parseFloat(document.getElementById('emotionWeight').value);
+                    const diffusionSteps = parseInt(document.getElementById('diffusionSteps').value);
+                    const maxTextTokens = parseInt(document.getElementById('maxTextTokens').value);
+                    const streamingMode = document.getElementById('streamingMode').checked;
+                    
+                    if (!text.trim()) {
+                        showStatus('Please enter some text to synthesize.', 'error');
+                        return;
                     }
-                } catch (error) {
-                    showStatus(`Network error: ${error.message}`, 'error');
-                }
-            });
+
+                    if (generateBtn) {
+                        generateBtn.disabled = true;
+                        generateBtn.innerHTML = '⏳ Generating...';
+                    }
+                    
+                    try {
+                        const startTime = performance.now();
+                        
+                        if (streamingMode) {
+                            // Streaming mode
+                            await handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, formData, startTime);
+                        } else {
+                            // Regular mode
+                            await handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, formData, startTime);
+                        }
+                    } catch (error) {
+                        showStatus(`Network error: ${error.message}`, 'error');
+                    } finally {
+                        if (generateBtn) {
+                            generateBtn.disabled = false;
+                            generateBtn.innerHTML = generateBtnDefaultHtml || '🎵 Generate Speech';
+                        }
+                    }
+                });
+            }
 
             const translateBtn = document.getElementById('translateBtn');
             const translateAdvancedToggle = document.getElementById('translateAdvancedMode');
@@ -6992,6 +7144,9 @@ async def home():
             const translateVolumeInput = document.getElementById('translateVolumePercent');
             const translateBackingVolumeInput = document.getElementById('translateBackingVolumePercent');
             const translateSpeakerAssignments = document.getElementById('translateSpeakerAssignments');
+            const translateDefaultSpeakerSelect = document.getElementById('translateDefaultSpeaker');
+            const translateDefaultEmotionWeightInput = document.getElementById('translateDefaultEmotionWeight');
+            const translateDefaultEmotionWeightValue = document.getElementById('translateDefaultEmotionWeightValue');
             const translateEnableChunkSplit = document.getElementById('translateEnableChunkSplit');
             const translateChunkSettings = document.getElementById('translateChunkSettings');
             const translateSplitAudioBtn = document.getElementById('translateSplitAudioBtn');
@@ -7010,6 +7165,7 @@ async def home():
             const translateChunkBatchControls = document.getElementById('translateChunkBatchControls');
             const translateChunkSelectPending = document.getElementById('translateChunkSelectPending');
             const translateGenerateChunksBtn = document.getElementById('translateGenerateChunksBtn');
+            const translateMergeStatus = document.getElementById('translateMergeStatus');
             const translateChunkBatchStatus = document.getElementById('translateChunkBatchStatus');
             const translateAudioInput = document.getElementById('translateAudioFile');
             const translateBaseFilenameInput = document.getElementById('translateBaseFilename');
@@ -7032,6 +7188,38 @@ async def home():
                 transcription: '',
                 ignoreNonSpeech: '',
             };
+            function refreshDefaultSpeakerOptions() {
+                if (!translateDefaultSpeakerSelect) {
+                    return;
+                }
+                const previousValue = translateDefaultSpeakerSelect.value || '';
+                translateDefaultSpeakerSelect.innerHTML = '<option value="">Auto (clone original voice)</option>';
+                availableSpeakerPresets.forEach(name => {
+                    if (!name) {
+                        return;
+                    }
+                    const option = document.createElement('option');
+                    option.value = name;
+                    option.textContent = name;
+                    translateDefaultSpeakerSelect.appendChild(option);
+                });
+                if (previousValue && availableSpeakerPresets.includes(previousValue)) {
+                    translateDefaultSpeakerSelect.value = previousValue;
+                }
+            }
+            function syncDefaultEmotionWeightDisplay() {
+                if (!translateDefaultEmotionWeightInput || !translateDefaultEmotionWeightValue) {
+                    return;
+                }
+                const parsed = parseFloat(translateDefaultEmotionWeightInput.value);
+                const safeValue = Number.isNaN(parsed) ? DEFAULT_EMOTION_WEIGHT : parsed;
+                translateDefaultEmotionWeightValue.textContent = safeValue.toFixed(2);
+            }
+            if (translateDefaultEmotionWeightInput) {
+                translateDefaultEmotionWeightInput.addEventListener('input', syncDefaultEmotionWeightDisplay);
+                translateDefaultEmotionWeightInput.addEventListener('change', syncDefaultEmotionWeightDisplay);
+                syncDefaultEmotionWeightDisplay();
+            }
             const NON_SPEECH_PLACEHOLDER = '{non_speech_instruction}';
             let autoManualSegmentsApplied = false;
             let translateChunkSessions = [];
@@ -7110,6 +7298,9 @@ async def home():
                 if (translateMergeChunksBtn) {
                     translateMergeChunksBtn.style.display = 'none';
                 }
+                if (translateMergeStatus) {
+                    hideStatus('translateMergeStatus');
+                }
                 if (translateChunkSelectPending) {
                     translateChunkSelectPending.checked = false;
                     translateChunkSelectPending.disabled = true;
@@ -7171,6 +7362,9 @@ async def home():
                     if (translateMergeChunksBtn) {
                         translateMergeChunksBtn.style.display = 'none';
                     }
+                    if (translateMergeStatus) {
+                        hideStatus('translateMergeStatus');
+                    }
                     updateChunkSelectionUI();
                     return;
                 }
@@ -7185,6 +7379,9 @@ async def home():
                 translateChunkSummary.textContent = summaryParts.join(' • ');
                 if (translateMergeChunksBtn) {
                     translateMergeChunksBtn.style.display = translateChunkSessions.length > 1 ? 'inline-flex' : 'none';
+                }
+                if (translateMergeStatus && translateChunkSessions.length <= 1) {
+                    hideStatus('translateMergeStatus');
                 }
                 const cacheBuster = Date.now();
                 translateChunkList.innerHTML = translateChunkSessions
@@ -7378,11 +7575,11 @@ async def home():
             }
 
             async function handleMergeChunks() {
+                const statusId = translateMergeStatus ? 'translateMergeStatus' : 'translateStatus';
                 if (!translateChunkSessions.length) {
-                    showStatus('Split audio into chunks before merging.', 'error', 'translateStatus');
+                    showStatus('Split audio into chunks before merging.', 'error', statusId);
                     return;
                 }
-                const statusId = 'translateStatus';
                 const formatSelect = document.getElementById('translateOutputFormat');
                 const selectedFormat = (formatSelect && formatSelect.value ? formatSelect.value : 'mp3').toLowerCase();
                 const payload = {
@@ -7392,6 +7589,9 @@ async def home():
                     merge_backing_track: translateMergeBackEl && translateMergeBackEl.checked ? true : false,
                 };
                 try {
+                    if (translateMergeChunksBtn) {
+                        translateMergeChunksBtn.disabled = true;
+                    }
                     showStatus('Merging chunk outputs... ⏳', 'success', statusId);
                     const response = await fetch('/api/translate_merge_chunks', {
                         method: 'POST',
@@ -7408,6 +7608,10 @@ async def home():
                     showStatus(data.message || 'Chunks merged successfully.', 'success', statusId);
                 } catch (error) {
                     showStatus(`Merge failed: ${error.message}`, 'error', statusId);
+                } finally {
+                    if (translateMergeChunksBtn) {
+                        translateMergeChunksBtn.disabled = false;
+                    }
                 }
             }
 
@@ -7440,6 +7644,15 @@ async def home():
                 payload.ignore_non_speech = translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? true : false;
                 payload.preserve_silence_audio = translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? true : false;
                 payload.force_gemini_regenerate = !!(translateForceGeminiRefresh && translateForceGeminiRefresh.checked);
+                if (translateDefaultSpeakerSelect && translateDefaultSpeakerSelect.value.trim()) {
+                    payload.default_speaker_preset = translateDefaultSpeakerSelect.value.trim();
+                }
+                if (translateDefaultEmotionWeightInput && translateDefaultEmotionWeightInput.value) {
+                    const defaultEmotion = parseFloat(translateDefaultEmotionWeightInput.value);
+                    if (!Number.isNaN(defaultEmotion)) {
+                        payload.default_emotion_weight = defaultEmotion;
+                    }
+                }
                 if (translateVolumeInput && translateVolumeInput.value) {
                     const volumeValue = parseFloat(translateVolumeInput.value);
                     if (!Number.isNaN(volumeValue)) {
@@ -8254,6 +8467,18 @@ async def home():
                     const silenceValue = (translateSilenceVolumeInput.value || '').trim();
                     if (silenceValue) {
                         formData.append('silence_volume_percent', silenceValue);
+                    }
+                }
+                if (translateDefaultSpeakerSelect) {
+                    const defaultSpeaker = (translateDefaultSpeakerSelect.value || '').trim();
+                    if (defaultSpeaker) {
+                        formData.append('default_speaker_preset', defaultSpeaker);
+                    }
+                }
+                if (translateDefaultEmotionWeightInput) {
+                    const weightValue = (translateDefaultEmotionWeightInput.value || '').trim();
+                    if (weightValue) {
+                        formData.append('default_emotion_weight', weightValue);
                     }
                 }
             }
@@ -9236,6 +9461,31 @@ async def home():
                 ) {
                     translateSilenceVolumeInput.value = metadata.silence_volume_percent;
                     syncSilenceVolumeUI();
+                }
+                if (translateDefaultSpeakerSelect) {
+                    const metadataSpeaker = typeof metadata.default_speaker_preset === 'string' ? metadata.default_speaker_preset.trim() : '';
+                    if (metadataSpeaker) {
+                        const hasOption = Array.from(translateDefaultSpeakerSelect.options || []).some(
+                            option => option.value === metadataSpeaker
+                        );
+                        if (!hasOption) {
+                            const option = document.createElement('option');
+                            option.value = metadataSpeaker;
+                            option.textContent = metadataSpeaker;
+                            translateDefaultSpeakerSelect.appendChild(option);
+                        }
+                        translateDefaultSpeakerSelect.value = metadataSpeaker;
+                    } else {
+                        translateDefaultSpeakerSelect.value = '';
+                    }
+                }
+                if (
+                    translateDefaultEmotionWeightInput &&
+                    typeof metadata.default_emotion_weight === 'number' &&
+                    !Number.isNaN(metadata.default_emotion_weight)
+                ) {
+                    translateDefaultEmotionWeightInput.value = metadata.default_emotion_weight.toFixed(2);
+                    syncDefaultEmotionWeightDisplay();
                 }
                 if (translateManualSegmentsToggle && translateManualSegmentsInput) {
                     let manualText = '';
@@ -10776,18 +11026,37 @@ async def api_translate_split_audio(
                         ]
 
                     chunk_entries: List[Dict[str, Any]] = []
+                    chunk_specs: List[Dict[str, Any]] = []
                     total_duration_ms = len(processed_audio)
                     gemini_model_name = _get_gemini_model_name()
                     chunk_batch_id = uuid.uuid4().hex
-                    _persist_chunk_batch_media(chunk_batch_id, processed_audio, "vocals_full")
+                    persist_tasks: List[asyncio.Task] = []
+                    persist_tasks.append(
+                        asyncio.create_task(
+                            _run_blocking(
+                                _persist_chunk_batch_media,
+                                chunk_batch_id,
+                                processed_audio,
+                                "vocals_full",
+                            )
+                        )
+                    )
                     if backing_track_audio is not None:
-                        _persist_chunk_batch_media(chunk_batch_id, backing_track_audio, "backing_full")
+                        persist_tasks.append(
+                            asyncio.create_task(
+                                _run_blocking(
+                                    _persist_chunk_batch_media,
+                                    chunk_batch_id,
+                                    backing_track_audio,
+                                    "backing_full",
+                                )
+                            )
+                        )
 
                     await emit_status(
                         stage="chunking",
                         message=f"Creating up to {len(chunk_ranges)} chunk session(s)...",
                     )
-                    created_chunks = 0
                     
                     # Collect chunk audio segments for caching (if not using cache)
                     new_chunk_segments = [] if not use_cached_chunks else None
@@ -10799,6 +11068,7 @@ async def api_translate_split_audio(
                         if duration_ms < CHUNK_SPLIT_MIN_CHUNK_MS:
                             continue
                         
+                        chunk_mp3_path = None
                         # When using cache, reference cached file directly; otherwise split from full audio
                         if use_cached_chunks:
                             # Use cached MP3 - create minimal AudioSegment to satisfy interface
@@ -10811,49 +11081,81 @@ async def api_translate_split_audio(
                             chunk_audio = processed_audio[start_ms:end_ms]
                             new_chunk_segments.append(chunk_audio)
 
-                        chunk_session = await _create_translate_session(
-                            chunk_audio,
-                            dest_language_value,
-                            prompt="",
-                            translate_enabled=True,
-                            response_format=TRANSLATE_DEFAULT_OUTPUT_FORMAT,
-                            bitrate=TRANSLATE_DEFAULT_BITRATE,
-                            input_mime_type=input_mime_type_value,
-                            clearvoice_settings={"enhancement": True, "super_resolution": apply_super_resolution},
-                            base_segments=[],
-                            gemini_chunks=[],
-                            gemini_model=gemini_model_name,
-                            gemini_api_key=None,
-                            backing_track_audio=None,
-                            backing_track_source="none",
-                            merge_with_backing=False,
-                            ignore_non_speech=False,
-                            preserve_silence_audio=False,
-                            generated_volume_percent=DEFAULT_GENERATED_VOLUME_PERCENT,
-                            backing_volume_percent=DEFAULT_GENERATED_VOLUME_PERCENT,
-                            chunk_parent_id=chunk_batch_id,
-                            chunk_index=chunk_idx,
-                            chunk_start_ms=start_ms,
-                            chunk_end_ms=end_ms,
-                            chunk_cut_reason=entry.get("cut_reason"),
-                            chunk_silence_midpoint_ms=entry.get("silence_midpoint_ms"),
-                            persist_media=False,  # Never persist - either using cache or will save later
-                            source_audio_filename=uploaded_filename,
-                            source_base_name=resolved_base_name,
+                        chunk_specs.append(
+                            {
+                                "chunk_idx": chunk_idx,
+                                "chunk_audio": chunk_audio,
+                                "chunk_mp3_path": chunk_mp3_path,
+                                "start_ms": start_ms,
+                                "end_ms": end_ms,
+                                "cut_reason": entry.get("cut_reason"),
+                                "silence_midpoint_ms": entry.get("silence_midpoint_ms"),
+                            }
                         )
-                        
-                        # If using cache, point directly to cached MP3 file instead of keeping audio in memory
-                        if use_cached_chunks:
-                            chunk_session.original_audio = None  # Clear placeholder
-                            chunk_session.original_audio_path = chunk_mp3_path  # Point to cached file
 
-                        chunk_entry = _serialize_chunk_session(chunk_session)
-                        chunk_entries.append(chunk_entry)
-                        created_chunks += 1
-                        await emit_status(
-                            stage="chunking",
-                            message=f"Chunk {created_chunks} created (target {len(chunk_ranges)}).",
+                    if chunk_specs:
+                        chunk_counter_lock = asyncio.Lock()
+                        created_chunk_counter = 0
+                        semaphore = asyncio.Semaphore(CHUNK_SESSION_CREATION_CONCURRENCY)
+
+                        async def _build_chunk_session(spec: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+                            nonlocal created_chunk_counter
+                            async with semaphore:
+                                chunk_session = await _create_translate_session(
+                                    spec["chunk_audio"],
+                                    dest_language_value,
+                                    prompt="",
+                                    translate_enabled=True,
+                                    response_format=TRANSLATE_DEFAULT_OUTPUT_FORMAT,
+                                    bitrate=TRANSLATE_DEFAULT_BITRATE,
+                                    input_mime_type=input_mime_type_value,
+                                    clearvoice_settings={
+                                        "enhancement": True,
+                                        "super_resolution": apply_super_resolution,
+                                    },
+                                    base_segments=[],
+                                    gemini_chunks=[],
+                                    gemini_model=gemini_model_name,
+                                    gemini_api_key=None,
+                                    backing_track_audio=None,
+                                    backing_track_source="none",
+                                    merge_with_backing=False,
+                                    ignore_non_speech=False,
+                                    preserve_silence_audio=False,
+                                    generated_volume_percent=DEFAULT_GENERATED_VOLUME_PERCENT,
+                                    backing_volume_percent=DEFAULT_GENERATED_VOLUME_PERCENT,
+                                    chunk_parent_id=chunk_batch_id,
+                                    chunk_index=spec["chunk_idx"],
+                                    chunk_start_ms=spec["start_ms"],
+                                    chunk_end_ms=spec["end_ms"],
+                                    chunk_cut_reason=spec["cut_reason"],
+                                    chunk_silence_midpoint_ms=spec["silence_midpoint_ms"],
+                                    persist_media=False,
+                                    source_audio_filename=uploaded_filename,
+                                    source_base_name=resolved_base_name,
+                                )
+
+                                if use_cached_chunks and spec["chunk_mp3_path"]:
+                                    chunk_session.original_audio = None
+                                    chunk_session.original_audio_path = spec["chunk_mp3_path"]
+
+                                chunk_entry = _serialize_chunk_session(chunk_session)
+
+                            async with chunk_counter_lock:
+                                created_chunk_counter += 1
+                                progress_idx = created_chunk_counter
+
+                            await emit_status(
+                                stage="chunking",
+                                message=f"Chunk {progress_idx} created (target {len(chunk_specs)}).",
+                            )
+                            return spec["chunk_idx"], chunk_entry
+
+                        chunk_results = await asyncio.gather(
+                            *[asyncio.create_task(_build_chunk_session(spec)) for spec in chunk_specs]
                         )
+                        chunk_results.sort(key=lambda item: item[0])
+                        chunk_entries = [entry for _, entry in chunk_results]
                     
                     # Save to cache if we just split the audio (not using cache)
                     if new_chunk_segments is not None and len(new_chunk_segments) > 0:
@@ -10903,6 +11205,9 @@ async def api_translate_split_audio(
                             source_base_name=resolved_base_name,
                         )
                         chunk_entries.append(_serialize_chunk_session(fallback_session))
+
+                    if persist_tasks:
+                        await asyncio.gather(*persist_tasks)
 
                     if not chunk_entries:
                         raise TranslateWorkflowHttpError(
@@ -11221,6 +11526,23 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
             else config_template.merge_with_backing
         )
         force_gemini_regenerate_flag = _coerce_to_bool(payload.force_gemini_regenerate or False)
+        default_speaker_value = (payload.default_speaker_preset or "").strip()
+        if not default_speaker_value:
+            default_speaker_value = (getattr(config_template, "default_speaker_preset", None) or "").strip()
+        default_emotion_weight_value = (
+            payload.default_emotion_weight
+            if payload.default_emotion_weight is not None
+            else getattr(config_template, "default_emotion_weight", None)
+        )
+        default_emotion_weight_value = _coerce_emotion_weight(
+            default_emotion_weight_value,
+            DEFAULT_EMOTION_WEIGHT,
+        )
+
+        for session in sessions:
+            if default_speaker_value:
+                session.default_speaker_preset = default_speaker_value
+            session.default_emotion_weight = default_emotion_weight_value
 
         summary_payload = {
             "chunks": len(sessions),
@@ -11288,6 +11610,8 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
                             merge_backing_track=merge_backing_requested,
                             silence_volume_percent=silence_volume_percent_value,
                             force_gemini_regenerate=force_gemini_regenerate_flag,
+                            default_speaker_preset=session.default_speaker_preset,
+                            default_emotion_weight=session.default_emotion_weight,
                         )
                         async with counter_lock:
                             success_count += 1
@@ -11386,6 +11710,8 @@ async def api_translate_segments(
     audio_file: Optional[UploadFile] = File(None),
     custom_backing_audio_file: Optional[UploadFile] = File(None),
     force_gemini_regenerate: Optional[bool] = Form(False),
+    default_speaker_preset: Optional[str] = Form(None),
+    default_emotion_weight: Optional[float] = Form(None),
 ):
     """API: Prepare translation segments for advanced translate/edit workflow."""
     reuse_session_id_value: Optional[str] = reuse_session_id
@@ -11416,6 +11742,8 @@ async def api_translate_segments(
         silence_volume_percent_value = silence_volume_percent
         uploaded_filename = audio_file.filename if audio_file else None
         force_gemini_regen_value = force_gemini_regenerate
+        default_speaker_value = default_speaker_preset
+        default_emotion_weight_value = default_emotion_weight
 
         content_type = request.headers.get("content-type", "")
         if (
@@ -11470,6 +11798,10 @@ async def api_translate_segments(
             )
             reuse_session_id_value = payload.get("reuse_session_id", reuse_session_id_value)
             force_gemini_regen_value = payload.get("force_gemini_regenerate", force_gemini_regen_value)
+            if payload.get("default_speaker_preset"):
+                default_speaker_value = payload.get("default_speaker_preset")
+            if "default_emotion_weight" in payload:
+                default_emotion_weight_value = payload.get("default_emotion_weight", default_emotion_weight_value)
 
         dest_language_value = (dest_language_value or "").strip()
         if not dest_language_value:
@@ -11514,6 +11846,7 @@ async def api_translate_segments(
             DEFAULT_SILENCE_VOLUME_PERCENT,
         )
         force_gemini_regenerate_flag = _coerce_to_bool(force_gemini_regen_value or False)
+        default_speaker_value = (default_speaker_value or "").strip()
         reuse_source_session: Optional[TranslateSessionData] = None
         reuse_session_id_value = (reuse_session_id_value or "").strip()
         if reuse_session_id_value:
@@ -11536,6 +11869,16 @@ async def api_translate_segments(
             requested_merge_backing = False
         resolved_gemini_model = _normalize_gemini_model_name(gemini_model_value)
         gemini_api_key_value = (gemini_api_key_value or "").strip()
+        if not default_speaker_value and reuse_source_session:
+            default_speaker_value = (reuse_source_session.default_speaker_preset or "").strip()
+        if not default_speaker_value:
+            default_speaker_value = None
+        if default_emotion_weight_value is None and reuse_source_session is not None:
+            default_emotion_weight_value = reuse_source_session.default_emotion_weight
+        default_emotion_weight_value = _coerce_emotion_weight(
+            default_emotion_weight_value,
+            DEFAULT_EMOTION_WEIGHT,
+        )
 
         reuse_session_for_segments = reuse_source_session
         session_source_filename = uploaded_filename or (
@@ -11673,6 +12016,9 @@ async def api_translate_segments(
                         source_audio_filename=session_source_filename,
                         source_base_name=resolved_base_name,
                         force_gemini_regenerate=force_gemini_regenerate_flag,
+                        initial_speaker_overrides=getattr(reuse_session_for_segments, "speaker_overrides", None),
+                        default_speaker_preset=default_speaker_value,
+                        default_emotion_weight=default_emotion_weight_value,
                     )
 
                     metadata = segment_result.metadata
@@ -11952,6 +12298,8 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                         silence_volume_percent=session.silence_volume_percent,
                         speaker_overrides=session.speaker_overrides,
                         backing_volume_percent=backing_volume_percent,
+                        default_speaker_preset=session.default_speaker_preset,
+                        default_emotion_weight=session.default_emotion_weight,
                     )
 
                     backing_meta = metadata.setdefault("backing_track", {})
@@ -11962,6 +12310,8 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                     metadata["preserve_silence_audio"] = session.preserve_silence_audio
                     metadata["speaker_overrides"] = copy.deepcopy(session.speaker_overrides)
                     metadata["backing_volume_percent"] = backing_volume_percent
+                    metadata["default_speaker_preset"] = session.default_speaker_preset
+                    metadata["default_emotion_weight"] = session.default_emotion_weight
                     if session.gemini_raw_text is not None:
                         metadata["gemini_raw_text"] = session.gemini_raw_text
                     generated_count = sum(
@@ -12251,10 +12601,14 @@ async def api_translate_segment_preview(payload: SegmentPreviewRequest):
             speaker_overrides=override_payload,
             backing_volume_percent=backing_volume,
             pad_to_original=False,
+            default_speaker_preset=session.default_speaker_preset,
+            default_emotion_weight=session.default_emotion_weight,
         )
 
         metadata["preview"] = True
         metadata["preview_segment_index"] = seg_input.index
+        metadata["default_speaker_preset"] = session.default_speaker_preset
+        metadata["default_emotion_weight"] = session.default_emotion_weight
 
         # Save preview to file and return URL instead of base64
         preview_filename = f"{session.session_id}_segment_{seg_input.index}_preview.mp3"
@@ -12414,6 +12768,8 @@ async def api_translate_audio(
     audio_file: Optional[UploadFile] = File(None),
     custom_backing_audio_file: Optional[UploadFile] = File(None),
     force_gemini_regenerate: Optional[bool] = Form(False),
+    default_speaker_preset: Optional[str] = Form(None),
+    default_emotion_weight: Optional[float] = Form(None),
 ):
     """API: Translate speech audio to a target language and return synthesized audio."""
     reuse_session_id_value: Optional[str] = reuse_session_id
@@ -12442,6 +12798,8 @@ async def api_translate_audio(
         backing_volume_percent_value = backing_volume_percent
         silence_volume_percent_value = silence_volume_percent
         force_gemini_regen_value = force_gemini_regenerate
+        default_speaker_value = default_speaker_preset
+        default_emotion_weight_value = default_emotion_weight
 
         content_type = request.headers.get("content-type", "")
         if (
@@ -12524,6 +12882,18 @@ async def api_translate_audio(
                 if translate_req.force_gemini_regenerate is not None
                 else force_gemini_regen_value
             )
+            if translate_req.default_speaker_preset:
+                default_speaker_value = translate_req.default_speaker_preset
+            if translate_req.default_emotion_weight is not None:
+                default_emotion_weight_value = translate_req.default_emotion_weight
+
+        default_speaker_value = (default_speaker_value or "").strip()
+        if not default_speaker_value:
+            default_speaker_value = None
+        default_emotion_weight_value = _coerce_emotion_weight(
+            default_emotion_weight_value,
+            DEFAULT_EMOTION_WEIGHT,
+        )
 
         reuse_source_session: Optional[TranslateSessionData] = None
         reuse_session_id_value = (reuse_session_id_value or "").strip()
@@ -12745,6 +13115,9 @@ async def api_translate_audio(
                          source_audio_filename=session_source_filename,
                          source_base_name=resolved_base_name,
                         force_gemini_regenerate=force_gemini_regenerate_flag,
+                        initial_speaker_overrides=getattr(reuse_session_for_translate, "speaker_overrides", None),
+                        default_speaker_preset=default_speaker_value,
+                        default_emotion_weight=default_emotion_weight_value,
                     )
                     session = segment_result.session
                     segments = segment_result.segments
@@ -12771,7 +13144,10 @@ async def api_translate_audio(
                         preserve_silence_audio=preserve_silence_audio_flag,
                         generated_volume_percent=generated_volume_percent_value,
                         silence_volume_percent=silence_volume_percent_value,
+                        speaker_overrides=session.speaker_overrides,
                         backing_volume_percent=backing_volume_percent_value,
+                        default_speaker_preset=session.default_speaker_preset,
+                        default_emotion_weight=session.default_emotion_weight,
                     )
 
                     metadata = dict(segment_result.metadata)
@@ -12791,6 +13167,8 @@ async def api_translate_audio(
                         metadata["speaker_overrides"] = copy.deepcopy(session.speaker_overrides)
                     else:
                         metadata["speaker_overrides"] = {}
+                    metadata["default_speaker_preset"] = session.default_speaker_preset if session else None
+                    metadata["default_emotion_weight"] = session.default_emotion_weight if session else DEFAULT_EMOTION_WEIGHT
                     backing_meta = metadata.setdefault("backing_track", {})
                     backing_meta["requested"] = requested_merge_backing
                     backing_meta["available"] = backing_track_audio is not None
