@@ -60,7 +60,7 @@ class IndexTTS2:
             device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device (default: None, which enables it automatically on CUDA).
             qwenemo_gpu_memory_utilization (float): GPU memory utilization for QwenEmotion vLLM engine (default: 0.10).
-            use_torch_compile (bool): whether to use torch.compile for s2mel acceleration (default: True). Uses fullgraph=True with torch.split to avoid dynamic slicing issues.
+            use_torch_compile (bool): whether to use torch.compile for s2mel acceleration (default: False). Uses fullgraph=True with torch.split to avoid dynamic slicing issues.
         """
         if device is not None:
             self.device = device
@@ -423,8 +423,10 @@ class IndexTTS2:
             )
             sentence_stats['gpt_forward_time'] = time.perf_counter() - m_start_time
 
-            dtype = None
-            with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
+            dtype = self.dtype
+            use_amp = dtype is not None
+            device_type = text_tokens.device.type
+            with torch.amp.autocast(device_type, enabled=use_amp, dtype=dtype):
                 m_start_time = time.perf_counter()
                 inference_cfg_rate = 0
                 latent = self.s2mel.models['gpt_layer'](latent)
