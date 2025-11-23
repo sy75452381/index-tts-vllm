@@ -27,7 +27,15 @@ import tempfile
 import traceback
 import uuid
 from pathlib import Path
-from typing import Any, List, Dict, Optional, Literal, Tuple, Set, Callable, Awaitable
+from typing import Any, List, Dict, Optional, Literal, Tuple, Set, Callable, Awaitable, Union
+import logging
+PERF_LOGGER = logging.getLogger("perf")
+if not PERF_LOGGER.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    PERF_LOGGER.addHandler(handler)
+PERF_LOGGER.setLevel(logging.INFO)
+PERF_LOGGER.propagate = False
 from contextlib import asynccontextmanager
 from io import BytesIO
 import base64
@@ -48,6 +56,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
+import librosa
 
 try:
     from clearvoice import ClearVoice  # type: ignore[import]
@@ -79,6 +88,29 @@ from speaker_preset_manager import SpeakerPresetManager, initialize_preset_manag
 # Configuration
 import argparse
 
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Parse boolean environment flags with sane defaults."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, *, min_value: int = 1, max_value: Optional[int] = None) -> int:
+    """Parse integer environment values with bounds."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    parsed = max(min_value, parsed)
+    if max_value is not None and parsed > max_value:
+        return max_value
+    return parsed
+
 # Global thread executor for blocking operations
 # Use CPU count for parallel audio processing, but cap at 8 to avoid excessive context switching
 _executor_workers = min(8, max(4, (os.cpu_count() or 4)))
@@ -87,6 +119,118 @@ executor = ThreadPoolExecutor(max_workers=_executor_workers, thread_name_prefix=
 # Global ClearVoice models (initialized lazily and reused)
 _enhancement_model: Optional[Any] = None
 _super_res_model: Optional[Any] = None
+
+
+@dataclass
+class AudioAssetInfo:
+    duration_ms: int
+    sample_rate: int
+    channels: int
+    sample_width: int
+    frame_count: int
+    hash_md5: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "duration_ms": self.duration_ms,
+            "sample_rate": self.sample_rate,
+            "channels": self.channels,
+            "sample_width": self.sample_width,
+            "frame_count": self.frame_count,
+            "hash_md5": self.hash_md5,
+        }
+
+    @staticmethod
+    def from_dict(payload: Optional[Dict[str, Any]]) -> Optional["AudioAssetInfo"]:
+        if not payload:
+            return None
+        return AudioAssetInfo(
+            duration_ms=int(payload.get("duration_ms") or 0),
+            sample_rate=int(payload.get("sample_rate") or 0),
+            channels=int(payload.get("channels") or 0),
+            sample_width=int(payload.get("sample_width") or 0),
+            frame_count=int(payload.get("frame_count") or 0),
+            hash_md5=payload.get("hash_md5"),
+        )
+
+
+@dataclass
+class AudioBuffer:
+    path: str
+    sample_rate: int
+    channels: int
+    frame_count: int
+    duration_ms: int
+    dtype: str = "float32"
+    analysis_samples: Optional[np.ndarray] = field(default=None, repr=False)
+    analysis_sample_rate: Optional[int] = None
+    analysis_downsample_factor: int = 1
+
+    def ensure_analysis_samples(
+        self,
+        target_sample_rate: int = 16_000,
+    ) -> Tuple[np.ndarray, int, int]:
+        if (
+            self.analysis_samples is not None
+            and self.analysis_sample_rate == target_sample_rate
+        ):
+            return (
+                self.analysis_samples,
+                self.analysis_sample_rate,
+                self.analysis_downsample_factor,
+            )
+        samples, sample_rate, downsample_factor = _read_analysis_samples_from_path(
+            self.path,
+            target_sample_rate=target_sample_rate,
+        )
+        self.analysis_samples = samples
+        self.analysis_sample_rate = sample_rate
+        self.analysis_downsample_factor = downsample_factor
+        return samples, sample_rate, downsample_factor
+
+
+@dataclass
+class SplitClearVoiceAssets:
+    processed_audio_path: str
+    processed_audio_info: AudioAssetInfo
+    clearvoice_hash: str
+    processed_mime_type: str = "audio/mpeg"
+    backing_track_path: Optional[str] = None
+    backing_audio_info: Optional[AudioAssetInfo] = None
+    backing_track_source: str = "none"
+    applied_super_resolution: bool = False
+
+
+class PerfLogger:
+    """Lightweight helper to print per-step timings for complex workflows."""
+
+    def __init__(self, label: str):
+        self.label = label
+        self.records: List[Dict[str, Any]] = []
+
+    def rename(self, label: str) -> None:
+        self.label = label
+
+    def mark(self, step_name: str, start_time: float, *, extra: Optional[str] = None) -> float:
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        self.records.append({"step": step_name, "elapsed_ms": elapsed_ms, "extra": extra})
+        extra_text = f" | {extra}" if extra else ""
+        PERF_LOGGER.info("⏱️ [%s] %s took %.1f ms%s", self.label, step_name, elapsed_ms, extra_text)
+        return elapsed_ms
+
+    def summary(self) -> None:
+        if not self.records:
+            return
+        total_ms = sum(record["elapsed_ms"] for record in self.records)
+        PERF_LOGGER.info(
+            "⏱️ [%s] summary → %s step(s), total %.1f ms",
+            self.label,
+            len(self.records),
+            total_ms,
+        )
+        for record in self.records:
+            extra_text = f" | {record['extra']}" if record.get("extra") else ""
+            PERF_LOGGER.info("   • %s: %.1f ms%s", record["step"], record["elapsed_ms"], extra_text)
 
 # Gemini configuration
 GEMINI_API_KEY_ENV_VAR = "GEMINI_API_KEY"
@@ -167,6 +311,8 @@ CHUNK_SPLIT_MAX_CHUNKS = 64
 CHUNK_SPLIT_SILENCE_GRACE_MS = 45000
 CHUNK_SPLIT_MIN_CHUNK_MS = 1000
 CHUNK_BATCH_GENERATE_DELAY_SECONDS = 60
+TRANSLATE_USE_FFMPEG_SPLIT_MERGE = _env_flag("TRANSLATE_USE_FFMPEG_SPLIT_MERGE", True)
+CHUNK_SPLIT_FFMPEG_CONCURRENCY = _env_int("CHUNK_SPLIT_FFMPEG_CONCURRENCY", 2, min_value=1, max_value=8)
 
 
 async def _run_blocking(func: Callable, *args, **kwargs):
@@ -246,6 +392,26 @@ def _export_audio_segment_bytes_sync(audio: AudioSegment, fmt: str = "mp3", bitr
 
 async def _export_audio_segment_bytes(audio: AudioSegment, fmt: str = "mp3", bitrate: Optional[str] = None) -> bytes:
     return await _run_blocking(_export_audio_segment_bytes_sync, audio, fmt, bitrate)
+
+
+def _export_audio_segment_to_path_sync(
+    audio: AudioSegment,
+    path: str,
+    fmt: str = "mp3",
+    bitrate: Optional[str] = None,
+) -> str:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    audio.export(path, format=fmt, bitrate=bitrate)
+    return path
+
+
+async def _export_audio_segment_to_path(
+    audio: AudioSegment,
+    path: str,
+    fmt: str = "mp3",
+    bitrate: Optional[str] = None,
+) -> str:
+    return await _run_blocking(_export_audio_segment_to_path_sync, audio, path, fmt, bitrate)
 
 
 def _export_audio_segment_to_tempfile_sync(audio: AudioSegment, suffix: str = ".wav") -> str:
@@ -669,6 +835,231 @@ async def _prepare_audio_assets(
                 pass
 
 
+def _clearvoice_input_manifest_dir() -> str:
+    path = os.path.join(CLEARVOICE_CACHE_DIR, "inputs")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _clearvoice_input_manifest_path(source_hash: str) -> str:
+    return os.path.join(_clearvoice_input_manifest_dir(), f"{source_hash}.json")
+
+
+def _load_clearvoice_input_manifest(source_hash: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not source_hash:
+        return None
+    path = _clearvoice_input_manifest_path(source_hash)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as infile:
+            return json.load(infile)
+    except Exception as exc:
+        print(f"⚠️ Failed to read ClearVoice input manifest '{path}': {exc}")
+        return None
+
+
+def _write_clearvoice_input_manifest(
+    source_hash: Optional[str],
+    clearvoice_hash: str,
+    *,
+    processed_hash: Optional[str] = None,
+) -> None:
+    if not source_hash:
+        return
+    payload = {
+        "source_hash": source_hash,
+        "clearvoice_hash": clearvoice_hash,
+        "updated_at": time.time(),
+    }
+    if processed_hash:
+        payload["processed_hash"] = processed_hash
+    path = _clearvoice_input_manifest_path(source_hash)
+    try:
+        with open(path, "w", encoding="utf-8") as outfile:
+            json.dump(payload, outfile, ensure_ascii=False)
+    except Exception as exc:
+        print(f"⚠️ Failed to write ClearVoice input manifest '{path}': {exc}")
+
+
+def _clearvoice_cache_paths(cache_hash: str) -> Tuple[str, str, str]:
+    cache_dir = os.path.join(CLEARVOICE_CACHE_DIR, cache_hash)
+    cached_enhanced_path = os.path.join(cache_dir, "mossformer2_se.mp3")
+    cached_sr_path = os.path.join(cache_dir, "mossformer2_sr.mp3")
+    cached_backing_path = os.path.join(cache_dir, "backing_track.mp3")
+    return cache_dir, cached_enhanced_path, cached_sr_path, cached_backing_path
+
+
+async def _prepare_clearvoice_for_split(
+    *,
+    audio_file: Optional[UploadFile],
+    audio_reference: Optional[str],
+    preloaded_audio_bytes: Optional[bytes],
+    source_audio_filename: Optional[str],
+    apply_super_resolution: bool,
+    emit_status: Optional[Callable[..., Awaitable[None]]] = None,
+) -> SplitClearVoiceAssets:
+    """
+    Prepare ClearVoice-enhanced audio for chunk splitting without decoding the entire track when cached.
+    """
+    cleanup_paths: List[str] = []
+    upload_temp_path: Optional[str] = None
+    normalized_audio_temp_path: Optional[str] = None
+    wav_input_path: Optional[str] = None
+    cache_hash: Optional[str] = None
+    cache_dir: Optional[str] = None
+    cached_enhanced_path: Optional[str] = None
+    cached_sr_path: Optional[str] = None
+    cached_backing_path: Optional[str] = None
+    source_hash: Optional[str] = None
+    manifest: Optional[Dict[str, Any]] = None
+    processed_hash: Optional[str] = None
+
+    def _update_cache_paths(hash_value: str) -> None:
+        nonlocal cache_hash, cache_dir, cached_enhanced_path, cached_sr_path, cached_backing_path
+        cache_dir, cached_enhanced_path, cached_sr_path, cached_backing_path = _clearvoice_cache_paths(hash_value)
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_hash = hash_value
+
+    async def _ensure_wav_input_path(audio_bytes_value: bytes) -> str:
+        nonlocal upload_temp_path, normalized_audio_temp_path, wav_input_path
+        if wav_input_path:
+            return wav_input_path
+        upload_temp_path = _persist_audio_upload(audio_bytes_value, source_audio_filename)
+        cleanup_paths.append(upload_temp_path)
+        normalized_audio_temp_path = await _normalize_uploaded_audio(upload_temp_path)
+        cleanup_paths.append(normalized_audio_temp_path)
+        wav_input_local, created_temp = await _ensure_clearvoice_input_path(normalized_audio_temp_path)
+        if created_temp:
+            cleanup_paths.append(wav_input_local)
+        wav_input_path = wav_input_local
+        return wav_input_path
+    try:
+        if preloaded_audio_bytes is not None:
+            audio_bytes = preloaded_audio_bytes
+        else:
+            audio_io = await load_audio_bytes_from_request(audio_file, audio_reference)
+            if audio_io is None:
+                raise TranslateWorkflowHttpError(
+                    400,
+                    {"status": "error", "message": "No audio provided for translation."},
+                )
+            audio_bytes = audio_io.read()
+        if not audio_bytes:
+            raise TranslateWorkflowHttpError(
+                400,
+                {"status": "error", "message": "Provided audio data is empty."},
+            )
+        source_hash = _compute_bytes_md5(audio_bytes)
+        manifest = _load_clearvoice_input_manifest(source_hash)
+        if manifest:
+            manifest_hash = manifest.get("clearvoice_hash")
+            processed_hash = manifest.get("processed_hash")
+            if manifest_hash:
+                _update_cache_paths(manifest_hash)
+                if os.path.exists(cached_enhanced_path) or os.path.exists(cached_sr_path):
+                    print(
+                        f"♻️ ClearVoice: Reusing cached assets for upload hash {source_hash[:8]} → {cache_hash}."
+                    )
+                else:
+                    cache_hash = None
+                    manifest = None
+        if cache_hash is None:
+            wav_input_path = await _ensure_wav_input_path(audio_bytes)
+            _update_cache_paths(_compute_file_md5(wav_input_path))
+        final_processed_target = cached_sr_path if apply_super_resolution else cached_enhanced_path
+
+        need_processing = not os.path.exists(final_processed_target)
+        if apply_super_resolution and not os.path.exists(cached_enhanced_path):
+            need_processing = True
+        backing_needed = not os.path.exists(cached_backing_path)
+
+        if need_processing or backing_needed:
+            if emit_status:
+                await emit_status(
+                    stage="enhancement",
+                    message="Generating ClearVoice cache for splitting...",
+                )
+            source_path = normalized_audio_temp_path
+            if source_path is None:
+                await _ensure_wav_input_path(audio_bytes)
+                source_path = normalized_audio_temp_path or wav_input_path
+            if source_path is None:
+                raise TranslateWorkflowHttpError(
+                    500,
+                    {"status": "error", "message": "Unable to prepare source audio for ClearVoice."},
+                )
+            original_audio = await _load_audio_segment_from_path(source_path)
+            processed_audio, backing_track_audio = await _run_clearvoice_pipeline(
+                original_audio,
+                apply_enhancement=True,
+                apply_super_resolution=apply_super_resolution,
+                pre_clearvoice_mix_audio=original_audio,
+                emit_status=emit_status,
+                source_audio_path=source_path,
+            )
+            processed_audio = None
+            backing_track_audio = None
+
+        if not os.path.exists(final_processed_target):
+            raise TranslateWorkflowHttpError(
+                500,
+                {
+                    "status": "error",
+                    "message": "ClearVoice processing did not produce an enhanced track.",
+                },
+            )
+
+        try:
+            processed_info = _probe_audio_metadata_from_path(
+                final_processed_target,
+                compute_hash=processed_hash is None,
+            )
+        except Exception as exc:
+            raise TranslateWorkflowHttpError(
+                500,
+                {"status": "error", "message": f"Failed to inspect ClearVoice output: {str(exc)}"},
+            ) from exc
+
+        backing_info: Optional[AudioAssetInfo] = None
+        backing_source = "none"
+        if os.path.exists(cached_backing_path):
+            try:
+                backing_info = _probe_audio_metadata_from_path(cached_backing_path, compute_hash=False)
+                backing_source = "cache"
+            except Exception as exc:
+                print(f"⚠️ Failed to probe cached backing track: {exc}")
+
+        if processed_hash and not processed_info.hash_md5:
+            processed_info = AudioAssetInfo(
+                duration_ms=processed_info.duration_ms,
+                sample_rate=processed_info.sample_rate,
+                channels=processed_info.channels,
+                sample_width=processed_info.sample_width,
+                frame_count=processed_info.frame_count,
+                hash_md5=processed_hash,
+            )
+        clearvoice_hash = processed_info.hash_md5 or _compute_file_md5(final_processed_target)
+        _write_clearvoice_input_manifest(
+            source_hash,
+            cache_hash or "",
+            processed_hash=clearvoice_hash,
+        )
+        return SplitClearVoiceAssets(
+            processed_audio_path=final_processed_target,
+            processed_audio_info=processed_info,
+            clearvoice_hash=clearvoice_hash,
+            processed_mime_type="audio/mpeg",
+            backing_track_path=cached_backing_path if os.path.exists(cached_backing_path) else None,
+            backing_audio_info=backing_info,
+            backing_track_source=backing_source,
+            applied_super_resolution=apply_super_resolution,
+        )
+    finally:
+        for path in cleanup_paths:
+            _safe_remove_file(path)
+
+
 @dataclass
 class SegmentBuildResult:
     session: TranslateSessionData
@@ -769,8 +1160,9 @@ async def _build_translation_segments(
             message=f"Received {len(gemini_chunks)} raw segments; preparing timeline...",
         )
 
+    original_duration_ms = len(original_audio)
     segments = _prepare_translation_segments(
-        original_audio,
+        original_duration_ms,
         gemini_chunks,
         dest_language,
         speaker_profiles=speaker_profiles,
@@ -857,14 +1249,14 @@ async def _build_translation_segments(
         session.chunk_cut_reason = source_chunk_session.chunk_cut_reason
         session.chunk_silence_midpoint_ms = source_chunk_session.chunk_silence_midpoint_ms
         session.chunk_source_session_id = source_chunk_session.session_id
-    ui_segments = _serialize_segments_for_ui(segments, original_audio, session.session_id)
+    ui_segments = _serialize_segments_for_ui(segments, session.session_id)
 
     metadata = {
         "dest_language": dest_language,
         "segment_count": len(segments),
         "speech_segment_count": sum(1 for seg in segments if seg.get("type") == "speech"),
         "silence_segment_count": sum(1 for seg in segments if seg.get("type") == "silence"),
-        "audio_duration_ms": len(original_audio),
+        "audio_duration_ms": original_duration_ms,
         "translate_enabled": translate_enabled,
         "response_format": response_format_value,
         "bitrate": bitrate_value,
@@ -958,7 +1350,6 @@ async def _build_translation_segments(
 @dataclass
 class TranslateSessionData:
     session_id: str
-    original_audio: AudioSegment
     dest_language: str
     prompt: str
     translate_enabled: bool
@@ -973,7 +1364,9 @@ class TranslateSessionData:
     source_audio_filename: Optional[str] = None
     source_base_name: Optional[str] = None
     original_audio_path: Optional[str] = None
-    backing_track_audio: Optional[AudioSegment] = None
+    original_audio_info: Optional[AudioAssetInfo] = None
+    backing_track_path: Optional[str] = None
+    backing_audio_info: Optional[AudioAssetInfo] = None
     backing_track_source: str = "none"
     merge_with_backing: bool = False
     ignore_non_speech: bool = False
@@ -999,6 +1392,8 @@ class TranslateSessionData:
     chunk_cut_reason: Optional[str] = None
     chunk_silence_midpoint_ms: Optional[int] = None
     chunk_source_session_id: Optional[str] = None
+    original_audio: Optional[AudioSegment] = field(default=None, repr=False)
+    backing_track_audio: Optional[AudioSegment] = field(default=None, repr=False)
 
 
 ADVANCED_TRANSLATE_SESSIONS: Dict[str, TranslateSessionData] = {}
@@ -1146,8 +1541,13 @@ def _load_split_audio_cache(cache_key: str) -> Optional[Dict[str, Any]]:
         
         # Verify all chunk files exist
         chunk_count = metadata.get("chunk_count", 0)
+        chunk_files = metadata.get("chunk_files", [])
         for chunk_idx in range(1, chunk_count + 1):
-            chunk_path = _split_audio_cache_path(cache_key, chunk_idx)
+            chunk_path = None
+            if chunk_files and chunk_idx - 1 < len(chunk_files):
+                chunk_path = chunk_files[chunk_idx - 1].get("file_path")
+            if not chunk_path:
+                chunk_path = _split_audio_cache_path(cache_key, chunk_idx)
             if not os.path.exists(chunk_path):
                 print(f"⚠️ Split audio cache incomplete, missing chunk {chunk_idx}: {chunk_path}")
                 return None
@@ -1158,11 +1558,80 @@ def _load_split_audio_cache(cache_key: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _iter_split_metadata_files() -> List[str]:
+    if not os.path.exists(SPLIT_AUDIO_CACHE_DIR):
+        return []
+    paths: List[str] = []
+    for entry in os.scandir(SPLIT_AUDIO_CACHE_DIR):
+        if entry.is_file() and entry.name.endswith("_metadata.json"):
+            paths.append(entry.path)
+    return paths
+
+
+def _load_split_cache_metadata_for_batch(batch_id: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    if not batch_id:
+        return None
+    for path in _iter_split_metadata_files():
+        try:
+            with open(path, "r", encoding="utf-8") as infile:
+                data = json.load(infile)
+        except Exception:
+            continue
+        if data.get("chunk_batch_id") == batch_id:
+            return path, data
+    return None
+
+
+def _write_split_cache_metadata(path: str, data: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix="split_audio_",
+        suffix=".json",
+        dir=os.path.dirname(path) or SPLIT_AUDIO_CACHE_DIR,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            json.dump(data, tmp_file, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def _refresh_split_cache_for_session(session: TranslateSessionData) -> None:
+    batch_id = session.chunk_parent_id
+    if not batch_id:
+        return
+    lookup = _load_split_cache_metadata_for_batch(batch_id)
+    if not lookup:
+        return
+    metadata_path, metadata = lookup
+    manifests: List[Dict[str, Any]] = metadata.get("chunk_sessions", [])
+    updated_manifest = _session_to_manifest(session)
+    updated = False
+    for idx, manifest in enumerate(manifests):
+        if manifest.get("session_id") == session.session_id or manifest.get("chunk_index") == session.chunk_index:
+            manifests[idx] = updated_manifest
+            updated = True
+            break
+    if not updated:
+        manifests.append(updated_manifest)
+    metadata["chunk_sessions"] = manifests
+    _write_split_cache_metadata(metadata_path, metadata)
+
+
 def _save_split_audio_cache(
     cache_key: str,
     chunk_ranges: List[Dict[str, Any]],
-    chunk_audio_segments: List[AudioSegment],
+    chunk_audio_segments: Optional[List[AudioSegment]],
     silence_stats: Dict[str, Any],
+    *,
+    chunk_audio_paths: Optional[List[Optional[str]]] = None,
+    chunk_session_manifests: Optional[List[Dict[str, Any]]] = None,
+    chunk_batch_id: Optional[str] = None,
 ) -> None:
     """
     Save split audio chunks as MP3 files and metadata to cache.
@@ -1176,21 +1645,46 @@ def _save_split_audio_cache(
     os.makedirs(SPLIT_AUDIO_CACHE_DIR, exist_ok=True)
     
     try:
-        # Save each chunk as MP3
-        chunk_files = []
-        for chunk_idx, (chunk_range, audio_segment) in enumerate(zip(chunk_ranges, chunk_audio_segments), start=1):
-            chunk_path = _split_audio_cache_path(cache_key, chunk_idx)
-            # Export as MP3
-            audio_segment.export(chunk_path, format="mp3", bitrate="128k")
-            chunk_files.append({
-                "chunk_index": chunk_idx,
-                "file_path": chunk_path,
-                "start_ms": chunk_range.get("start_ms"),
-                "end_ms": chunk_range.get("end_ms"),
-                "duration_ms": len(audio_segment),
-                "cut_reason": chunk_range.get("cut_reason"),
-                "silence_midpoint_ms": chunk_range.get("silence_midpoint_ms"),
-            })
+        chunk_files: List[Dict[str, Any]] = []
+        if chunk_audio_segments is not None:
+            for chunk_idx, (chunk_range, audio_segment) in enumerate(zip(chunk_ranges, chunk_audio_segments), start=1):
+                desired_path = None
+                if chunk_audio_paths and chunk_idx - 1 < len(chunk_audio_paths):
+                    desired_path = chunk_audio_paths[chunk_idx - 1]
+                chunk_path = desired_path or _split_audio_cache_path(cache_key, chunk_idx)
+                os.makedirs(os.path.dirname(chunk_path) or ".", exist_ok=True)
+                audio_segment.export(chunk_path, format="mp3", bitrate="128k")
+                chunk_files.append(
+                    {
+                        "chunk_index": chunk_idx,
+                        "file_path": chunk_path,
+                        "start_ms": chunk_range.get("start_ms"),
+                        "end_ms": chunk_range.get("end_ms"),
+                        "duration_ms": len(audio_segment),
+                        "cut_reason": chunk_range.get("cut_reason"),
+                        "silence_midpoint_ms": chunk_range.get("silence_midpoint_ms"),
+                    }
+                )
+        else:
+            for chunk_idx, chunk_range in enumerate(chunk_ranges, start=1):
+                range_duration = max(0, int(chunk_range.get("end_ms", 0)) - int(chunk_range.get("start_ms", 0)))
+                desired_path = None
+                if chunk_audio_paths and chunk_idx - 1 < len(chunk_audio_paths):
+                    desired_path = chunk_audio_paths[chunk_idx - 1]
+                chunk_path = desired_path or _split_audio_cache_path(cache_key, chunk_idx)
+                if not os.path.exists(chunk_path):
+                    raise FileNotFoundError(f"Chunk audio missing for cache at {chunk_path}")
+                chunk_files.append(
+                    {
+                        "chunk_index": chunk_idx,
+                        "file_path": chunk_path,
+                        "start_ms": chunk_range.get("start_ms"),
+                        "end_ms": chunk_range.get("end_ms"),
+                        "duration_ms": range_duration,
+                        "cut_reason": chunk_range.get("cut_reason"),
+                        "silence_midpoint_ms": chunk_range.get("silence_midpoint_ms"),
+                    }
+                )
         
         # Save metadata
         metadata = {
@@ -1201,6 +1695,8 @@ def _save_split_audio_cache(
             "chunk_ranges": chunk_ranges,
             "chunk_files": chunk_files,
             "silence_stats": silence_stats,
+            "chunk_sessions": chunk_session_manifests or [],
+            "chunk_batch_id": chunk_batch_id,
         }
         
         metadata_path = _split_audio_metadata_path(cache_key)
@@ -1229,10 +1725,79 @@ def _save_split_audio_cache(
             pass
 
 
-def _persist_session_audio_segment(session_id: str, audio: AudioSegment, kind: str, fmt: str = "mp3") -> str:
+async def _materialize_split_chunks_ffmpeg(
+    source_audio_path: str,
+    chunk_specs: List[Dict[str, Any]],
+    *,
+    emit_status: Optional[Callable[..., Awaitable[None]]] = None,
+    bitrate: str = TRANSLATE_DEFAULT_BITRATE,
+) -> None:
+    if not chunk_specs:
+        return
+    if not _ffmpeg_available():
+        raise RuntimeError("ffmpeg split requested but ffmpeg is unavailable.")
+    semaphore = asyncio.Semaphore(max(1, CHUNK_SPLIT_FFMPEG_CONCURRENCY))
+    progress_lock = asyncio.Lock()
+    total = len(chunk_specs)
+    completed = 0
+
+    async def _extract(spec: Dict[str, Any]) -> None:
+        nonlocal completed
+        chunk_path = spec["chunk_mp3_path"]
+        start_ms = int(spec["start_ms"])
+        end_ms = int(spec["end_ms"])
+        os.makedirs(os.path.dirname(chunk_path) or ".", exist_ok=True)
+        async with semaphore:
+            await _run_blocking(
+                _ffmpeg_extract_segment,
+                source_audio_path,
+                chunk_path,
+                start_ms,
+                end_ms,
+                bitrate=bitrate,
+            )
+        async with progress_lock:
+            completed += 1
+            if emit_status:
+                await emit_status(
+                    stage="chunking",
+                    message=f"Extracted chunk {completed}/{total} via ffmpeg...",
+                )
+
+    await asyncio.gather(*(asyncio.create_task(_extract(spec)) for spec in chunk_specs))
+
+
+async def _materialize_split_chunks_pydub(
+    source_audio: AudioSegment,
+    chunk_specs: List[Dict[str, Any]],
+    *,
+    emit_status: Optional[Callable[..., Awaitable[None]]] = None,
+    bitrate: str = TRANSLATE_DEFAULT_BITRATE,
+) -> None:
+    total = len(chunk_specs)
+    for idx, spec in enumerate(chunk_specs, start=1):
+        start_ms = int(spec["start_ms"])
+        end_ms = int(spec["end_ms"])
+        chunk_audio = source_audio[start_ms:end_ms]
+        await _export_audio_segment_to_path(
+            chunk_audio,
+            spec["chunk_mp3_path"],
+            fmt="mp3",
+            bitrate=bitrate,
+        )
+        if emit_status:
+            await emit_status(stage="chunking", message=f"Exported chunk {idx}/{total}...")
+
+
+def _persist_session_audio_segment(
+    session_id: str,
+    audio: AudioSegment,
+    kind: str,
+    fmt: str = "mp3",
+) -> Tuple[str, AudioAssetInfo]:
     path = _session_media_path(session_id, kind, fmt)
     audio.export(path, format=fmt)
-    return path
+    return path, _audio_segment_metadata(audio)
 
 
 def _get_session_original_audio(session: TranslateSessionData) -> AudioSegment:
@@ -1245,22 +1810,81 @@ def _get_session_original_audio(session: TranslateSessionData) -> AudioSegment:
 
 
 def _get_session_backing_audio(session: TranslateSessionData) -> Optional[AudioSegment]:
-    return session.backing_track_audio
+    if session.backing_track_audio is not None:
+        return session.backing_track_audio
+    path = getattr(session, "backing_track_path", None)
+    if path and os.path.exists(path):
+        session.backing_track_audio = _load_audio_segment_from_path_sync(path)
+        return session.backing_track_audio
+    return None
 
 
 def _session_has_backing_audio(session: TranslateSessionData) -> bool:
-    return session.backing_track_audio is not None
+    if session.backing_track_audio is not None:
+        return True
+    path = getattr(session, "backing_track_path", None)
+    return bool(path and os.path.exists(path))
 
 
-def _persist_chunk_batch_media(batch_id: str, audio: AudioSegment, kind: str, fmt: str = "mp3") -> str:
+def _persist_chunk_batch_media(
+    batch_id: str,
+    audio: Union[AudioSegment, str],
+    kind: str,
+    fmt: str = "mp3",
+) -> str:
     path = _chunk_batch_media_path(batch_id, kind, fmt)
-    audio.export(path, format=fmt)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if isinstance(audio, AudioSegment):
+        audio.export(path, format=fmt)
+    else:
+        _transcode_or_copy_audio_file(audio, path, fmt)
     return path
 
 
+def _transcode_or_copy_audio_file(source_path: str, target_path: str, fmt: str) -> None:
+    if not os.path.exists(source_path):
+        raise FileNotFoundError(f"Audio source not found: {source_path}")
+    source_ext = os.path.splitext(source_path)[1].lstrip(".").lower()
+    target_ext = (fmt or source_ext or "mp3").lower()
+    if source_ext == target_ext:
+        shutil.copy2(source_path, target_path)
+        return
+    if not _ffmpeg_available():
+        raise RuntimeError("ffmpeg is required to transcode audio for chunk batch media.")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        source_path,
+    ]
+    codec_args = _ffmpeg_codec_args_for_format(target_ext, TRANSLATE_DEFAULT_BITRATE)
+    if target_ext == "wav":
+        codec_args = ["-c:a", "pcm_s16le"]
+    cmd += codec_args
+    cmd.append(target_path)
+    _run_ffmpeg_command(cmd)
+
+
 def _session_audio_duration_ms(session: TranslateSessionData) -> int:
+    info = getattr(session, "original_audio_info", None)
+    if info and info.duration_ms:
+        return int(info.duration_ms)
     audio = _get_session_original_audio(session)
     return len(audio)
+
+
+def _resolve_chunk_duration_ms(session: TranslateSessionData) -> int:
+    if session.chunk_start_ms is not None and session.chunk_end_ms is not None:
+        duration = int(session.chunk_end_ms) - int(session.chunk_start_ms)
+        if duration > 0:
+            return duration
+    try:
+        return _session_audio_duration_ms(session)
+    except RuntimeError:
+        return 0
 
 
 class TranslateWorkflowHttpError(Exception):
@@ -1364,19 +1988,44 @@ except SystemExit:
     )
 
 # Create directories
-os.makedirs("outputs/tasks", exist_ok=True)
-os.makedirs("outputs", exist_ok=True)
-os.makedirs("prompts", exist_ok=True)
-os.makedirs("speaker_presets", exist_ok=True)
-TRANSLATE_OUTPUT_DIR = os.path.join("outputs", "translate_results")
+APP_DIR = Path(__file__).resolve().parent
+_OUTPUT_SUBDIRS = (
+    "translate_results",
+    "clearvoice_cache",
+    "translate_session_media",
+    "split_audio_cache",
+)
+
+
+def _resolve_outputs_root(app_dir: Path) -> Path:
+    candidates = [
+        app_dir / "outputs",
+        app_dir.parent / "outputs",
+    ]
+    best_path = candidates[0]
+    best_score = -1
+    for candidate in candidates:
+        score = sum((candidate / sub).exists() for sub in _OUTPUT_SUBDIRS)
+        if score > best_score:
+            best_score = score
+            best_path = candidate
+    best_path.mkdir(parents=True, exist_ok=True)
+    return best_path.resolve()
+
+
+ROOT_OUTPUT_DIR = _resolve_outputs_root(APP_DIR)
+os.makedirs(ROOT_OUTPUT_DIR / "tasks", exist_ok=True)
+os.makedirs((APP_DIR / "prompts").resolve(), exist_ok=True)
+os.makedirs((APP_DIR / "speaker_presets").resolve(), exist_ok=True)
+TRANSLATE_OUTPUT_DIR = str((ROOT_OUTPUT_DIR / "translate_results").resolve())
 os.makedirs(TRANSLATE_OUTPUT_DIR, exist_ok=True)
-TRANSLATE_SESSION_MEDIA_DIR = os.path.join("outputs", "translate_session_media")
+TRANSLATE_SESSION_MEDIA_DIR = str((ROOT_OUTPUT_DIR / "translate_session_media").resolve())
 os.makedirs(TRANSLATE_SESSION_MEDIA_DIR, exist_ok=True)
-CLEARVOICE_CACHE_DIR = os.path.join("outputs", "clearvoice_cache")
+CLEARVOICE_CACHE_DIR = str((ROOT_OUTPUT_DIR / "clearvoice_cache").resolve())
 os.makedirs(CLEARVOICE_CACHE_DIR, exist_ok=True)
-GEMINI_CACHE_DIR = os.path.join("outputs", "gemini_cache")
+GEMINI_CACHE_DIR = str((ROOT_OUTPUT_DIR / "gemini_cache").resolve())
 os.makedirs(GEMINI_CACHE_DIR, exist_ok=True)
-SPLIT_AUDIO_CACHE_DIR = os.path.join("outputs", "split_audio_cache")
+SPLIT_AUDIO_CACHE_DIR = str((ROOT_OUTPUT_DIR / "split_audio_cache").resolve())
 os.makedirs(SPLIT_AUDIO_CACHE_DIR, exist_ok=True)
 
 
@@ -1414,6 +2063,18 @@ def _read_file_sync(file_path: str) -> bytes:
     """Synchronous file read operation"""
     with open(file_path, 'rb') as f:
         return f.read()
+
+
+def _safe_remove_file(path: Optional[str]) -> None:
+    """Best effort removal for temporary files."""
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
 
 async def async_remove_file(file_path: str) -> None:
     """Async wrapper for removing files"""
@@ -1645,6 +2306,124 @@ def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
         return input_path
 
 
+
+_AUDIO_SUBTYPE_SAMPLE_WIDTHS = {
+    "PCM_16": 2,
+    "PCM_U8": 1,
+    "PCM_S8": 1,
+    "PCM_24": 3,
+    "PCM_32": 4,
+    "FLOAT": 4,
+    "DOUBLE": 8,
+    "ULAW": 2,
+    "ALAW": 2,
+}
+
+
+def _audio_segment_metadata(audio: AudioSegment, *, hash_md5: Optional[str] = None) -> AudioAssetInfo:
+    if audio is None:
+        raise ValueError("AudioSegment is required for metadata extraction.")
+    frame_rate = int(audio.frame_rate or 16000)
+    channels = int(audio.channels or 1)
+    sample_width = int(audio.sample_width or 2)
+    duration_ms = max(0, len(audio))
+    frame_count = int(frame_rate * (duration_ms / 1000.0))
+    return AudioAssetInfo(
+        duration_ms=duration_ms,
+        sample_rate=frame_rate,
+        channels=channels,
+        sample_width=sample_width,
+        frame_count=frame_count,
+        hash_md5=hash_md5,
+    )
+
+
+def _probe_audio_metadata_from_path(path: str, *, compute_hash: bool = False) -> AudioAssetInfo:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Audio path not found: {path}")
+    info = sf.info(path)
+    sample_rate = int(getattr(info, "samplerate", 0) or 0)
+    channels = int(getattr(info, "channels", 0) or 1)
+    frame_count = int(getattr(info, "frames", 0) or 0)
+    duration_ms = 0
+    if getattr(info, "duration", None):
+        duration_ms = int(float(info.duration) * 1000)
+    elif sample_rate > 0:
+        duration_ms = int((frame_count / sample_rate) * 1000)
+    subtype = (getattr(info, "subtype", None) or "").upper()
+    sample_width = _AUDIO_SUBTYPE_SAMPLE_WIDTHS.get(subtype, 2)
+    hash_md5 = _compute_file_md5(path) if compute_hash else None
+    return AudioAssetInfo(
+        duration_ms=duration_ms,
+        sample_rate=sample_rate or 0,
+        channels=channels or 1,
+        sample_width=sample_width,
+        frame_count=frame_count,
+        hash_md5=hash_md5,
+    )
+
+
+def _read_analysis_samples_from_path(
+    path: str,
+    *,
+    target_sample_rate: int = 16_000,
+) -> Tuple[np.ndarray, int, int]:
+    desired_rate = target_sample_rate if target_sample_rate and target_sample_rate > 0 else None
+    try:
+        samples, sample_rate = librosa.load(
+            path,
+            sr=desired_rate,
+            mono=True,
+        )
+        analysis_rate = int(desired_rate or sample_rate)
+        downsample_factor = 1
+        return np.asarray(samples, dtype=np.float32), analysis_rate, downsample_factor
+    except Exception as exc:
+        print(f"⚠️ librosa.load failed for {path}: {exc}")
+    samples, sample_rate = sf.read(path, dtype="float32", always_2d=False)
+    if samples.ndim > 1:
+        samples = np.mean(samples, axis=1)
+    analysis_rate = int(sample_rate or desired_rate or 16000)
+    downsample_factor = 1
+    if (
+        target_sample_rate
+        and target_sample_rate > 0
+        and sample_rate
+        and sample_rate > target_sample_rate
+    ):
+        try:
+            samples = librosa.resample(samples, orig_sr=sample_rate, target_sr=target_sample_rate)
+            downsample_factor = max(1, int(round(sample_rate / target_sample_rate)))
+            analysis_rate = target_sample_rate
+        except Exception as resample_exc:
+            print(f"⚠️ librosa.resample failed for {path}: {resample_exc}")
+    return np.asarray(samples, dtype=np.float32), analysis_rate, downsample_factor
+
+
+def _load_processed_audio(path: str, *, target_sample_rate: int = 16_000) -> AudioBuffer:
+    info = _probe_audio_metadata_from_path(path, compute_hash=False)
+    samples, analysis_rate, downsample_factor = _read_analysis_samples_from_path(
+        path,
+        target_sample_rate=target_sample_rate,
+    )
+    return AudioBuffer(
+        path=path,
+        sample_rate=info.sample_rate,
+        channels=info.channels,
+        frame_count=info.frame_count,
+        duration_ms=info.duration_ms,
+        analysis_samples=samples,
+        analysis_sample_rate=analysis_rate,
+        analysis_downsample_factor=downsample_factor,
+    )
+
+
+def _audio_source_duration_ms(audio: Union[AudioSegment, AudioBuffer]) -> int:
+    if isinstance(audio, AudioBuffer):
+        return int(audio.duration_ms)
+    return len(audio)
+
+
 def _audio_segment_to_ndarray(audio: AudioSegment) -> Tuple[np.ndarray, int]:
     """Convert a pydub AudioSegment into a normalized numpy array (float32)."""
     if audio is None:
@@ -1666,13 +2445,15 @@ def _audio_segment_to_ndarray(audio: AudioSegment) -> Tuple[np.ndarray, int]:
 
 
 def _prepare_analysis_samples(
-    audio: AudioSegment,
+    audio: Union[AudioSegment, AudioBuffer],
     target_sample_rate: int = 16_000,
 ) -> Tuple[np.ndarray, int, int]:
     """
     Prepare a numpy array for analysis-heavy operations.
     Returns (samples, effective_sample_rate, downsample_factor).
     """
+    if isinstance(audio, AudioBuffer):
+        return audio.ensure_analysis_samples(target_sample_rate)
     samples, sample_rate = _audio_segment_to_ndarray(audio)
     if sample_rate <= 0:
         return samples, 1, 1
@@ -1687,7 +2468,7 @@ def _prepare_analysis_samples(
 
 
 def _detect_silence_midpoints_in_window(
-    audio: Optional[AudioSegment] = None,
+    audio: Optional[Union[AudioSegment, AudioBuffer]] = None,
     *,
     min_silence_ms: int,
     silence_threshold_db: float,
@@ -1718,7 +2499,7 @@ def _detect_silence_midpoints_in_window(
 
 
 def _detect_silence_midpoints_parallel(
-    audio: AudioSegment,
+    audio: Union[AudioSegment, AudioBuffer],
     *,
     min_silence_ms: int,
     silence_threshold_db: float,
@@ -1731,7 +2512,7 @@ def _detect_silence_midpoints_parallel(
     Split the audio into overlapping windows and detect silence midpoints in parallel.
     Returns (sorted_midpoints, stats).
     """
-    total_duration_ms = len(audio)
+    total_duration_ms = _audio_source_duration_ms(audio)
     if total_duration_ms <= 0:
         return [], {"windows": 0, "strategy": "empty"}
 
@@ -1823,7 +2604,7 @@ def _detect_silence_midpoints_parallel(
 
 
 def _plan_chunk_ranges(
-    audio: AudioSegment,
+    audio: Union[AudioSegment, AudioBuffer],
     *,
     min_chunk_ms: int,
     max_chunk_ms: int,
@@ -1834,7 +2615,7 @@ def _plan_chunk_ranges(
     Determine chunk boundaries for long-form audio by opportunistically snapping to nearby silence.
     Returns a list of chunk metadata dictionaries plus diagnostics.
     """
-    total_duration_ms = len(audio)
+    total_duration_ms = _audio_source_duration_ms(audio)
     if total_duration_ms <= 0:
         return [(0, 0)], {
             "silence_probes": 0,
@@ -2220,6 +3001,199 @@ def _serialize_chunk_session(session: TranslateSessionData) -> Dict[str, Any]:
     }
 
 
+def _session_to_manifest(session: TranslateSessionData) -> Dict[str, Any]:
+    return {
+        "session_id": session.session_id,
+        "dest_language": session.dest_language,
+        "prompt": session.prompt,
+        "translate_enabled": session.translate_enabled,
+        "response_format": session.response_format,
+        "bitrate": session.bitrate,
+        "input_mime_type": session.input_mime_type,
+        "clearvoice_settings": copy.deepcopy(session.clearvoice_settings),
+        "base_segments": copy.deepcopy(session.base_segments),
+        "gemini_chunks": copy.deepcopy(session.gemini_chunks),
+        "gemini_model": session.gemini_model,
+        "gemini_api_key": session.gemini_api_key,
+        "source_audio_filename": session.source_audio_filename,
+        "source_base_name": session.source_base_name,
+        "original_audio_path": session.original_audio_path,
+        "original_audio_info": session.original_audio_info.to_dict() if session.original_audio_info else None,
+        "backing_track_path": session.backing_track_path,
+        "backing_audio_info": session.backing_audio_info.to_dict() if session.backing_audio_info else None,
+        "backing_track_source": session.backing_track_source,
+        "merge_with_backing": session.merge_with_backing,
+        "ignore_non_speech": session.ignore_non_speech,
+        "preserve_silence_audio": session.preserve_silence_audio,
+        "generated_volume_percent": session.generated_volume_percent,
+        "backing_volume_percent": session.backing_volume_percent,
+        "silence_volume_percent": session.silence_volume_percent,
+        "speaker_profiles": copy.deepcopy(session.speaker_profiles),
+        "speaker_overrides": copy.deepcopy(session.speaker_overrides),
+        "default_speaker_preset": session.default_speaker_preset,
+        "default_emotion_weight": session.default_emotion_weight,
+        "gemini_raw_text": session.gemini_raw_text,
+        "chunk_parent_id": session.chunk_parent_id,
+        "chunk_index": session.chunk_index,
+        "chunk_start_ms": session.chunk_start_ms,
+        "chunk_end_ms": session.chunk_end_ms,
+        "chunk_cut_reason": session.chunk_cut_reason,
+        "chunk_silence_midpoint_ms": session.chunk_silence_midpoint_ms,
+        "chunk_output_path": session.chunk_output_path,
+        "chunk_output_filename": session.chunk_output_filename,
+        "chunk_output_format": session.chunk_output_format,
+        "chunk_generated": session.chunk_generated,
+        "chunk_generated_at": session.chunk_generated_at,
+        "chunk_source_session_id": session.chunk_source_session_id,
+        "created_at": session.created_at,
+    }
+
+
+async def _rehydrate_session_from_manifest(manifest: Dict[str, Any]) -> TranslateSessionData:
+    audio_info = AudioAssetInfo.from_dict(manifest.get("original_audio_info"))
+    backing_info = AudioAssetInfo.from_dict(manifest.get("backing_audio_info"))
+    session = await _create_translate_session(
+        None,
+        manifest.get("dest_language", "unspecified"),
+        manifest.get("prompt", ""),
+        manifest.get("translate_enabled", True),
+        manifest.get("response_format", TRANSLATE_DEFAULT_OUTPUT_FORMAT),
+        manifest.get("bitrate", TRANSLATE_DEFAULT_BITRATE),
+        manifest.get("input_mime_type"),
+        manifest.get("clearvoice_settings") or {},
+        manifest.get("base_segments") or [],
+        manifest.get("gemini_chunks") or [],
+        manifest.get("gemini_model") or _get_gemini_model_name(),
+        manifest.get("gemini_api_key"),
+        backing_track_audio=None,
+        backing_track_path=manifest.get("backing_track_path"),
+        backing_audio_info=backing_info,
+        backing_track_source=manifest.get("backing_track_source", "none"),
+        merge_with_backing=manifest.get("merge_with_backing", False),
+        ignore_non_speech=manifest.get("ignore_non_speech", False),
+        preserve_silence_audio=manifest.get("preserve_silence_audio", False),
+        generated_volume_percent=manifest.get("generated_volume_percent", DEFAULT_GENERATED_VOLUME_PERCENT),
+        backing_volume_percent=manifest.get("backing_volume_percent", DEFAULT_GENERATED_VOLUME_PERCENT),
+        silence_volume_percent=manifest.get("silence_volume_percent", DEFAULT_SILENCE_VOLUME_PERCENT),
+        speaker_profiles=manifest.get("speaker_profiles"),
+        speaker_overrides=manifest.get("speaker_overrides"),
+        gemini_raw_text=manifest.get("gemini_raw_text"),
+        chunk_parent_id=manifest.get("chunk_parent_id"),
+        chunk_index=manifest.get("chunk_index"),
+        chunk_start_ms=manifest.get("chunk_start_ms"),
+        chunk_end_ms=manifest.get("chunk_end_ms"),
+        chunk_cut_reason=manifest.get("chunk_cut_reason"),
+        chunk_silence_midpoint_ms=manifest.get("chunk_silence_midpoint_ms"),
+        source_audio_filename=manifest.get("source_audio_filename"),
+        source_base_name=manifest.get("source_base_name"),
+        default_speaker_preset=manifest.get("default_speaker_preset"),
+        default_emotion_weight=manifest.get("default_emotion_weight"),
+        original_audio_path=manifest.get("original_audio_path"),
+        original_audio_info=audio_info,
+        session_id=manifest.get("session_id"),
+        persist_media=False,
+    )
+    session.chunk_output_path = manifest.get("chunk_output_path")
+    session.chunk_output_filename = manifest.get("chunk_output_filename")
+    session.chunk_output_format = manifest.get("chunk_output_format")
+    session.chunk_generated = manifest.get("chunk_generated", False)
+    session.chunk_generated_at = manifest.get("chunk_generated_at")
+    session.chunk_source_session_id = manifest.get("chunk_source_session_id")
+    return session
+
+
+def _discover_existing_chunk_artifacts(base_name: str) -> Dict[int, Dict[str, Any]]:
+    safe_base = _sanitize_base_filename(base_name) or DEFAULT_BASE_FILENAME
+    artifacts: Dict[int, Dict[str, Any]] = {}
+    scan_dir = os.path.abspath(TRANSLATE_OUTPUT_DIR)
+    if not os.path.exists(scan_dir):
+        return artifacts
+    audio_pattern = re.compile(
+        rf"^{re.escape(safe_base)}_chunk(?P<idx>\d+)_(?P<label>[a-z0-9]+)\.(?P<ext>[a-z0-9]+)$",
+        re.IGNORECASE,
+    )
+    srt_pattern = re.compile(
+        rf"^{re.escape(safe_base)}_chunk(?P<idx>\d+)_(?P<label>[a-z0-9]+)\.srt$",
+        re.IGNORECASE,
+    )
+    for entry in os.scandir(scan_dir):
+        if not entry.is_file():
+            continue
+        match = audio_pattern.match(entry.name)
+        if match:
+            idx = int(match.group("idx"))
+            ext = match.group("ext").lower()
+            artifacts.setdefault(idx, {}).setdefault("audio", []).append(
+                {
+                    "path": os.path.abspath(entry.path),
+                    "url": f"/api/translate_outputs/{entry.name}",
+                    "suffix": match.group("label"),
+                    "filename": entry.name,
+                    "format": ext,
+                }
+            )
+            continue
+        srt_match = srt_pattern.match(entry.name)
+        if srt_match:
+            idx = int(srt_match.group("idx"))
+            artifacts.setdefault(idx, {}).setdefault("subtitles", []).append(
+                {
+                    "path": os.path.abspath(entry.path),
+                    "url": f"/api/translate_outputs/{entry.name}",
+                    "suffix": srt_match.group("label"),
+                    "filename": entry.name,
+                }
+            )
+    return artifacts
+
+
+def _parse_srt_entries(path: str, limit: int = 10) -> List[str]:
+    entries: List[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as infile:
+            buffer: List[str] = []
+            for line in infile:
+                stripped = line.strip()
+                if not stripped:
+                    if buffer:
+                        entries.append(" ".join(buffer).strip())
+                        buffer = []
+                        if len(entries) >= limit:
+                            break
+                    continue
+                if stripped.isdigit():
+                    buffer = []
+                    continue
+                if "-->" in stripped:
+                    continue
+                buffer.append(stripped)
+            if buffer and len(entries) < limit:
+                entries.append(" ".join(buffer).strip())
+    except Exception as exc:
+        print(f"⚠️ Failed to parse SRT at {path}: {exc}")
+    return entries
+
+
+def _srt_matches_manifest(manifest: Dict[str, Any], srt_path: str, limit: int = 10) -> bool:
+    segments = manifest.get("base_segments") or []
+    manifest_texts: List[str] = []
+    for segment in segments:
+        if segment.get("type") == "silence":
+            continue
+        text = (segment.get("translated_text") or segment.get("source_text") or "").strip()
+        if text:
+            manifest_texts.append(text.lower())
+        if len(manifest_texts) >= limit:
+            break
+    if not manifest_texts:
+        return False
+    srt_entries = [entry.lower() for entry in _parse_srt_entries(srt_path, limit=limit) if entry]
+    if not srt_entries:
+        return False
+    compare_len = min(len(manifest_texts), len(srt_entries))
+    return all(manifest_texts[i] == srt_entries[i] for i in range(compare_len))
+
+
 def _mark_chunk_generated(
     session: TranslateSessionData,
     output_path: str,
@@ -2231,6 +3205,7 @@ def _mark_chunk_generated(
     session.chunk_output_filename = output_filename
     session.chunk_output_format = response_format
     session.chunk_generated_at = time.time()
+    _refresh_split_cache_for_session(session)
 
 
 async def _generate_chunk_audio_from_session(
@@ -2434,6 +3409,17 @@ def _load_chunk_audio_for_merge(session: TranslateSessionData) -> Optional[Audio
     except RuntimeError as exc:
         print(f"⚠️ Chunk session '{session.session_id}' is missing original audio: {exc}")
         return None
+
+
+def _resolve_session_chunk_audio_path(session: TranslateSessionData) -> Optional[str]:
+    candidates = [
+        session.chunk_output_path,
+        getattr(session, "original_audio_path", None),
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
 
 
 def _extract_backing_track_from_vocals(
@@ -3461,7 +4447,6 @@ def _save_segment_audio_preview(
 
 def _serialize_segments_for_ui(
     segments: List[Dict[str, Any]],
-    audio: AudioSegment,
     session_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     ui_segments: List[Dict[str, Any]] = []
@@ -3514,7 +4499,7 @@ def _cleanup_expired_translate_sessions_locked(now: Optional[float] = None) -> N
 
 
 async def _create_translate_session(
-    original_audio: AudioSegment,
+    original_audio: Optional[AudioSegment],
     dest_language: str,
     prompt: str,
     translate_enabled: bool,
@@ -3527,6 +4512,8 @@ async def _create_translate_session(
     gemini_model: str,
     gemini_api_key: Optional[str],
     backing_track_audio: Optional[AudioSegment] = None,
+    backing_track_path: Optional[str] = None,
+    backing_audio_info: Optional[AudioAssetInfo] = None,
     backing_track_source: str = "none",
     merge_with_backing: bool = False,
     ignore_non_speech: bool = False,
@@ -3543,14 +4530,17 @@ async def _create_translate_session(
     chunk_end_ms: Optional[int] = None,
     chunk_cut_reason: Optional[str] = None,
     chunk_silence_midpoint_ms: Optional[int] = None,
-    persist_media: bool = False,
+    persist_media: bool = True,
     media_format: str = "wav",
     source_audio_filename: Optional[str] = None,
     source_base_name: Optional[str] = None,
     default_speaker_preset: Optional[str] = None,
     default_emotion_weight: Optional[float] = None,
+    original_audio_path: Optional[str] = None,
+    original_audio_info: Optional[AudioAssetInfo] = None,
+    session_id: Optional[str] = None,
 ) -> TranslateSessionData:
-    session_id = uuid.uuid4().hex
+    session_id = session_id or uuid.uuid4().hex
     resolved_base_name = _normalize_base_filename(
         source_base_name,
         fallback=source_audio_filename,
@@ -3561,9 +4551,36 @@ async def _create_translate_session(
         DEFAULT_EMOTION_WEIGHT,
     )
 
+    audio_path = original_audio_path
+    audio_info = original_audio_info
+    if not audio_path and original_audio is None:
+        raise ValueError("Either original_audio or original_audio_path must be provided.")
+    should_persist_audio = persist_media or not audio_path or (audio_path and not os.path.exists(audio_path))
+    if should_persist_audio:
+        if original_audio is None:
+            raise ValueError("Original audio data is required to persist session media.")
+        target_format = media_format or "wav"
+        audio_path, audio_info = _persist_session_audio_segment(session_id, original_audio, "vocals", fmt=target_format)
+    if audio_info is None and audio_path:
+        try:
+            audio_info = _probe_audio_metadata_from_path(audio_path, compute_hash=False)
+        except Exception as exc:
+            print(f"⚠️ Failed to probe audio metadata for {audio_path}: {exc}")
+            audio_info = None
+
+    backing_path = backing_track_path
+    backing_info = backing_audio_info
+    if backing_path is None and backing_track_audio is not None:
+        backing_path, backing_info = _persist_session_audio_segment(session_id, backing_track_audio, "backing", fmt="mp3")
+    if backing_info is None and backing_path:
+        try:
+            backing_info = _probe_audio_metadata_from_path(backing_path, compute_hash=False)
+        except Exception as exc:
+            print(f"⚠️ Failed to probe backing track metadata for {backing_path}: {exc}")
+            backing_info = None
+
     session = TranslateSessionData(
         session_id=session_id,
-        original_audio=original_audio,
         dest_language=dest_language,
         prompt=prompt,
         translate_enabled=translate_enabled,
@@ -3575,7 +4592,12 @@ async def _create_translate_session(
         gemini_chunks=copy.deepcopy(gemini_chunks),
         gemini_model=gemini_model,
         gemini_api_key=gemini_api_key,
-        backing_track_audio=backing_track_audio,
+        source_audio_filename=source_audio_filename,
+        source_base_name=resolved_base_name,
+        original_audio_path=audio_path,
+        original_audio_info=audio_info,
+        backing_track_path=backing_path,
+        backing_audio_info=backing_info,
         backing_track_source=backing_track_source or "none",
         merge_with_backing=merge_with_backing,
         ignore_non_speech=ignore_non_speech,
@@ -3588,8 +4610,6 @@ async def _create_translate_session(
         default_speaker_preset=normalized_default_speaker,
         default_emotion_weight=normalized_default_emotion,
         gemini_raw_text=gemini_raw_text,
-        source_audio_filename=source_audio_filename,
-        source_base_name=resolved_base_name,
         chunk_parent_id=chunk_parent_id,
         chunk_index=chunk_index,
         chunk_start_ms=chunk_start_ms,
@@ -3597,9 +4617,8 @@ async def _create_translate_session(
         chunk_cut_reason=chunk_cut_reason,
         chunk_silence_midpoint_ms=chunk_silence_midpoint_ms,
     )
-    if persist_media:
-        session.original_audio_path = _persist_session_audio_segment(session_id, original_audio, "vocals", fmt=media_format)
-        session.original_audio = None
+    session.original_audio = None
+    session.backing_track_audio = None
     async with ADVANCED_TRANSLATE_SESSION_LOCK:
         _cleanup_expired_translate_sessions_locked()
         ADVANCED_TRANSLATE_SESSIONS[session_id] = session
@@ -3623,6 +4642,7 @@ async def _update_translate_session_segments(
         if session:
             session.base_segments = copy.deepcopy(segments)
             session.created_at = time.time()
+            _refresh_split_cache_for_session(session)
 
 
 async def _update_translate_session_speaker_overrides(
@@ -3695,7 +4715,7 @@ def _guess_audio_format_from_mime(mime_type: Optional[str]) -> Optional[str]:
 
 
 def _prepare_translation_segments(
-    original_audio: AudioSegment,
+    audio_duration_ms: int,
     chunk_data: List[Dict[str, Any]],
     dest_language: str,
     *,
@@ -3703,7 +4723,7 @@ def _prepare_translation_segments(
     min_speech_duration_ms: int = MIN_SPEECH_DURATION_MS,
     max_merge_interval_ms: int = MAX_MERGE_INTERVAL_MS,
 ) -> List[Dict[str, Any]]:
-    total_duration_ms = len(original_audio)
+    total_duration_ms = max(0, int(audio_duration_ms))
     segments: List[Dict[str, Any]] = []
     current_ms = 0
     normalized_profiles = speaker_profiles or []
@@ -3971,6 +4991,253 @@ def _apply_volume_with_ffmpeg(segment: AudioSegment, volume_percent: float) -> A
                     os.remove(path)
                 except Exception:
                     pass
+
+
+@functools.lru_cache(maxsize=1)
+def _ffmpeg_available() -> bool:
+    """Check once if ffmpeg is on PATH."""
+    return shutil.which("ffmpeg") is not None
+
+
+def _ffmpeg_seconds_from_ms(ms: int) -> str:
+    return f"{max(0, int(ms)) / 1000:.3f}"
+
+
+def _ffmpeg_codec_args_for_format(fmt: Optional[str], bitrate: Optional[str]) -> List[str]:
+    fmt_normalized = (fmt or "").lower()
+    codec_map = {
+        "mp3": ["-c:a", "libmp3lame"],
+        "ogg": ["-c:a", "libvorbis"],
+        "opus": ["-c:a", "libopus"],
+        "aac": ["-c:a", "aac"],
+        "webm": ["-c:a", "libopus"],
+        "wav": ["-c:a", "pcm_s16le"],
+        "flac": ["-c:a", "flac"],
+    }
+    codec_args = codec_map.get(fmt_normalized, ["-c:a", "libmp3lame"])
+    if bitrate and fmt_normalized in {"mp3", "ogg", "opus", "aac", "webm"}:
+        codec_args = codec_args + ["-b:a", bitrate]
+    return codec_args
+
+
+def _run_ffmpeg_command(cmd: List[str]) -> None:
+    process = subprocess.run(cmd, capture_output=True, text=True)
+    if process.returncode != 0:
+        stderr = process.stderr.strip()
+        stdout = process.stdout.strip()
+        raise RuntimeError(stderr or stdout or "ffmpeg command failed")
+
+
+def _ffmpeg_extract_segment(
+    input_path: str,
+    output_path: str,
+    start_ms: int,
+    end_ms: int,
+    *,
+    reencode: bool = False,
+    bitrate: Optional[str] = None,
+) -> None:
+    if not _ffmpeg_available():
+        raise RuntimeError("ffmpeg is not available on PATH.")
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input audio not found at {input_path}")
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    duration_ms = max(0, int(end_ms) - int(start_ms))
+    if duration_ms <= 0:
+        raise ValueError("Segment duration must be positive for ffmpeg extraction.")
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        _ffmpeg_seconds_from_ms(start_ms),
+        "-i",
+        input_path,
+        "-t",
+        _ffmpeg_seconds_from_ms(duration_ms),
+    ]
+    if reencode:
+        fmt = os.path.splitext(output_path)[1].lstrip(".") or TRANSLATE_DEFAULT_OUTPUT_FORMAT
+        cmd += _ffmpeg_codec_args_for_format(fmt, bitrate or TRANSLATE_DEFAULT_BITRATE)
+    else:
+        cmd += ["-c", "copy"]
+    cmd.append(output_path)
+
+    try:
+        _run_ffmpeg_command(cmd)
+    except RuntimeError as exc:
+        _safe_remove_file(output_path)
+        if not reencode:
+            _ffmpeg_extract_segment(
+                input_path,
+                output_path,
+                start_ms,
+                end_ms,
+                reencode=True,
+                bitrate=bitrate,
+            )
+        else:
+            raise exc
+
+
+def _ffmpeg_concat_files(
+    input_paths: List[str],
+    output_path: str,
+    *,
+    copy_codec: bool = True,
+    target_format: Optional[str] = None,
+    bitrate: Optional[str] = None,
+) -> None:
+    if not _ffmpeg_available():
+        raise RuntimeError("ffmpeg is not available on PATH.")
+    if not input_paths:
+        raise ValueError("No input files provided for ffmpeg concat.")
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    list_file = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tmp:
+            list_file = tmp.name
+            for path in input_paths:
+                abs_path = os.path.abspath(path)
+                if not os.path.exists(abs_path):
+                    raise FileNotFoundError(f"Input audio for concat not found: {abs_path}")
+                sanitized = abs_path.replace("'", "'\\''")
+                tmp.write(f"file '{sanitized}'\n")
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            list_file,
+        ]
+        if copy_codec:
+            cmd += ["-c", "copy"]
+        else:
+            fmt = target_format or os.path.splitext(output_path)[1].lstrip(".") or TRANSLATE_DEFAULT_OUTPUT_FORMAT
+            cmd += _ffmpeg_codec_args_for_format(fmt, bitrate or TRANSLATE_DEFAULT_BITRATE)
+        cmd.append(output_path)
+
+        try:
+            _run_ffmpeg_command(cmd)
+        except RuntimeError as exc:
+            _safe_remove_file(output_path)
+            if copy_codec:
+                _ffmpeg_concat_files(
+                    input_paths,
+                    output_path,
+                    copy_codec=False,
+                    target_format=target_format,
+                    bitrate=bitrate,
+                )
+            else:
+                raise exc
+    finally:
+        _safe_remove_file(list_file)
+
+
+def _ffmpeg_overlay_tracks(
+    vocals_path: str,
+    backing_path: str,
+    output_path: str,
+    *,
+    vocals_volume: float = 1.0,
+    backing_volume: float = 1.0,
+    output_format: Optional[str] = None,
+    bitrate: Optional[str] = None,
+) -> None:
+    if not _ffmpeg_available():
+        raise RuntimeError("ffmpeg is not available on PATH.")
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    filter_complex = (
+        f"[0:a]volume={vocals_volume}[vocals];"
+        f"[1:a]volume={backing_volume}[backing];"
+        f"[vocals][backing]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
+    )
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        vocals_path,
+        "-i",
+        backing_path,
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[aout]",
+    ]
+    fmt = output_format or os.path.splitext(output_path)[1].lstrip(".") or TRANSLATE_DEFAULT_OUTPUT_FORMAT
+    cmd += _ffmpeg_codec_args_for_format(fmt, bitrate or TRANSLATE_DEFAULT_BITRATE)
+    cmd.append(output_path)
+
+    try:
+        _run_ffmpeg_command(cmd)
+    except RuntimeError as exc:
+        _safe_remove_file(output_path)
+        raise exc
+
+
+def _ffmpeg_concat_to_tempfile(
+    input_paths: List[str],
+    *,
+    output_format: str,
+    bitrate: Optional[str] = None,
+) -> str:
+    suffix = f".{output_format}" if output_format else ".mp3"
+    tmp_file = tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=TRANSLATE_SESSION_MEDIA_DIR)
+    tmp_file.close()
+    try:
+        _ffmpeg_concat_files(
+            input_paths,
+            tmp_file.name,
+            copy_codec=True,
+            target_format=output_format,
+            bitrate=bitrate,
+        )
+        return tmp_file.name
+    except Exception:
+        _safe_remove_file(tmp_file.name)
+        raise
+
+
+def _ffmpeg_overlay_to_tempfile(
+    vocals_path: str,
+    backing_path: str,
+    *,
+    output_format: str,
+    bitrate: Optional[str] = None,
+    vocals_volume: float = 1.0,
+    backing_volume: float = 1.0,
+) -> str:
+    suffix = f".{output_format}" if output_format else ".mp3"
+    tmp_file = tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=TRANSLATE_SESSION_MEDIA_DIR)
+    tmp_file.close()
+    try:
+        _ffmpeg_overlay_tracks(
+            vocals_path,
+            backing_path,
+            tmp_file.name,
+            vocals_volume=vocals_volume,
+            backing_volume=backing_volume,
+            output_format=output_format,
+            bitrate=bitrate,
+        )
+        return tmp_file.name
+    except Exception:
+        _safe_remove_file(tmp_file.name)
+        raise
 
 
 async def _synthesize_translated_audio(
@@ -10920,6 +12187,7 @@ async def api_translate_split_audio(
             upload_filename=uploaded_filename,
             reuse_session=None,
         )
+        input_mime_type_value = audio_mime_type_value or "audio/wav"
 
         split_request_summary = {
             "dest_language": dest_language_value,
@@ -10930,6 +12198,8 @@ async def api_translate_split_audio(
             "super_resolution": apply_super_resolution,
             "base_output_name": resolved_base_name,
         }
+
+        split_profiler = PerfLogger("split:pending")
 
         async def split_stream():
             queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
@@ -10958,29 +12228,26 @@ async def api_translate_split_audio(
                 try:
                     await emit_status(stage="start", message="Split request accepted.", summary=split_request_summary)
 
-                    (
-                        processed_audio,
-                        input_mime_type_value,
-                        _processed_bytes,
-                        _gemini_mime_type,
-                        backing_track_audio,
-                        _merge_flag,
-                        backing_track_source,
-                    ) = await _prepare_audio_assets(
-                        reuse_source_session=None,
+                    audio_prepare_start = time.perf_counter()
+                    clearvoice_assets = await _prepare_clearvoice_for_split(
                         audio_file=audio_file_for_pipeline,
                         audio_reference=audio_reference_value if audio_reference_value else None,
                         preloaded_audio_bytes=preloaded_audio_bytes,
                         source_audio_filename=uploaded_filename,
-                        audio_mime_type_value=audio_mime_type_value,
-                        apply_enhancement=True,
                         apply_super_resolution=apply_super_resolution,
-                        requested_merge_backing=False,
                         emit_status=emit_status,
+                    )
+                    split_profiler.mark(
+                        "prepare_clearvoice_assets",
+                        audio_prepare_start,
+                        extra=(
+                            f"clearvoice_duration={clearvoice_assets.processed_audio_info.duration_ms/1000:.1f}s, "
+                            f"super_resolution={apply_super_resolution}"
+                        ),
                     )
 
                     # Compute cache key based on processed audio + split settings
-                    clearvoice_hash = _compute_bytes_md5(_processed_bytes)
+                    clearvoice_hash = clearvoice_assets.clearvoice_hash
                     split_cache_key = _split_audio_cache_key(
                         clearvoice_hash,
                         min_chunk_minutes=min_minutes,
@@ -10990,8 +12257,54 @@ async def api_translate_split_audio(
                     )
                     
                     print(f"🔍 Checking split audio cache: {split_cache_key}")
+                    cache_lookup_start = time.perf_counter()
                     cached_split_data = _load_split_audio_cache(split_cache_key)
+                    split_profiler.mark(
+                        "split_cache_lookup",
+                        cache_lookup_start,
+                        extra="hit" if cached_split_data else "miss",
+                    )
+                    total_duration_ms = max(0, clearvoice_assets.processed_audio_info.duration_ms)
+                    chunk_batch_id = uuid.uuid4().hex
+                    split_profiler.rename(f"split:{chunk_batch_id}")
+                    vocals_full_path: Optional[str] = None
+                    processed_audio_buffer: Optional[AudioBuffer] = None
+
+                    async def _ensure_vocals_full_path() -> str:
+                        nonlocal vocals_full_path
+                        if vocals_full_path is None:
+                            vocals_full_path = await _run_blocking(
+                                _persist_chunk_batch_media,
+                                chunk_batch_id,
+                                clearvoice_assets.processed_audio_path,
+                                "vocals_full",
+                                fmt="wav",
+                            )
+                        return vocals_full_path
+
+                    async def _ensure_processed_audio_buffer() -> AudioBuffer:
+                        nonlocal processed_audio_buffer, total_duration_ms
+                        if processed_audio_buffer is None:
+                            path = await _ensure_vocals_full_path()
+                            processed_audio_buffer = _load_processed_audio(path)
+                            if processed_audio_buffer.duration_ms:
+                                total_duration_ms = processed_audio_buffer.duration_ms
+                        return processed_audio_buffer
                     
+                    chunk_entries: List[Dict[str, Any]] = []
+                    chunk_specs: List[Dict[str, Any]] = []
+                    chunk_session_manifests: List[Dict[str, Any]] = []
+                    rehydrated_from_cache = False
+                    processed_audio_segment: Optional[AudioSegment] = None
+
+                    async def _ensure_processed_audio_segment() -> AudioSegment:
+                        nonlocal processed_audio_segment
+                        if processed_audio_segment is None:
+                            processed_audio_segment = await _load_audio_segment_from_path(
+                                clearvoice_assets.processed_audio_path
+                            )
+                        return processed_audio_segment
+
                     if cached_split_data:
                         # Reuse cached split MP3 files and metadata!
                         print(f"♻️ Split audio cache hit! Reusing {cached_split_data['chunk_count']} cached MP3 chunks.")
@@ -11003,15 +12316,42 @@ async def api_translate_split_audio(
                         silence_stats = cached_split_data.get("silence_stats", {"cached": True})
                         # Don't preload chunks - will load on-demand or reference cached files
                         use_cached_chunks = True
+                        cached_manifests = cached_split_data.get("chunk_sessions") or []
+                        if cached_manifests:
+                            manifest_lang = (cached_manifests[0].get("dest_language") or "").strip().lower()
+                            requested_lang = dest_language_value.strip().lower()
+                            if not manifest_lang or manifest_lang == requested_lang:
+                                try:
+                                    rehydrate_start = time.perf_counter()
+                                    restored_sessions = await asyncio.gather(
+                                        *[_rehydrate_session_from_manifest(manifest) for manifest in cached_manifests]
+                                    )
+                                    chunk_entries = [_serialize_chunk_session(session) for session in restored_sessions]
+                                    rehydrated_from_cache = True
+                                    chunk_session_manifests = cached_manifests
+                                    split_profiler.mark(
+                                        "rehydrate_chunk_sessions",
+                                        rehydrate_start,
+                                        extra=f"sessions={len(restored_sessions)}",
+                                    )
+                                except Exception as manifest_exc:
+                                    print(f"⚠️ Failed to rehydrate chunk sessions from cache: {manifest_exc}")
                     else:
                         # No cache, analyze and split
                         await emit_status(stage="chunking", message="Analyzing silence to plan chunk ranges...")
+                        plan_ranges_start = time.perf_counter()
+                        processed_buffer = await _ensure_processed_audio_buffer()
                         chunk_ranges, silence_stats = _plan_chunk_ranges(
-                            processed_audio,
+                            processed_buffer,
                             min_chunk_ms=min_chunk_ms,
                             max_chunk_ms=max_chunk_ms,
                             min_silence_ms=min_silence_ms_value,
                             silence_threshold_db=silence_threshold_value,
+                        )
+                        split_profiler.mark(
+                            "plan_chunk_ranges",
+                            plan_ranges_start,
+                            extra=f"ranges={len(chunk_ranges)}, silence_points={silence_stats.get('silence_count', 0)}",
                         )
                         use_cached_chunks = False
 
@@ -11019,36 +12359,26 @@ async def api_translate_split_audio(
                         chunk_ranges = [
                             {
                                 "start_ms": 0,
-                                "end_ms": len(processed_audio),
+                                "end_ms": total_duration_ms,
                                 "cut_reason": "full_audio",
                                 "silence_midpoint_ms": None,
                             }
                         ]
 
-                    chunk_entries: List[Dict[str, Any]] = []
-                    chunk_specs: List[Dict[str, Any]] = []
-                    total_duration_ms = len(processed_audio)
                     gemini_model_name = _get_gemini_model_name()
-                    chunk_batch_id = uuid.uuid4().hex
+                    use_ffmpeg_split = TRANSLATE_USE_FFMPEG_SPLIT_MERGE and _ffmpeg_available()
+                    backing_track_source = clearvoice_assets.backing_track_source or "none"
+                    backing_available = bool(clearvoice_assets.backing_track_path)
                     persist_tasks: List[asyncio.Task] = []
-                    persist_tasks.append(
-                        asyncio.create_task(
-                            _run_blocking(
-                                _persist_chunk_batch_media,
-                                chunk_batch_id,
-                                processed_audio,
-                                "vocals_full",
-                            )
-                        )
-                    )
-                    if backing_track_audio is not None:
+                    if backing_available:
                         persist_tasks.append(
                             asyncio.create_task(
                                 _run_blocking(
                                     _persist_chunk_batch_media,
                                     chunk_batch_id,
-                                    backing_track_audio,
+                                    clearvoice_assets.backing_track_path,
                                     "backing_full",
+                                    fmt="mp3",
                                 )
                             )
                         )
@@ -11057,41 +12387,92 @@ async def api_translate_split_audio(
                         stage="chunking",
                         message=f"Creating up to {len(chunk_ranges)} chunk session(s)...",
                     )
-                    
-                    # Collect chunk audio segments for caching (if not using cache)
-                    new_chunk_segments = [] if not use_cached_chunks else None
 
-                    for chunk_idx, entry in enumerate(chunk_ranges, start=1):
-                        start_ms = entry["start_ms"]
-                        end_ms = entry["end_ms"]
-                        duration_ms = max(0, end_ms - start_ms)
-                        if duration_ms < CHUNK_SPLIT_MIN_CHUNK_MS:
-                            continue
-                        
-                        chunk_mp3_path = None
-                        # When using cache, reference cached file directly; otherwise split from full audio
-                        if use_cached_chunks:
-                            # Use cached MP3 - create minimal AudioSegment to satisfy interface
-                            # We'll set the path directly after session creation to avoid loading
-                            chunk_mp3_path = _split_audio_cache_path(split_cache_key, chunk_idx)
-                            # Create empty AudioSegment as placeholder (won't be used)
-                            chunk_audio = AudioSegment.silent(duration=duration_ms)
-                        else:
-                            # Split from processed audio and collect for caching
-                            chunk_audio = processed_audio[start_ms:end_ms]
-                            new_chunk_segments.append(chunk_audio)
+                    cached_chunk_files = []
+                    if use_cached_chunks:
+                        cached_chunk_files = cached_split_data.get("chunk_files", [])
 
-                        chunk_specs.append(
-                            {
-                                "chunk_idx": chunk_idx,
-                                "chunk_audio": chunk_audio,
-                                "chunk_mp3_path": chunk_mp3_path,
-                                "start_ms": start_ms,
-                                "end_ms": end_ms,
-                                "cut_reason": entry.get("cut_reason"),
-                                "silence_midpoint_ms": entry.get("silence_midpoint_ms"),
-                            }
-                        )
+                    if not rehydrated_from_cache:
+                        for chunk_idx, entry in enumerate(chunk_ranges, start=1):
+                            start_ms = int(entry["start_ms"])
+                            end_ms = int(entry["end_ms"])
+                            duration_ms = max(0, end_ms - start_ms)
+                            if duration_ms < CHUNK_SPLIT_MIN_CHUNK_MS:
+                                continue
+
+                            if use_cached_chunks:
+                                cached_path = None
+                                if cached_chunk_files and chunk_idx - 1 < len(cached_chunk_files):
+                                    cached_path = cached_chunk_files[chunk_idx - 1].get("file_path")
+                                chunk_mp3_path = cached_path or _split_audio_cache_path(split_cache_key, chunk_idx)
+                            else:
+                                chunk_mp3_path = _split_audio_cache_path(split_cache_key, chunk_idx)
+
+                            chunk_specs.append(
+                                {
+                                    "chunk_idx": chunk_idx,
+                                    "chunk_mp3_path": chunk_mp3_path,
+                                    "start_ms": start_ms,
+                                    "end_ms": end_ms,
+                                    "cut_reason": entry.get("cut_reason"),
+                                    "silence_midpoint_ms": entry.get("silence_midpoint_ms"),
+                                }
+                            )
+
+                    if chunk_specs and not use_cached_chunks:
+                        try:
+                            if use_ffmpeg_split:
+                                await emit_status(
+                                    stage="chunking",
+                                    message="Extracting chunk audio files with ffmpeg...",
+                                )
+                                materialize_start = time.perf_counter()
+                                await _materialize_split_chunks_ffmpeg(
+                                    await _ensure_vocals_full_path(),
+                                    chunk_specs,
+                                    emit_status=emit_status,
+                                )
+                                split_profiler.mark(
+                                    "materialize_chunks_ffmpeg",
+                                    materialize_start,
+                                    extra=f"chunks={len(chunk_specs)}",
+                                )
+                            else:
+                                await emit_status(
+                                    stage="chunking",
+                                    message="Exporting chunk audio segments...",
+                                )
+                                materialize_start = time.perf_counter()
+                                await _materialize_split_chunks_pydub(
+                                await _ensure_processed_audio_segment(),
+                                    chunk_specs,
+                                    emit_status=emit_status,
+                                )
+                                split_profiler.mark(
+                                    "materialize_chunks_pydub",
+                                    materialize_start,
+                                    extra=f"chunks={len(chunk_specs)}",
+                                )
+                        except Exception as exc:
+                            if use_ffmpeg_split:
+                                print(f"⚠️ FFmpeg chunk extraction failed: {exc}")
+                                await emit_status(
+                                    stage="chunking",
+                                    message="FFmpeg extraction failed, falling back to in-memory chunk export...",
+                                )
+                                materialize_start = time.perf_counter()
+                                await _materialize_split_chunks_pydub(
+                                await _ensure_processed_audio_segment(),
+                                    chunk_specs,
+                                    emit_status=emit_status,
+                                )
+                                split_profiler.mark(
+                                    "materialize_chunks_pydub_fallback",
+                                    materialize_start,
+                                    extra=f"chunks={len(chunk_specs)}",
+                                )
+                            else:
+                                raise
 
                     if chunk_specs:
                         chunk_counter_lock = asyncio.Lock()
@@ -11101,8 +12482,51 @@ async def api_translate_split_audio(
                         async def _build_chunk_session(spec: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
                             nonlocal created_chunk_counter
                             async with semaphore:
+                                chunk_audio_path = spec["chunk_mp3_path"]
+                                chunk_audio_segment: Optional[AudioSegment] = None
+                                chunk_audio_info: Optional[AudioAssetInfo] = None
+                                path_exists = chunk_audio_path and os.path.exists(chunk_audio_path)
+                                if path_exists:
+                                    try:
+                                        chunk_audio_info = _probe_audio_metadata_from_path(chunk_audio_path, compute_hash=False)
+                                    except Exception as meta_exc:
+                                        print(f"⚠️ Failed to read metadata for cached chunk {chunk_audio_path}: {meta_exc}")
+                                else:
+                                    base_audio = await _ensure_processed_audio_segment()
+                                    chunk_audio_segment = base_audio[spec["start_ms"]:spec["end_ms"]]
+                                    if chunk_audio_path:
+                                        try:
+                                            await _export_audio_segment_to_path(
+                                                chunk_audio_segment,
+                                                chunk_audio_path,
+                                                fmt="mp3",
+                                                bitrate=TRANSLATE_DEFAULT_BITRATE,
+                                            )
+                                            path_exists = True
+                                        except Exception as export_exc:
+                                            print(
+                                                f"⚠️ Failed to persist chunk {spec['chunk_idx']} audio to {chunk_audio_path}: {export_exc}"
+                                            )
+                                            path_exists = False
+                                    chunk_audio_info = _audio_segment_metadata(chunk_audio_segment)
+                                if chunk_audio_info is None:
+                                    duration_ms = max(0, int(spec["end_ms"]) - int(spec["start_ms"]))
+                                    base_audio = await _ensure_processed_audio_segment()
+                                    frame_rate = int(getattr(base_audio, "frame_rate", 44100) or 44100)
+                                    channels = int(getattr(base_audio, "channels", 1) or 1)
+                                    sample_width = int(getattr(base_audio, "sample_width", 2) or 2)
+                                    frame_count = int(frame_rate * (duration_ms / 1000.0))
+                                    chunk_audio_info = AudioAssetInfo(
+                                        duration_ms=duration_ms,
+                                        sample_rate=frame_rate,
+                                        channels=channels,
+                                        sample_width=sample_width,
+                                        frame_count=frame_count,
+                                        hash_md5=None,
+                                    )
+
                                 chunk_session = await _create_translate_session(
-                                    spec["chunk_audio"],
+                                    chunk_audio_segment if not path_exists else None,
                                     dest_language_value,
                                     prompt="",
                                     translate_enabled=True,
@@ -11130,20 +12554,20 @@ async def api_translate_split_audio(
                                     chunk_end_ms=spec["end_ms"],
                                     chunk_cut_reason=spec["cut_reason"],
                                     chunk_silence_midpoint_ms=spec["silence_midpoint_ms"],
-                                    persist_media=False,
+                                    persist_media=not path_exists,
                                     source_audio_filename=uploaded_filename,
                                     source_base_name=resolved_base_name,
+                                    original_audio_path=chunk_audio_path if path_exists else None,
+                                    original_audio_info=chunk_audio_info,
                                 )
 
-                                if use_cached_chunks and spec["chunk_mp3_path"]:
-                                    chunk_session.original_audio = None
-                                    chunk_session.original_audio_path = spec["chunk_mp3_path"]
-
+                                chunk_manifest = _session_to_manifest(chunk_session)
                                 chunk_entry = _serialize_chunk_session(chunk_session)
 
                             async with chunk_counter_lock:
                                 created_chunk_counter += 1
                                 progress_idx = created_chunk_counter
+                                chunk_session_manifests.append(chunk_manifest)
 
                             await emit_status(
                                 stage="chunking",
@@ -11151,24 +12575,115 @@ async def api_translate_split_audio(
                             )
                             return spec["chunk_idx"], chunk_entry
 
+                        build_chunks_start = time.perf_counter()
                         chunk_results = await asyncio.gather(
                             *[asyncio.create_task(_build_chunk_session(spec)) for spec in chunk_specs]
                         )
                         chunk_results.sort(key=lambda item: item[0])
                         chunk_entries = [entry for _, entry in chunk_results]
+                        split_profiler.mark(
+                            "create_chunk_sessions",
+                            build_chunks_start,
+                            extra=f"sessions={len(chunk_entries)}",
+                        )
                     
+                    artifact_discovery_start = time.perf_counter()
+                    artifacts_by_chunk = _discover_existing_chunk_artifacts(resolved_base_name)
+                    split_profiler.mark(
+                        "discover_existing_artifacts",
+                        artifact_discovery_start,
+                        extra=f"chunk_files={len(artifacts_by_chunk)}",
+                    )
+                    reused_artifacts = 0
+                    if artifacts_by_chunk and chunk_entries:
+                        requested_lang_label = (dest_language_value or "").strip().lower()
+                        lang_suffix = _language_code_from_label(dest_language_value).lower()
+                        allow_wildcard_suffix = not requested_lang_label or requested_lang_label == "unspecified"
+                        manifest_by_index = {
+                            manifest.get("chunk_index"): manifest
+                            for manifest in chunk_session_manifests
+                            if manifest.get("chunk_index") is not None
+                        }
+                        for entry in chunk_entries:
+                            idx = entry.get("chunk_index")
+                            if idx is None:
+                                continue
+                            artifact_bundle = artifacts_by_chunk.get(int(idx))
+                            if not artifact_bundle:
+                                continue
+                            audio_candidates = [
+                                item for item in artifact_bundle.get("audio", [])
+                                if item.get("suffix", "").lower() == lang_suffix
+                            ]
+                            subtitle_candidates = [
+                                item for item in artifact_bundle.get("subtitles", [])
+                                if item.get("suffix", "").lower() == lang_suffix
+                            ]
+                            if allow_wildcard_suffix and not audio_candidates:
+                                audio_candidates = artifact_bundle.get("audio", [])
+                            if allow_wildcard_suffix and not subtitle_candidates:
+                                subtitle_candidates = artifact_bundle.get("subtitles", [])
+                            audio_entry = audio_candidates[0] if audio_candidates else None
+                            subtitle_entry = subtitle_candidates[0] if subtitle_candidates else None
+                            if audio_entry:
+                                entry["existing_audio_url"] = audio_entry["url"]
+                                entry["existing_audio_filename"] = audio_entry["filename"]
+                            if subtitle_entry:
+                                entry["existing_subtitle_url"] = subtitle_entry["url"]
+                                entry["existing_subtitle_filename"] = subtitle_entry["filename"]
+                            manifest = manifest_by_index.get(idx)
+                            already_generated = False
+                            if manifest and subtitle_entry:
+                                already_generated = _srt_matches_manifest(manifest, subtitle_entry["path"])
+                            if not already_generated and audio_entry and subtitle_entry:
+                                already_generated = True
+                            entry["already_generated"] = already_generated
+                            if already_generated and audio_entry:
+                                entry["generated"] = True
+                                entry["generated_audio_url"] = audio_entry["url"]
+                                entry["audio_url"] = audio_entry["url"]
+                                entry["output_filename"] = audio_entry["filename"]
+                                entry["output_format"] = audio_entry.get("format") or entry.get("output_format")
+                                if subtitle_entry:
+                                    entry["subtitle_url"] = subtitle_entry["url"]
+                                    entry["subtitle_file_name"] = subtitle_entry["filename"]
+                                reused_artifacts += 1
+                    if reused_artifacts:
+                        print(f"♻️ [{resolved_base_name}] Found {reused_artifacts} pre-generated chunk(s) matching existing artifacts.")
+
                     # Save to cache if we just split the audio (not using cache)
-                    if new_chunk_segments is not None and len(new_chunk_segments) > 0:
+                    if not use_cached_chunks and chunk_specs:
+                        chunk_ranges_for_cache = [
+                            {
+                                "start_ms": spec["start_ms"],
+                                "end_ms": spec["end_ms"],
+                                "cut_reason": spec.get("cut_reason"),
+                                "silence_midpoint_ms": spec.get("silence_midpoint_ms"),
+                            }
+                            for spec in chunk_specs
+                        ]
+                        chunk_audio_paths = [spec["chunk_mp3_path"] for spec in chunk_specs]
                         await emit_status(stage="chunking", message="Caching split audio chunks...")
                         try:
                             # Run cache save in thread pool to avoid blocking
+                            cache_save_start = time.perf_counter()
                             await asyncio.get_event_loop().run_in_executor(
                                 executor,
-                                _save_split_audio_cache,
-                                split_cache_key,
-                                chunk_ranges,
-                                new_chunk_segments,
-                                silence_stats,
+                                functools.partial(
+                                    _save_split_audio_cache,
+                                    split_cache_key,
+                                    chunk_ranges_for_cache,
+                                    None,
+                                    silence_stats,
+                                    chunk_audio_paths=chunk_audio_paths,
+                                    chunk_session_manifests=chunk_session_manifests,
+                                    chunk_batch_id=chunk_batch_id,
+                                ),
+                            )
+                            split_profiler.mark(
+                                "cache_split_artifacts",
+                                cache_save_start,
+                                extra=f"chunks={len(chunk_specs)}",
                             )
                         except Exception as exc:
                             print(f"⚠️ Failed to cache split audio chunks: {exc}")
@@ -11176,7 +12691,7 @@ async def api_translate_split_audio(
                     if not chunk_entries and total_duration_ms >= CHUNK_SPLIT_MIN_CHUNK_MS:
                         await emit_status(stage="chunking", message="Fallback: keeping full audio as single chunk.")
                         fallback_session = await _create_translate_session(
-                            processed_audio,
+                            await _ensure_processed_audio_segment(),
                             dest_language_value,
                             prompt="",
                             translate_enabled=True,
@@ -11204,6 +12719,7 @@ async def api_translate_split_audio(
                             source_audio_filename=uploaded_filename,
                             source_base_name=resolved_base_name,
                         )
+                        chunk_session_manifests.append(_session_to_manifest(fallback_session))
                         chunk_entries.append(_serialize_chunk_session(fallback_session))
 
                     if persist_tasks:
@@ -11239,7 +12755,7 @@ async def api_translate_split_audio(
                         "clearvoice": {
                             "enhancement": True,
                             "super_resolution": apply_super_resolution,
-                            "backing_available": backing_track_audio is not None,
+                            "backing_available": backing_available,
                             "backing_source": backing_track_source,
                         },
                         "session_ttl_seconds": ADVANCED_TRANSLATE_SESSION_TTL_SECONDS,
@@ -11269,6 +12785,7 @@ async def api_translate_split_audio(
                         await heartbeat
                     except asyncio.CancelledError:
                         pass
+                    split_profiler.summary()
                     await queue.put(None)
 
             asyncio.create_task(run_pipeline())
@@ -11294,12 +12811,14 @@ async def api_translate_split_audio(
 async def api_translate_merge_chunks(payload: MergeChunksRequest):
     """API: Merge multiple chunk sessions back into a single audio file."""
     try:
+        merge_profiler = PerfLogger("merge:pending")
         session_ids: List[str] = [
             sid for sid in (payload.chunk_session_ids or []) if isinstance(sid, str) and sid.strip()
         ]
         chunk_batch_id = (payload.chunk_batch_id or "").strip()
 
         sessions: List[TranslateSessionData] = []
+        resolve_start = time.perf_counter()
         if session_ids:
             for sid in session_ids:
                 session = await _get_translate_session(sid)
@@ -11330,33 +12849,36 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
                     "message": "Provide chunk_session_ids (ordered list) or chunk_batch_id to merge.",
                 },
             )
+        merge_profiler.mark("resolve_chunk_sessions", resolve_start, extra=f"sessions={len(sessions)}")
+        if not chunk_batch_id and sessions:
+            chunk_batch_id = sessions[0].chunk_parent_id or ""
+        merge_profiler.rename(f"merge:{chunk_batch_id or 'adhoc'}")
 
         merge_backing_request = _coerce_to_bool(payload.merge_backing_track)
-        merged_audio: Optional[AudioSegment] = None
+        response_format_value = TRANSLATE_DEFAULT_OUTPUT_FORMAT
+        bitrate_value = payload.bitrate or TRANSLATE_DEFAULT_BITRATE
+        use_ffmpeg_merge = TRANSLATE_USE_FFMPEG_SPLIT_MERGE and _ffmpeg_available()
+        merged_audio_path: Optional[str] = None
+        merged_audio_segment: Optional[AudioSegment] = None
+        temp_paths_to_cleanup: List[str] = []
         merged_segments: List[Dict[str, Any]] = []
         chunk_results: List[Dict[str, Any]] = []
         timeline_offset_ms = 0
+        chunk_materials: List[Dict[str, Any]] = []
+        materials_start = time.perf_counter()
         for session in sessions:
-            segment_audio = _load_chunk_audio_for_merge(session)
-            if segment_audio is None:
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "status": "error",
-                        "message": f"Chunk session '{session.session_id}' has no audio available.",
-                    },
-                )
+            chunk_audio_path = _resolve_session_chunk_audio_path(session)
+            chunk_duration_ms = _resolve_chunk_duration_ms(session)
             chunk_results.append(
                 {
                     "session_id": session.session_id,
                     "chunk_index": session.chunk_index,
                     "generated": bool(session.chunk_generated),
-                    "duration_ms": len(segment_audio),
+                    "duration_ms": chunk_duration_ms,
                     "source": "generated" if session.chunk_generated else "original",
                     "audio_url": _chunk_output_url(session) if session.chunk_generated else None,
                 }
             )
-            chunk_duration_ms = len(segment_audio)
             merged_segments.extend(
                 _offset_segments_for_merge(
                     getattr(session, "base_segments", None),
@@ -11365,40 +12887,164 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
                 )
             )
             timeline_offset_ms += chunk_duration_ms
-            merged_audio = segment_audio if merged_audio is None else merged_audio + segment_audio
+            chunk_materials.append(
+                {
+                    "session": session,
+                    "audio_path": chunk_audio_path,
+                    "duration_ms": chunk_duration_ms,
+                }
+            )
+        merge_profiler.mark(
+            "prepare_chunk_materials",
+            materials_start,
+            extra=f"chunks={len(chunk_materials)}, timeline={timeline_offset_ms/1000:.1f}s",
+        )
 
-        if merged_audio is None:
+        if not chunk_materials:
             return JSONResponse(
                 status_code=400,
                 content={"status": "error", "message": "No audio chunks were provided to merge."},
             )
 
-        response_format_value = TRANSLATE_DEFAULT_OUTPUT_FORMAT
-        bitrate_value = payload.bitrate or TRANSLATE_DEFAULT_BITRATE
-        final_audio = merged_audio
+        ffmpeg_concat_paths = [material["audio_path"] for material in chunk_materials]
+        if use_ffmpeg_merge and all(ffmpeg_concat_paths):
+            concat_start = time.perf_counter()
+            try:
+                merged_audio_path = await _run_blocking(
+                    _ffmpeg_concat_to_tempfile,
+                    ffmpeg_concat_paths,
+                    output_format=response_format_value,
+                    bitrate=bitrate_value,
+                )
+                temp_paths_to_cleanup.append(merged_audio_path)
+                merge_profiler.mark(
+                    "ffmpeg_concat",
+                    concat_start,
+                    extra=f"segments={len(ffmpeg_concat_paths)}",
+                )
+            except Exception as exc:
+                merge_profiler.mark(
+                    "ffmpeg_concat_failed",
+                    concat_start,
+                    extra=str(exc),
+                )
+                print(f"⚠️ FFmpeg concat failed, falling back to Python merge: {exc}")
+                merged_audio_path = None
+
+        if merged_audio_path is None:
+            python_concat_start = time.perf_counter()
+            for material in chunk_materials:
+                segment_audio = await _run_blocking(_load_chunk_audio_for_merge, material["session"])
+                if segment_audio is None:
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "status": "error",
+                            "message": f"Chunk session '{material['session'].session_id}' has no audio available.",
+                        },
+                    )
+                merged_audio_segment = segment_audio if merged_audio_segment is None else merged_audio_segment + segment_audio
+            merge_profiler.mark(
+                "python_concat",
+                python_concat_start,
+                extra=f"segments={len(chunk_materials)}",
+            )
+
+        if merged_audio_segment is None and merged_audio_path is None:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "Unable to merge chunk audio."},
+            )
+
+        final_audio_path = merged_audio_path
+        final_audio_segment = merged_audio_segment
         if merge_backing_request:
             batch_id = chunk_batch_id or (sessions[0].chunk_parent_id if sessions else None)
             if batch_id:
                 backing_path = _chunk_batch_media_path(batch_id, "backing_full")
                 if os.path.exists(backing_path):
-                    backing_ext = os.path.splitext(backing_path)[1].lstrip(".") or None
-                    full_backing_audio = AudioSegment.from_file(backing_path, format=backing_ext)
-                    backing_len = len(full_backing_audio)
-                    vocal_len = len(merged_audio)
-                    if backing_len >= vocal_len:
-                        final_audio = full_backing_audio.overlay(merged_audio)
-                    else:
-                        print(
-                            f"⚠️ Backing track ({backing_len} ms) shorter than merged vocals ({vocal_len} ms); using vocal timeline as base."
+                    ffmpeg_bitrate = (
+                        bitrate_value if response_format_value in {"mp3", "ogg", "opus", "aac", "webm"} else None
+                    )
+                    if final_audio_path and use_ffmpeg_merge:
+                        overlay_start = time.perf_counter()
+                        try:
+                            overlay_temp = await _run_blocking(
+                                _ffmpeg_overlay_to_tempfile,
+                                final_audio_path,
+                                backing_path,
+                                output_format=response_format_value,
+                                bitrate=ffmpeg_bitrate,
+                                vocals_volume=1.0,
+                                backing_volume=1.0,
+                            )
+                            temp_paths_to_cleanup.append(final_audio_path)
+                            final_audio_path = overlay_temp
+                            temp_paths_to_cleanup.append(overlay_temp)
+                            final_audio_segment = None
+                            merge_profiler.mark(
+                                "ffmpeg_overlay",
+                                overlay_start,
+                                extra=os.path.basename(backing_path),
+                            )
+                        except Exception as exc:
+                            merge_profiler.mark(
+                                "ffmpeg_overlay_failed",
+                                overlay_start,
+                                extra=str(exc),
+                            )
+                            print(f"⚠️ FFmpeg overlay failed, falling back to Python mix: {exc}")
+                    if final_audio_segment is None:
+                        if final_audio_path:
+                            final_audio_segment = await _load_audio_segment_from_path(final_audio_path)
+                        else:
+                            final_audio_segment = merged_audio_segment
+                    if final_audio_segment is not None:
+                        overlay_python_start = time.perf_counter()
+                        backing_ext = os.path.splitext(backing_path)[1].lstrip(".") or None
+                        full_backing_audio = AudioSegment.from_file(backing_path, format=backing_ext)
+                        backing_len = len(full_backing_audio)
+                        vocal_len = len(final_audio_segment)
+                        if backing_len >= vocal_len:
+                            final_audio_segment = full_backing_audio.overlay(final_audio_segment)
+                        else:
+                            print(
+                                f"⚠️ Backing track ({backing_len} ms) shorter than merged vocals ({vocal_len} ms); using vocal timeline as base."
+                            )
+                            final_audio_segment = final_audio_segment.overlay(full_backing_audio)
+                        final_audio_path = None
+                        merge_profiler.mark(
+                            "python_overlay",
+                            overlay_python_start,
+                            extra=f"backing_len={backing_len}ms,vocals_len={vocal_len}ms",
                         )
-                        final_audio = merged_audio.overlay(full_backing_audio)
                 else:
                     print(f"⚠️ Full backing track not found at {backing_path}; exporting vocals only.")
-        merged_bytes = await _export_audio_segment_bytes(
-            final_audio,
-            fmt=response_format_value,
-            bitrate=bitrate_value if response_format_value in {"mp3", "ogg", "opus", "aac", "webm"} else None,
-        )
+        if final_audio_segment is not None:
+            export_start = time.perf_counter()
+            merged_bytes = await _export_audio_segment_bytes(
+                final_audio_segment,
+                fmt=response_format_value,
+                bitrate=bitrate_value if response_format_value in {"mp3", "ogg", "opus", "aac", "webm"} else None,
+            )
+            merge_profiler.mark(
+                "export_audio_segment",
+                export_start,
+                extra=f"format={response_format_value}",
+            )
+        elif final_audio_path:
+            export_start = time.perf_counter()
+            merged_bytes = await async_read_file(final_audio_path)
+            merge_profiler.mark(
+                "read_final_audio_file",
+                export_start,
+                extra=os.path.basename(final_audio_path),
+            )
+        else:
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": "Failed to render merged audio."},
+            )
 
         template_session = sessions[0]
         resolved_base_name = _normalize_base_filename(
@@ -11412,8 +13058,11 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
         output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
         with open(output_path, "wb") as outfile:
             outfile.write(merged_bytes)
+        for temp_path in temp_paths_to_cleanup:
+            await async_remove_file(temp_path)
 
         audio_url = f"/api/translate_outputs/{output_filename}"
+        subtitle_export_start = time.perf_counter()
         subtitle_translated = _export_srt_from_segments(
             merged_segments,
             base_name=base_stem,
@@ -11428,9 +13077,15 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
             text_kind="source",
             empty_note="No merged speech segments were available for subtitle export.",
         )
+        merge_profiler.mark(
+            "export_subtitles",
+            subtitle_export_start,
+            extra=f"segments={len(merged_segments)}",
+        )
         subtitle_url = subtitle_translated["url"] if subtitle_translated else None
         original_subtitle_url = subtitle_original["url"] if subtitle_original else None
 
+        merge_profiler.summary()
         return JSONResponse(
             status_code=200,
             content={
@@ -11454,6 +13109,8 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
         )
     except Exception as exc:
         traceback.print_exc()
+        if "merge_profiler" in locals():
+            merge_profiler.summary()
         return JSONResponse(
             status_code=500,
             content={"status": "error", "message": f"Failed to merge chunks: {str(exc)}"},
