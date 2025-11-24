@@ -5629,6 +5629,10 @@ async def _gemini_transcribe_translate(
                 response_mime_type="application/json",
                 temperature=DEFAULT_GEMINI_TEMPERATURE,
                 top_p=DEFAULT_GEMINI_TOP_P,
+                thinking_config=types.ThinkingConfig(
+                    include_thoughts=False,
+                    thinkingBudget = -1
+                )
             ),
         )
 
@@ -7487,8 +7491,8 @@ async def home():
                                         <div class="form-group">
                                             <label for="translateGeminiModel">Gemini Model:</label>
                                             <select id="translateGeminiModel" name="gemini_model">
-                                                <option value="gemini-2.5-pro" selected>Gemini 2.5 Pro (highest accuracy)</option>
-                                                <option value="gemini-flash-latest">Gemini Flash Latest (fast)</option>
+                                                <option value="gemini-2.5-pro">Gemini 2.5 Pro (highest accuracy)</option>
+                                                <option value="gemini-flash-latest" selected>Gemini Flash Latest (fast)</option>
                                             </select>
                                             <small style="color: #666; display: block; margin-top: 6px;">
                                                 Choose the Gemini model used for transcription/translation. Flash is faster; Pro is more accurate.
