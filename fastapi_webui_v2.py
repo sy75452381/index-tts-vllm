@@ -29,6 +29,7 @@ import uuid
 from pathlib import Path
 from typing import Any, List, Dict, Optional, Literal, Tuple, Set, Callable, Awaitable, Union
 import logging
+import multiprocessing
 PERF_LOGGER = logging.getLogger("perf")
 if not PERF_LOGGER.handlers:
     handler = logging.StreamHandler(sys.stdout)
@@ -47,7 +48,7 @@ import shutil
 import subprocess
 import urllib.request
 import hashlib
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import copy
 from dataclasses import dataclass, field
 
@@ -314,6 +315,57 @@ CHUNK_BATCH_GENERATE_DELAY_SECONDS = 60
 TRANSLATE_USE_FFMPEG_SPLIT_MERGE = _env_flag("TRANSLATE_USE_FFMPEG_SPLIT_MERGE", True)
 CHUNK_SPLIT_FFMPEG_CONCURRENCY = _env_int("CHUNK_SPLIT_FFMPEG_CONCURRENCY", 2, min_value=1, max_value=8)
 
+CLEARVOICE_PARALLEL_MIN_CHUNK_SECONDS = 300
+CLEARVOICE_PARALLEL_MAX_CHUNK_SECONDS = 1800
+CLEARVOICE_PARALLEL_MAX_WORKERS = 5
+CLEARVOICE_PARALLEL_DEFAULT_CHUNK_SECONDS = _env_int(
+    "CLEARVOICE_PARALLEL_CHUNK_SECONDS",
+    300,
+    min_value=CLEARVOICE_PARALLEL_MIN_CHUNK_SECONDS,
+    max_value=CLEARVOICE_PARALLEL_MAX_CHUNK_SECONDS,
+)
+CLEARVOICE_PARALLEL_DEFAULT_WORKERS = _env_int(
+    "CLEARVOICE_PARALLEL_WORKERS",
+    5,
+    min_value=1,
+    max_value=CLEARVOICE_PARALLEL_MAX_WORKERS,
+)
+CLEARVOICE_PARALLEL_MAX_CHUNKS = 120
+
+
+@dataclass
+class ClearVoiceParallelConfig:
+    enabled: bool = False
+    chunk_seconds: int = CLEARVOICE_PARALLEL_DEFAULT_CHUNK_SECONDS
+    max_workers: int = CLEARVOICE_PARALLEL_DEFAULT_WORKERS
+
+    @property
+    def chunk_ms(self) -> int:
+        return max(1000, int(self.chunk_seconds) * 1000)
+
+    def to_metadata(self) -> Dict[str, Any]:
+        return {
+            "parallel_enabled": bool(self.enabled),
+            "parallel_chunk_seconds": int(self.chunk_seconds),
+            "parallel_max_workers": int(self.max_workers),
+        }
+
+
+@dataclass
+class ClearVoiceParallelChunkJob:
+    chunk_idx: int
+    chunk_path: str
+    apply_enhancement: bool
+    apply_super_resolution: bool
+
+
+@dataclass
+class ClearVoiceParallelChunkResult:
+    chunk_idx: int
+    final_path: str
+    enhancement_path: Optional[str]
+    generated_paths: List[str]
+
 
 async def _run_blocking(func: Callable, *args, **kwargs):
     loop = asyncio.get_event_loop()
@@ -447,6 +499,7 @@ async def _run_clearvoice_pipeline(
     pre_clearvoice_mix_audio: Optional[AudioSegment],
     emit_status: Optional[Callable[..., Awaitable[None]]],
     source_audio_path: Optional[str] = None,
+    clearvoice_parallel_config: Optional[ClearVoiceParallelConfig] = None,
 ) -> Tuple[AudioSegment, Optional[AudioSegment]]:
     if not (apply_enhancement or apply_super_resolution):
         return original_audio, None
@@ -481,6 +534,18 @@ async def _run_clearvoice_pipeline(
             temp_input_path = await _export_audio_segment_to_tempfile(original_audio)
             processed_paths.add(temp_input_path)
 
+        total_duration_ms = int(len(original_audio) if original_audio is not None else 0)
+        parallel_config = (
+            clearvoice_parallel_config if clearvoice_parallel_config and clearvoice_parallel_config.enabled else None
+        )
+        planned_chunks: List[Tuple[int, int]] = []
+        if parallel_config and (apply_enhancement or apply_super_resolution):
+            planned_chunks = _plan_clearvoice_parallel_chunks(total_duration_ms, parallel_config.chunk_ms)
+            if len(planned_chunks) <= 1:
+                parallel_config = None
+        else:
+            parallel_config = None
+
         cache_hash = _compute_file_md5(temp_input_path)
         cache_dir = os.path.join(CLEARVOICE_CACHE_DIR, cache_hash)
         os.makedirs(cache_dir, exist_ok=True)
@@ -505,11 +570,28 @@ async def _run_clearvoice_pipeline(
             print(f"♻️ ClearVoice: Reusing cached MossFormer2_SE_48K output for {cache_hash}.")
 
         if final_processed_path is None:
-            final_processed_local_path, clearvoice_paths, enhancement_output_local = await apply_clearvoice_processing(
-                temp_input_path,
-                apply_enhancement,
-                apply_super_resolution,
-            )
+            if parallel_config:
+                if emit_status:
+                    await emit_status(
+                        stage="enhancement",
+                        message=f"Running ClearVoice in parallel across {len(planned_chunks)} chunk(s)...",
+                    )
+                else:
+                    print(f"⚡ ClearVoice: running parallel ClearVoice across {len(planned_chunks)} chunk(s).")
+                final_processed_local_path, clearvoice_paths, enhancement_output_local = await _run_blocking(
+                    _apply_clearvoice_parallel_sync,
+                    temp_input_path,
+                    total_duration_ms,
+                    apply_enhancement,
+                    apply_super_resolution,
+                    parallel_config,
+                )
+            else:
+                final_processed_local_path, clearvoice_paths, enhancement_output_local = await apply_clearvoice_processing(
+                    temp_input_path,
+                    apply_enhancement,
+                    apply_super_resolution,
+                )
             processed_paths.update(clearvoice_paths)
             processed_paths.add(final_processed_local_path)
             final_processed_path = final_processed_local_path
@@ -639,6 +721,7 @@ async def _prepare_audio_assets(
     custom_backing_audio_reference: Optional[str] = None,
     custom_backing_mime_type_value: Optional[str] = None,
     emit_status: Optional[Callable[..., Awaitable[None]]] = None,
+    clearvoice_parallel_config: Optional[ClearVoiceParallelConfig] = None,
 ) -> Tuple[AudioSegment, str, bytes, str, Optional[AudioSegment], bool, str]:
     source_audio_temp_path: Optional[str] = None
     custom_backing_audio: Optional[AudioSegment] = None
@@ -785,6 +868,7 @@ async def _prepare_audio_assets(
             pre_clearvoice_mix_audio=pre_clearvoice_mix_audio,
             emit_status=emit_status,
             source_audio_path=source_audio_temp_path,
+            clearvoice_parallel_config=clearvoice_parallel_config,
         )
         if backing_track_audio is not None:
             backing_track_source = "extracted"
@@ -898,6 +982,7 @@ async def _prepare_clearvoice_for_split(
     source_audio_filename: Optional[str],
     apply_super_resolution: bool,
     emit_status: Optional[Callable[..., Awaitable[None]]] = None,
+    clearvoice_parallel_config: Optional[ClearVoiceParallelConfig] = None,
 ) -> SplitClearVoiceAssets:
     """
     Prepare ClearVoice-enhanced audio for chunk splitting without decoding the entire track when cached.
@@ -997,6 +1082,7 @@ async def _prepare_clearvoice_for_split(
                 pre_clearvoice_mix_audio=original_audio,
                 emit_status=emit_status,
                 source_audio_path=source_path,
+                clearvoice_parallel_config=clearvoice_parallel_config,
             )
             processed_audio = None
             backing_track_audio = None
@@ -1106,6 +1192,7 @@ async def _build_translation_segments(
     initial_speaker_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     default_speaker_preset: Optional[str] = None,
     default_emotion_weight: Optional[float] = None,
+    clearvoice_settings: Optional[Dict[str, Any]] = None,
 ) -> SegmentBuildResult:
     manual_chunk_data = None
     manual_speaker_profiles: List[Dict[str, Any]] = []
@@ -1217,7 +1304,8 @@ async def _build_translation_segments(
         response_format_value,
         bitrate_value,
         input_mime_type,
-        {
+        clearvoice_settings
+        or {
             "enhancement": apply_enhancement,
             "super_resolution": apply_super_resolution,
         },
@@ -1271,7 +1359,8 @@ async def _build_translation_segments(
         "speaker_profiles": copy.deepcopy(speaker_profiles),
         "speaker_overrides": copy.deepcopy(getattr(session, "speaker_overrides", {})),
         "gemini_raw_text": raw_gemini_response_text,
-        "clearvoice": {
+        "clearvoice": clearvoice_settings
+        or {
             "enhancement": apply_enhancement,
             "super_resolution": apply_super_resolution,
         },
@@ -1356,7 +1445,7 @@ class TranslateSessionData:
     response_format: str
     bitrate: str
     input_mime_type: Optional[str]
-    clearvoice_settings: Dict[str, bool]
+    clearvoice_settings: Dict[str, Any]
     base_segments: List[Dict[str, Any]]
     gemini_chunks: List[Dict[str, Any]]
     gemini_model: str
@@ -3232,6 +3321,7 @@ async def _generate_chunk_audio_from_session(
     if apply_super_resolution and not apply_enhancement:
         apply_enhancement = True
         clearvoice_settings["enhancement"] = True
+    parallel_config = _parallel_config_from_settings(clearvoice_settings)
     resolved_base_name = _normalize_base_filename(
         chunk_session.source_base_name,
         fallback=chunk_session.source_audio_filename,
@@ -3258,6 +3348,7 @@ async def _generate_chunk_audio_from_session(
         custom_backing_audio_reference=None,
         custom_backing_mime_type_value=None,
         emit_status=None,
+        clearvoice_parallel_config=parallel_config,
     )
 
     final_prompt = _resolve_final_prompt(
@@ -3300,6 +3391,7 @@ async def _generate_chunk_audio_from_session(
         initial_speaker_overrides=chunk_session.speaker_overrides,
         default_speaker_preset=default_speaker_preset,
         default_emotion_weight=default_emotion_weight,
+        clearvoice_settings=clearvoice_settings,
     )
 
     audio_payload, _media_type, synthesis_metadata = await _synthesize_translated_audio(
@@ -3481,6 +3573,135 @@ def _extract_backing_track_from_vocals(
     except Exception as exc:
         print(f"⚠️ Failed to extract backing track from ClearVoice output: {exc}")
         return None
+
+
+def _plan_clearvoice_parallel_chunks(total_ms: int, chunk_ms: int) -> List[Tuple[int, int]]:
+    chunk_ms = max(1_000, int(chunk_ms))
+    total_ms = max(0, int(total_ms))
+    if total_ms <= 0:
+        return []
+    ranges: List[Tuple[int, int]] = []
+    start = 0
+    max_chunks = max(1, CLEARVOICE_PARALLEL_MAX_CHUNKS)
+    while start < total_ms and len(ranges) < max_chunks:
+        # If we're at the cap, consume the remainder to avoid truncation.
+        if len(ranges) == max_chunks - 1:
+            end = total_ms
+        else:
+            end = min(total_ms, start + chunk_ms)
+        if end <= start:
+            break
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def _run_clearvoice_chunk_job(job: ClearVoiceParallelChunkJob) -> ClearVoiceParallelChunkResult:
+    final_path, generated_paths, enhancement_path = _apply_clearvoice_processing_sync(
+        job.chunk_path,
+        job.apply_enhancement,
+        job.apply_super_resolution,
+    )
+    cleanup_targets = set(generated_paths or [])
+    cleanup_targets.add(final_path)
+    if enhancement_path:
+        cleanup_targets.add(enhancement_path)
+    return ClearVoiceParallelChunkResult(
+        chunk_idx=job.chunk_idx,
+        final_path=final_path,
+        enhancement_path=enhancement_path,
+        generated_paths=list(cleanup_targets),
+    )
+
+
+def _apply_clearvoice_parallel_sync(
+    input_path: str,
+    total_duration_ms: int,
+    apply_enhancement: bool,
+    apply_super_resolution: bool,
+    config: ClearVoiceParallelConfig,
+) -> Tuple[str, List[str], Optional[str]]:
+    if not config or not config.enabled:
+        return _apply_clearvoice_processing_sync(input_path, apply_enhancement, apply_super_resolution)
+    if not _ffmpeg_available():
+        print("⚠️ ClearVoice parallel requested but ffmpeg is unavailable. Falling back to sequential run.")
+        return _apply_clearvoice_processing_sync(input_path, apply_enhancement, apply_super_resolution)
+
+    chunk_ranges = _plan_clearvoice_parallel_chunks(total_duration_ms, config.chunk_ms)
+    if len(chunk_ranges) <= 1:
+        return _apply_clearvoice_processing_sync(input_path, apply_enhancement, apply_super_resolution)
+
+    cleanup_paths: Set[str] = set()
+
+    def _track(path: Optional[str]) -> None:
+        if path:
+            cleanup_paths.add(path)
+
+    chunk_jobs: List[ClearVoiceParallelChunkJob] = []
+    try:
+        for idx, (start_ms, end_ms) in enumerate(chunk_ranges):
+            fd, chunk_path = tempfile.mkstemp(prefix="cv_parallel_chunk_", suffix=".wav")
+            os.close(fd)
+            _ffmpeg_extract_segment(input_path, chunk_path, start_ms, end_ms, reencode=True)
+            _track(chunk_path)
+            chunk_jobs.append(
+                ClearVoiceParallelChunkJob(
+                    chunk_idx=idx,
+                    chunk_path=chunk_path,
+                    apply_enhancement=apply_enhancement,
+                    apply_super_resolution=apply_super_resolution,
+                )
+            )
+    except Exception:
+        for path in cleanup_paths:
+            _safe_remove_file(path)
+        raise
+
+    ctx = multiprocessing.get_context("spawn")
+    worker_count = max(1, min(config.max_workers, len(chunk_jobs)))
+    results: List[ClearVoiceParallelChunkResult] = []
+    start_time = time.perf_counter()
+    try:
+        with ProcessPoolExecutor(max_workers=worker_count, mp_context=ctx) as pool:
+            futures = [pool.submit(_run_clearvoice_chunk_job, job) for job in chunk_jobs]
+            for future in as_completed(futures):
+                results.append(future.result())
+    except Exception:
+        for path in cleanup_paths:
+            _safe_remove_file(path)
+        raise
+
+    results.sort(key=lambda item: item.chunk_idx)
+    for res in results:
+        for generated in res.generated_paths:
+            _track(generated)
+
+    final_chunk_paths = [res.final_path for res in results]
+    enhancement_chunk_paths = [res.enhancement_path for res in results if res.enhancement_path]
+
+    fd, final_concat_path = tempfile.mkstemp(prefix="cv_parallel_final_", suffix=".wav")
+    os.close(fd)
+    _ffmpeg_concat_files(final_chunk_paths, final_concat_path, copy_codec=True, target_format="wav")
+    _track(final_concat_path)
+
+    enhancement_concat_path: Optional[str] = None
+    if apply_enhancement and enhancement_chunk_paths:
+        fd, enhancement_concat_path = tempfile.mkstemp(prefix="cv_parallel_enh_", suffix=".wav")
+        os.close(fd)
+        _ffmpeg_concat_files(
+            enhancement_chunk_paths,
+            enhancement_concat_path,
+            copy_codec=True,
+            target_format="wav",
+        )
+        _track(enhancement_concat_path)
+
+    elapsed = time.perf_counter() - start_time
+    print(
+        f"⚡ ClearVoice parallel processed {len(final_chunk_paths)} chunk(s) "
+        f"in {elapsed:.2f}s using {worker_count} worker(s)."
+    )
+    return final_concat_path, list(cleanup_paths), enhancement_concat_path
 
 
 def _apply_clearvoice_processing_sync(
@@ -4125,6 +4346,55 @@ def _coerce_positive_int(
     return parsed
 
 
+def _coerce_clearvoice_parallel_config(
+    enabled_value: Any,
+    chunk_seconds_value: Any,
+    max_workers_value: Any,
+) -> ClearVoiceParallelConfig:
+    chunk_seconds = _coerce_positive_int(
+        chunk_seconds_value,
+        CLEARVOICE_PARALLEL_DEFAULT_CHUNK_SECONDS,
+        min_value=CLEARVOICE_PARALLEL_MIN_CHUNK_SECONDS,
+        max_value=CLEARVOICE_PARALLEL_MAX_CHUNK_SECONDS,
+    )
+    max_workers = _coerce_positive_int(
+        max_workers_value,
+        CLEARVOICE_PARALLEL_DEFAULT_WORKERS,
+        min_value=1,
+        max_value=CLEARVOICE_PARALLEL_MAX_WORKERS,
+    )
+    enabled = _coerce_to_bool(enabled_value)
+    return ClearVoiceParallelConfig(
+        enabled=enabled,
+        chunk_seconds=chunk_seconds,
+        max_workers=max_workers,
+    )
+
+
+def _parallel_config_from_settings(settings: Optional[Dict[str, Any]]) -> Optional[ClearVoiceParallelConfig]:
+    if not settings:
+        return None
+    if not _coerce_to_bool(settings.get("parallel_enabled")):
+        return None
+    chunk_seconds = _coerce_positive_int(
+        settings.get("parallel_chunk_seconds"),
+        CLEARVOICE_PARALLEL_DEFAULT_CHUNK_SECONDS,
+        min_value=CLEARVOICE_PARALLEL_MIN_CHUNK_SECONDS,
+        max_value=CLEARVOICE_PARALLEL_MAX_CHUNK_SECONDS,
+    )
+    max_workers = _coerce_positive_int(
+        settings.get("parallel_max_workers"),
+        CLEARVOICE_PARALLEL_DEFAULT_WORKERS,
+        min_value=1,
+        max_value=CLEARVOICE_PARALLEL_MAX_WORKERS,
+    )
+    return ClearVoiceParallelConfig(
+        enabled=True,
+        chunk_seconds=chunk_seconds,
+        max_workers=max_workers,
+    )
+
+
 def _coerce_positive_float(
     value: Any,
     default: float,
@@ -4506,7 +4776,7 @@ async def _create_translate_session(
     response_format: str,
     bitrate: str,
     input_mime_type: Optional[str],
-    clearvoice_settings: Dict[str, bool],
+    clearvoice_settings: Dict[str, Any],
     base_segments: List[Dict[str, Any]],
     gemini_chunks: List[Dict[str, Any]],
     gemini_model: str,
@@ -5247,7 +5517,7 @@ async def _synthesize_translated_audio(
     response_format: str = TRANSLATE_DEFAULT_OUTPUT_FORMAT,
     bitrate: str = TRANSLATE_DEFAULT_BITRATE,
     input_mime_type: Optional[str] = None,
-    clearvoice_settings: Optional[Dict[str, bool]] = None,
+    clearvoice_settings: Optional[Dict[str, Any]] = None,
     backing_track_audio: Optional[AudioSegment] = None,
     backing_track_source: str = "none",
     merge_with_backing: bool = False,
@@ -6023,6 +6293,18 @@ class TranslateRequest(BaseModel):
     super_resolution_voice: Optional[bool] = Field(
         default=False,
         description="Apply ClearVoice MossFormer2_SR_48K super-resolution before translation.",
+    )
+    clearvoice_parallel_enabled: Optional[bool] = Field(
+        default=False,
+        description="Enable experimental ClearVoice parallel chunk processing for faster separation.",
+    )
+    clearvoice_parallel_chunk_seconds: Optional[int] = Field(
+        default=None,
+        description="When parallel ClearVoice is enabled, chunk duration in seconds (default 180s).",
+    )
+    clearvoice_parallel_max_workers: Optional[int] = Field(
+        default=None,
+        description="When parallel ClearVoice is enabled, maximum concurrent worker processes (max 5).",
     )
     merge_backing_track: Optional[bool] = Field(
         default=False,
@@ -7413,6 +7695,27 @@ async def home():
                                             <small style="color: #666; margin-top: 5px; display: block;">
                                                 ClearVoice runs locally before contacting Gemini. Enable it for cleaner vocals, optional super-resolution, and backing-track extraction.
                                             </small>
+                                            <div style="margin-top: 12px; padding: 12px; border-radius: 12px; background: rgba(118,75,162,0.08);">
+                                                <label style="display: flex; align-items: center; gap: 10px; font-weight: 500;">
+                                                    <input type="checkbox" id="translateClearVoiceParallel">
+                                                    <span>Accelerate ClearVoice with parallel chunk processing (beta)</span>
+                                                </label>
+                                                <small style="color:#666;margin-top:4px;display:block;">
+                                                    Splits the normalized WAV into shorter chunks, runs MossFormer models in separate worker processes (max 5), then recombines for faster vocals.
+                                                </small>
+                                                <div id="translateParallelSettings" style="display:none;margin-top:10px;gap:12px;flex-wrap:wrap;">
+                                                    <div style="margin-bottom:10px;">
+                                                        <label for="translateParallelChunkSeconds" style="font-weight:500;display:block;">Chunk length (seconds):</label>
+                                                        <input type="number" id="translateParallelChunkSeconds" value="300" min="300" max="1800" step="30">
+                                                        <small style="color:#666;display:block;margin-top:4px;">Shorter chunks improve concurrency but may increase seams.</small>
+                                                    </div>
+                                                    <div style="margin-bottom:10px;">
+                                                        <label for="translateParallelMaxWorkers" style="font-weight:500;display:block;">Max workers (processes):</label>
+                                                        <input type="number" id="translateParallelMaxWorkers" value="5" min="1" max="5" step="1">
+                                                        <small style="color:#666;display:block;margin-top:4px;">Each worker loads ClearVoice models independently.</small>
+                                                    </div>
+                                                </div>
+                                            </div>
                                             <div style="margin-top: 12px; padding: 12px; border-radius: 12px; background: rgba(102,126,234,0.08);">
                                                 <label style="display: flex; align-items: center; gap: 10px; font-weight: 500;">
                                                     <input type="checkbox" id="translateEnableChunkSplit">
@@ -7809,7 +8112,7 @@ async def home():
                             <li><strong>POST /add_speaker</strong> - Register a new speaker with reference audio
                                 <ul style="margin-left: 20px; margin-top: 5px; color: #666;">
                                     <li>Form data: <code>name</code> (string), <code>audio_file</code> (file upload)</li>
-                                    <li>Optional form data: <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) — toggles ClearVoice MossFormer2_SE_48K and MossFormer2_SR_48K (both default to <code>false</code>); <code>merge_backing_track</code> (bool) mixes regenerated speech onto the extracted instrumental (requires enhancement); <code>min_speech_ms</code>/<code>max_merge_ms</code> override the segment-merging heuristics (set <code>max_merge_ms</code> to 0 to skip merging entirely); <code>segments_json</code> lets you supply Gemini-style JSON to skip inference.</li>
+                                    <li>Optional form data: <code>enhance_voice</code> (bool), <code>super_resolution_voice</code> (bool) — toggles ClearVoice MossFormer2_SE_48K and MossFormer2_SR_48K (both default to <code>false</code>); <code>clearvoice_parallel_enabled</code> (bool) with <code>clearvoice_parallel_chunk_seconds</code>/<code>clearvoice_parallel_max_workers</code> controls the experimental multi-process ClearVoice pipeline; <code>merge_backing_track</code> (bool) mixes regenerated speech onto the extracted instrumental (requires enhancement); <code>min_speech_ms</code>/<code>max_merge_ms</code> override the segment-merging heuristics (set <code>max_merge_ms</code> to 0 to skip merging entirely); <code>segments_json</code> lets you supply Gemini-style JSON to skip inference.</li>
                                     <li>Audio will be automatically trimmed to 3-15 seconds at silence points; when both toggles are enabled, enhancement runs before super-resolution</li>
                                 </ul>
                             </li>
@@ -8426,6 +8729,10 @@ async def home():
             const translateChunkMinSilenceInput = document.getElementById('translateChunkMinSilenceMs');
             const translateChunkMinHint = document.getElementById('translateChunkMinHint');
             const translateChunkMaxHint = document.getElementById('translateChunkMaxHint');
+            const translateParallelToggle = document.getElementById('translateClearVoiceParallel');
+            const translateParallelSettings = document.getElementById('translateParallelSettings');
+            const translateParallelChunkInput = document.getElementById('translateParallelChunkSeconds');
+            const translateParallelWorkersInput = document.getElementById('translateParallelMaxWorkers');
             const translateChunkResults = document.getElementById('translateChunkResults');
             const translateChunkSummary = document.getElementById('translateChunkSummary');
             const translateChunkList = document.getElementById('translateChunkList');
@@ -8523,6 +8830,41 @@ async def home():
                 });
             }
             updateFfmpegCommands();
+
+            function updateParallelSettingsVisibility() {
+                if (!translateParallelToggle || !translateParallelSettings) {
+                    return;
+                }
+                const enhancementEnabled = translateEnhanceEl && translateEnhanceEl.checked;
+                translateParallelToggle.disabled = !enhancementEnabled;
+                if (!enhancementEnabled) {
+                    translateParallelToggle.checked = false;
+                }
+                translateParallelSettings.style.display =
+                    enhancementEnabled && translateParallelToggle.checked ? 'flex' : 'none';
+            }
+            if (translateParallelToggle) {
+                translateParallelToggle.addEventListener('change', updateParallelSettingsVisibility);
+            }
+            if (translateEnhanceEl) {
+                translateEnhanceEl.addEventListener('change', updateParallelSettingsVisibility);
+            }
+            updateParallelSettingsVisibility();
+
+            function appendClearVoiceParallelSettings(formData) {
+                if (!formData || !translateParallelToggle) {
+                    return;
+                }
+                const enhancementEnabled = translateEnhanceEl && translateEnhanceEl.checked;
+                const enabled = enhancementEnabled && translateParallelToggle.checked && !translateParallelToggle.disabled;
+                formData.append('clearvoice_parallel_enabled', enabled ? 'true' : 'false');
+                if (enabled && translateParallelChunkInput && translateParallelChunkInput.value) {
+                    formData.append('clearvoice_parallel_chunk_seconds', translateParallelChunkInput.value);
+                }
+                if (enabled && translateParallelWorkersInput && translateParallelWorkersInput.value) {
+                    formData.append('clearvoice_parallel_max_workers', translateParallelWorkersInput.value);
+                }
+            }
 
             translateStepToggles.forEach((toggle) => {
                 const step = toggle.closest('.translate-step');
@@ -9298,6 +9640,7 @@ async def home():
                 }
                 formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
                 formData.append('enhance_voice', 'true');
+                appendClearVoiceParallelSettings(formData);
                 if (translateBaseFilenameInput && translateBaseFilenameInput.value.trim()) {
                     formData.append('base_filename', translateBaseFilenameInput.value.trim());
                 }
@@ -10918,6 +11261,7 @@ async def home():
                         formData.append('merge_backing_track', translateMergeBackEl && translateMergeBackEl.checked ? 'true' : 'false');
                         formData.append('ignore_non_speech', translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? 'true' : 'false');
                         formData.append('preserve_silence_audio', translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? 'true' : 'false');
+                        appendClearVoiceParallelSettings(formData);
                         if (translateBaseFilenameInput && translateBaseFilenameInput.value.trim()) {
                             formData.append('base_filename', translateBaseFilenameInput.value.trim());
                         }
@@ -10982,6 +11326,7 @@ async def home():
                     formData.append('merge_backing_track', translateMergeBackEl && translateMergeBackEl.checked ? 'true' : 'false');
                     formData.append('ignore_non_speech', translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? 'true' : 'false');
                     formData.append('preserve_silence_audio', translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? 'true' : 'false');
+                    appendClearVoiceParallelSettings(formData);
                     if (translateBaseFilenameInput && translateBaseFilenameInput.value.trim()) {
                         formData.append('base_filename', translateBaseFilenameInput.value.trim());
                     }
@@ -12079,6 +12424,9 @@ async def api_translate_split_audio(
     min_silence_ms: Optional[int] = Form(None),
     silence_threshold_db: Optional[float] = Form(None),
     super_resolution_voice: Optional[bool] = Form(False),
+    clearvoice_parallel_enabled: Optional[bool] = Form(False),
+    clearvoice_parallel_chunk_seconds: Optional[int] = Form(None),
+    clearvoice_parallel_max_workers: Optional[int] = Form(None),
     audio_file: Optional[UploadFile] = File(None),
 ):
     """API: Split long audio into ClearVoice-enhanced chunks for reuse."""
@@ -12093,6 +12441,9 @@ async def api_translate_split_audio(
 
     try:
         payload: Optional[Dict[str, Any]] = None
+        clearvoice_parallel_enabled_value = clearvoice_parallel_enabled
+        clearvoice_parallel_chunk_seconds_value = clearvoice_parallel_chunk_seconds
+        clearvoice_parallel_max_workers_value = clearvoice_parallel_max_workers
         content_type = request.headers.get("content-type", "")
         if (
             audio_file is None
@@ -12117,6 +12468,15 @@ async def api_translate_split_audio(
             min_silence_ms = payload.get("min_silence_ms", min_silence_ms)
             silence_threshold_db = payload.get("silence_threshold_db", silence_threshold_db)
             super_resolution_voice = payload.get("super_resolution_voice", super_resolution_voice)
+            clearvoice_parallel_enabled_value = payload.get(
+                "clearvoice_parallel_enabled", clearvoice_parallel_enabled_value
+            )
+            clearvoice_parallel_chunk_seconds_value = payload.get(
+                "clearvoice_parallel_chunk_seconds", clearvoice_parallel_chunk_seconds_value
+            )
+            clearvoice_parallel_max_workers_value = payload.get(
+                "clearvoice_parallel_max_workers", clearvoice_parallel_max_workers_value
+            )
 
         audio_reference_value = (audio or "").strip()
         if audio_file is None and not audio_reference_value:
@@ -12130,6 +12490,11 @@ async def api_translate_split_audio(
 
         dest_language_value = (dest_language or "").strip() or "unspecified"
         apply_super_resolution = _coerce_to_bool(super_resolution_voice)
+        parallel_config = _coerce_clearvoice_parallel_config(
+            clearvoice_parallel_enabled_value,
+            clearvoice_parallel_chunk_seconds_value,
+            clearvoice_parallel_max_workers_value,
+        )
         min_minutes = _coerce_positive_float(
             chunk_min_minutes,
             CHUNK_SPLIT_DEFAULT_MIN_MINUTES,
@@ -12200,6 +12565,7 @@ async def api_translate_split_audio(
             "min_silence_ms": min_silence_ms_value,
             "silence_threshold_db": silence_threshold_value,
             "super_resolution": apply_super_resolution,
+            "clearvoice_parallel": parallel_config.to_metadata(),
             "base_output_name": resolved_base_name,
         }
 
@@ -12240,6 +12606,7 @@ async def api_translate_split_audio(
                         source_audio_filename=uploaded_filename,
                         apply_super_resolution=apply_super_resolution,
                         emit_status=emit_status,
+                        clearvoice_parallel_config=parallel_config if parallel_config.enabled else None,
                     )
                     split_profiler.mark(
                         "prepare_clearvoice_assets",
@@ -12529,6 +12896,13 @@ async def api_translate_split_audio(
                                         hash_md5=None,
                                     )
 
+                                chunk_clearvoice_settings = {
+                                    "enhancement": True,
+                                    "super_resolution": apply_super_resolution,
+                                }
+                                if parallel_config.enabled:
+                                    chunk_clearvoice_settings.update(parallel_config.to_metadata())
+
                                 chunk_session = await _create_translate_session(
                                     chunk_audio_segment if not path_exists else None,
                                     dest_language_value,
@@ -12537,10 +12911,7 @@ async def api_translate_split_audio(
                                     response_format=TRANSLATE_DEFAULT_OUTPUT_FORMAT,
                                     bitrate=TRANSLATE_DEFAULT_BITRATE,
                                     input_mime_type=input_mime_type_value,
-                                    clearvoice_settings={
-                                        "enhancement": True,
-                                        "super_resolution": apply_super_resolution,
-                                    },
+                                    clearvoice_settings=chunk_clearvoice_settings,
                                     base_segments=[],
                                     gemini_chunks=[],
                                     gemini_model=gemini_model_name,
@@ -13358,6 +13729,9 @@ async def api_translate_segments(
     gemini_api_key: Optional[str] = Form(None),
     enhance_voice: Optional[bool] = Form(False),
     super_resolution_voice: Optional[bool] = Form(False),
+    clearvoice_parallel_enabled: Optional[bool] = Form(False),
+    clearvoice_parallel_chunk_seconds: Optional[int] = Form(None),
+    clearvoice_parallel_max_workers: Optional[int] = Form(None),
     merge_backing_track: Optional[bool] = Form(False),
     min_speech_ms: Optional[int] = Form(None),
     max_merge_ms: Optional[int] = Form(None),
@@ -13392,6 +13766,9 @@ async def api_translate_segments(
         gemini_api_key_value = gemini_api_key
         enhance_voice_value = enhance_voice
         super_resolution_voice_value = super_resolution_voice
+        clearvoice_parallel_enabled_value = clearvoice_parallel_enabled
+        clearvoice_parallel_chunk_seconds_value = clearvoice_parallel_chunk_seconds
+        clearvoice_parallel_max_workers_value = clearvoice_parallel_max_workers
         merge_backing_track_value = merge_backing_track
         min_speech_duration_value = min_speech_ms
         max_merge_interval_value = max_merge_ms
@@ -13439,6 +13816,15 @@ async def api_translate_segments(
             gemini_api_key_value = payload.get("gemini_api_key", gemini_api_key_value)
             enhance_voice_value = payload.get("enhance_voice", enhance_voice_value)
             super_resolution_voice_value = payload.get("super_resolution_voice", super_resolution_voice_value)
+            clearvoice_parallel_enabled_value = payload.get(
+                "clearvoice_parallel_enabled", clearvoice_parallel_enabled_value
+            )
+            clearvoice_parallel_chunk_seconds_value = payload.get(
+                "clearvoice_parallel_chunk_seconds", clearvoice_parallel_chunk_seconds_value
+            )
+            clearvoice_parallel_max_workers_value = payload.get(
+                "clearvoice_parallel_max_workers", clearvoice_parallel_max_workers_value
+            )
             merge_backing_track_value = payload.get("merge_backing_track", merge_backing_track_value)
             min_speech_duration_value = payload.get("min_speech_ms", min_speech_duration_value)
             max_merge_interval_value = payload.get("max_merge_ms", max_merge_interval_value)
@@ -13478,6 +13864,13 @@ async def api_translate_segments(
         preserve_silence_audio_flag = _coerce_to_bool(preserve_silence_audio_value)
         apply_enhancement = _coerce_to_bool(enhance_voice_value)
         apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
+        parallel_config = _coerce_clearvoice_parallel_config(
+            clearvoice_parallel_enabled_value,
+            clearvoice_parallel_chunk_seconds_value,
+            clearvoice_parallel_max_workers_value,
+        )
+        if not (apply_enhancement or apply_super_resolution):
+            parallel_config.enabled = False
         if apply_super_resolution and not apply_enhancement:
             apply_enhancement = True
         if apply_super_resolution and not apply_enhancement:
@@ -13528,6 +13921,12 @@ async def api_translate_segments(
         )
         if reuse_source_session is not None and reuse_source_session.chunk_parent_id:
             requested_merge_backing = False
+        clearvoice_settings: Dict[str, Any] = {
+            "enhancement": apply_enhancement,
+            "super_resolution": apply_super_resolution,
+        }
+        if parallel_config.enabled:
+            clearvoice_settings.update(parallel_config.to_metadata())
         resolved_gemini_model = _normalize_gemini_model_name(gemini_model_value)
         gemini_api_key_value = (gemini_api_key_value or "").strip()
         if not default_speaker_value and reuse_source_session:
@@ -13638,6 +14037,7 @@ async def api_translate_segments(
                         custom_backing_audio_reference=custom_backing_audio_value,
                         custom_backing_mime_type_value=custom_backing_audio_mime_type_value,
                         emit_status=emit_status,
+                        clearvoice_parallel_config=parallel_config if parallel_config.enabled else None,
                     )
 
                     final_prompt = _resolve_final_prompt(
@@ -13680,6 +14080,7 @@ async def api_translate_segments(
                         initial_speaker_overrides=getattr(reuse_session_for_segments, "speaker_overrides", None),
                         default_speaker_preset=default_speaker_value,
                         default_emotion_weight=default_emotion_weight_value,
+                        clearvoice_settings=clearvoice_settings,
                     )
 
                     metadata = segment_result.metadata
@@ -14416,6 +14817,9 @@ async def api_translate_audio(
     gemini_api_key: Optional[str] = Form(None),
     enhance_voice: Optional[bool] = Form(False),
     super_resolution_voice: Optional[bool] = Form(False),
+    clearvoice_parallel_enabled: Optional[bool] = Form(False),
+    clearvoice_parallel_chunk_seconds: Optional[int] = Form(None),
+    clearvoice_parallel_max_workers: Optional[int] = Form(None),
     merge_backing_track: Optional[bool] = Form(False),
     min_speech_ms: Optional[int] = Form(None),
     max_merge_ms: Optional[int] = Form(None),
@@ -14449,6 +14853,9 @@ async def api_translate_audio(
         gemini_api_key_value = gemini_api_key
         enhance_voice_value = enhance_voice
         super_resolution_voice_value = super_resolution_voice
+        clearvoice_parallel_enabled_value = clearvoice_parallel_enabled
+        clearvoice_parallel_chunk_seconds_value = clearvoice_parallel_chunk_seconds
+        clearvoice_parallel_max_workers_value = clearvoice_parallel_max_workers
         merge_backing_track_value = merge_backing_track
         min_speech_duration_value = min_speech_ms
         max_merge_interval_value = max_merge_ms
@@ -14502,6 +14909,12 @@ async def api_translate_audio(
             super_resolution_voice_value = (
                 translate_req.super_resolution_voice if translate_req.super_resolution_voice is not None else super_resolution_voice_value
             )
+            if translate_req.clearvoice_parallel_enabled is not None:
+                clearvoice_parallel_enabled_value = translate_req.clearvoice_parallel_enabled
+            if translate_req.clearvoice_parallel_chunk_seconds is not None:
+                clearvoice_parallel_chunk_seconds_value = translate_req.clearvoice_parallel_chunk_seconds
+            if translate_req.clearvoice_parallel_max_workers is not None:
+                clearvoice_parallel_max_workers_value = translate_req.clearvoice_parallel_max_workers
             merge_backing_track_value = (
                 translate_req.merge_backing_track if translate_req.merge_backing_track is not None else merge_backing_track_value
             )
@@ -14582,6 +14995,13 @@ async def api_translate_audio(
         preserve_silence_audio_flag = _coerce_to_bool(preserve_silence_audio_value)
         apply_enhancement = _coerce_to_bool(enhance_voice_value)
         apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
+        parallel_config = _coerce_clearvoice_parallel_config(
+            clearvoice_parallel_enabled_value,
+            clearvoice_parallel_chunk_seconds_value,
+            clearvoice_parallel_max_workers_value,
+        )
+        if not (apply_enhancement or apply_super_resolution):
+            parallel_config.enabled = False
         custom_backing_present = bool(custom_backing_audio_file) or bool((custom_backing_audio_value or "").strip())
         merge_backing_requested_raw = _coerce_to_bool(merge_backing_track_value)
         reuse_backing_available = bool(reuse_source_session and _session_has_backing_audio(reuse_source_session))
@@ -14592,6 +15012,12 @@ async def api_translate_audio(
         )
         if reuse_source_session is not None and reuse_source_session.chunk_parent_id:
             requested_merge_backing = False
+        clearvoice_settings: Dict[str, Any] = {
+            "enhancement": apply_enhancement,
+            "super_resolution": apply_super_resolution,
+        }
+        if parallel_config.enabled:
+            clearvoice_settings.update(parallel_config.to_metadata())
         min_speech_duration = _coerce_positive_int(
             min_speech_duration_value,
             MIN_SPEECH_DURATION_MS,
@@ -14654,6 +15080,7 @@ async def api_translate_audio(
             "bitrate": bitrate_value,
             "enhancement": apply_enhancement,
             "super_resolution": apply_super_resolution,
+            "clearvoice_parallel": parallel_config.to_metadata(),
             "merge_backing": requested_merge_backing,
             "custom_backing": custom_backing_present,
             "ignore_non_speech": ignore_non_speech_flag,
@@ -14736,6 +15163,7 @@ async def api_translate_audio(
                         custom_backing_audio_reference=custom_backing_audio_value,
                         custom_backing_mime_type_value=custom_backing_audio_mime_type_value,
                         emit_status=emit_status,
+                        clearvoice_parallel_config=parallel_config if parallel_config.enabled else None,
                     )
                     input_mime_type_local = input_mime_type_resolved or input_mime_type
 
@@ -14779,6 +15207,7 @@ async def api_translate_audio(
                         initial_speaker_overrides=getattr(reuse_session_for_translate, "speaker_overrides", None),
                         default_speaker_preset=default_speaker_value,
                         default_emotion_weight=default_emotion_weight_value,
+                        clearvoice_settings=clearvoice_settings,
                     )
                     session = segment_result.session
                     segments = segment_result.segments
