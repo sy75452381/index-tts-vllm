@@ -27,6 +27,57 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
+# Patch transformers to fix 'dict' object has no attribute 'model_type' error
+# This must be done before vLLM imports its tokenizer
+def _apply_transformers_config_patch():
+    """
+    Monkey-patch transformers to fix the 'dict' object has no attribute 'model_type' error.
+    This occurs when transformers loads config.json as a dict instead of a PretrainedConfig
+    in certain edge cases with local model directories.
+    
+    The fix patches json.load to wrap dict results from config.json files.
+    """
+    try:
+        import json
+        import os
+        
+        if hasattr(json, '_original_load'):
+            return  # Already patched
+        
+        original_json_load = json.load
+        json._original_load = original_json_load
+        
+        class ConfigDictWrapper(dict):
+            """A dict subclass that also supports attribute access for config fields"""
+            def __getattr__(self, name):
+                if name.startswith('_'):
+                    raise AttributeError(name)
+                try:
+                    return self[name]
+                except KeyError:
+                    return None
+            
+            def __setattr__(self, name, value):
+                self[name] = value
+        
+        def patched_json_load(fp, *args, **kwargs):
+            result = original_json_load(fp, *args, **kwargs)
+            # Check if this looks like a model config file
+            if isinstance(result, dict):
+                # Get filename if available
+                filename = getattr(fp, 'name', '')
+                if filename.endswith('config.json') or 'model_type' in result:
+                    return ConfigDictWrapper(result)
+            return result
+        
+        json.load = patched_json_load
+        print("✓ Applied json.load config patch")
+    except Exception as e:
+        print(f"Warning: Could not apply json.load patch: {e}")
+
+# Apply patch immediately at import time
+_apply_transformers_config_patch()
+
 from vllm import SamplingParams, TokensPrompt
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -836,7 +887,24 @@ class QwenEmotion:
     def __init__(self, model_dir, gpu_memory_utilization=0.1, cache_dir="emotion_cache"):
         self.model_dir = model_dir
         self.cache_dir = cache_dir
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
+        
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_dir,
+                trust_remote_code=True,
+                local_files_only=True,
+                use_fast=True
+            )
+        except AttributeError as e:
+            # Fallback: some transformers versions have issues with config loading
+            # Try loading with explicit tokenizer class
+            print(f"Warning: AutoTokenizer failed ({e}), trying Qwen2Tokenizer directly...")
+            from transformers import Qwen2Tokenizer
+            self.tokenizer = Qwen2Tokenizer.from_pretrained(
+                self.model_dir,
+                trust_remote_code=True,
+                local_files_only=True
+            )
 
         engine_args = AsyncEngineArgs(
             model=model_dir,
@@ -844,6 +912,7 @@ class QwenEmotion:
             dtype="auto",
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=2048,
+            trust_remote_code=True,
         )
         self.model = AsyncLLM.from_engine_args(engine_args)
 
