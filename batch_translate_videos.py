@@ -818,7 +818,7 @@ Examples:
     # Optional arguments
     parser.add_argument(
         "--api-url",
-        default="https://8000-01kawgrqc581se5zc6yfxgp6sp.cloudspaces.litng.ai",
+        default="http://localhost:8000",
         help="IndexTTS API base URL (default: http://localhost:8000)"
     )
     parser.add_argument(
@@ -981,4 +981,5 @@ Examples:
 
 if __name__ == "__main__":
     main()
+
 
