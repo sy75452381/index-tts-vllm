@@ -3457,76 +3457,102 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                 const newline = '\n';
                 let buffer = '';
                 let completed = false;
+                let successfulChunks = 0;
+                let failedChunks = 0;
 
-                while (true) {
-                    const { value, done } = await reader.read();
-                    if (done) {
-                        break;
+                try {
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) {
+                            break;
+                        }
+                        buffer += decoder.decode(value, { stream: true });
+                        let newlineIndex = buffer.indexOf(newline);
+                        while (newlineIndex !== -1) {
+                            const line = buffer.slice(0, newlineIndex).trim();
+                            buffer = buffer.slice(newlineIndex + 1);
+                            newlineIndex = buffer.indexOf(newline);
+                            if (!line) {
+                                continue;
+                            }
+                            let eventData;
+                            try {
+                                eventData = JSON.parse(line);
+                            } catch (parseError) {
+                                console.warn('Failed to parse chunk batch event:', parseError, line);
+                                continue;
+                            }
+                            const eventType = eventData.event || 'status';
+                            if (eventType === 'status') {
+                                const message = eventData.message || 'Processing chunks...';
+                                showStatus(message, 'info', statusId);
+                            } else if (eventType === 'heartbeat') {
+                                // Heartbeat event to keep connection alive - just log it
+                                console.log('Chunk generation heartbeat:', eventData.message);
+                            } else if (eventType === 'chunk_waiting') {
+                                const waitSeconds = Math.ceil(eventData.delay_seconds || 0);
+                                showStatus(
+                                    `Chunk ${eventData.chunk_index ?? ''} scheduled (starts in ~${waitSeconds}s).`,
+                                    'info',
+                                    statusId
+                                );
+                            } else if (eventType === 'chunk_start') {
+                                showStatus(
+                                    `Chunk ${eventData.chunk_index ?? ''} generating...`,
+                                    'success',
+                                    statusId
+                                );
+                            } else if (eventType === 'chunk_complete') {
+                                successfulChunks++;
+                                if (eventData.metadata) {
+                                    applyChunkGenerationMetadata(eventData.metadata, eventData.audio_url, { autoSelect: false });
+                                }
+                                if (eventData.chunk_session_id) {
+                                    translateChunkSelections.delete(eventData.chunk_session_id);
+                                }
+                                const successMessage =
+                                    eventData.message || `Chunk ${eventData.chunk_index ?? ''} generated successfully.`;
+                                showStatus(successMessage, 'success', statusId);
+                                updateChunkBatchControlsVisibility();
+                            } else if (eventType === 'chunk_error') {
+                                failedChunks++;
+                                const message = eventData.message || 'Chunk generation failed.';
+                                showStatus(message, 'error', statusId);
+                            } else if (eventType === 'complete') {
+                                completed = true;
+                                const detailParts = [];
+                                if (typeof eventData.completed_chunks === 'number') {
+                                    detailParts.push(`${eventData.completed_chunks} succeeded`);
+                                }
+                                if (typeof eventData.failed_chunks === 'number') {
+                                    detailParts.push(`${eventData.failed_chunks} failed`);
+                                }
+                                const summaryMessage = eventData.message || 'Chunk batch generation finished.';
+                                const detailMessage = detailParts.length ? ` (${detailParts.join(', ')})` : '';
+                                showStatus(`${summaryMessage}${detailMessage}`, 'success', statusId);
+                            }
+                        }
                     }
-                    buffer += decoder.decode(value, { stream: true });
-                    let newlineIndex = buffer.indexOf(newline);
-                    while (newlineIndex !== -1) {
-                        const line = buffer.slice(0, newlineIndex).trim();
-                        buffer = buffer.slice(newlineIndex + 1);
-                        newlineIndex = buffer.indexOf(newline);
-                        if (!line) {
-                            continue;
-                        }
-                        let eventData;
-                        try {
-                            eventData = JSON.parse(line);
-                        } catch (parseError) {
-                            console.warn('Failed to parse chunk batch event:', parseError, line);
-                            continue;
-                        }
-                        const eventType = eventData.event || 'status';
-                        if (eventType === 'status') {
-                            const message = eventData.message || 'Processing chunks...';
-                            showStatus(message, 'info', statusId);
-                        } else if (eventType === 'chunk_waiting') {
-                            const waitSeconds = Math.ceil(eventData.delay_seconds || 0);
-                            showStatus(
-                                `Chunk ${eventData.chunk_index ?? ''} scheduled (starts in ~${waitSeconds}s).`,
-                                'info',
-                                statusId
-                            );
-                        } else if (eventType === 'chunk_start') {
-                            showStatus(
-                                `Chunk ${eventData.chunk_index ?? ''} generating...`,
-                                'success',
-                                statusId
-                            );
-                        } else if (eventType === 'chunk_complete') {
-                            if (eventData.metadata) {
-                                applyChunkGenerationMetadata(eventData.metadata, eventData.audio_url, { autoSelect: false });
-                            }
-                            if (eventData.chunk_session_id) {
-                                translateChunkSelections.delete(eventData.chunk_session_id);
-                            }
-                            const successMessage =
-                                eventData.message || `Chunk ${eventData.chunk_index ?? ''} generated successfully.`;
-                            showStatus(successMessage, 'success', statusId);
-                            updateChunkBatchControlsVisibility();
-                        } else if (eventType === 'chunk_error') {
-                            const message = eventData.message || 'Chunk generation failed.';
-                            showStatus(message, 'error', statusId);
-                        } else if (eventType === 'complete') {
-                            completed = true;
-                            const detailParts = [];
-                            if (typeof eventData.completed_chunks === 'number') {
-                                detailParts.push(`${eventData.completed_chunks} succeeded`);
-                            }
-                            if (typeof eventData.failed_chunks === 'number') {
-                                detailParts.push(`${eventData.failed_chunks} failed`);
-                            }
-                            const summaryMessage = eventData.message || 'Chunk batch generation finished.';
-                            const detailMessage = detailParts.length ? ` (${detailParts.join(', ')})` : '';
-                            showStatus(`${summaryMessage}${detailMessage}`, 'success', statusId);
-                        }
+                } catch (streamError) {
+                    console.error('Stream read error during chunk generation:', streamError);
+                    // If we already processed some chunks successfully, show a partial success message
+                    if (successfulChunks > 0) {
+                        const partialMessage = `Connection interrupted. ${successfulChunks} chunk(s) completed before error. You can retry the remaining chunks.`;
+                        showStatus(partialMessage, 'warning', statusId);
+                        updateChunkBatchControlsVisibility();
+                        return; // Don't throw, partial success
                     }
+                    throw streamError;
                 }
 
                 if (!completed) {
+                    // If we have successful chunks but didn't get complete event, show partial success
+                    if (successfulChunks > 0) {
+                        const partialMessage = `Stream ended early. ${successfulChunks} chunk(s) completed. You can retry the remaining chunks.`;
+                        showStatus(partialMessage, 'warning', statusId);
+                        updateChunkBatchControlsVisibility();
+                        return;
+                    }
                     const message = 'Chunk batch generation stream ended unexpectedly.';
                     showStatus(message, 'error', statusId);
                     throw new Error(message);

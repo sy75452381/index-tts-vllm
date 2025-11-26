@@ -1721,6 +1721,7 @@ def _save_split_audio_cache(
     chunk_audio_paths: Optional[List[Optional[str]]] = None,
     chunk_session_manifests: Optional[List[Dict[str, Any]]] = None,
     chunk_batch_id: Optional[str] = None,
+    base_output_name: Optional[str] = None,
 ) -> None:
     """
     Save split audio chunks as MP3 files and metadata to cache.
@@ -1786,6 +1787,7 @@ def _save_split_audio_cache(
             "silence_stats": silence_stats,
             "chunk_sessions": chunk_session_manifests or [],
             "chunk_batch_id": chunk_batch_id,
+            "base_output_name": base_output_name,
         }
         
         metadata_path = _split_audio_metadata_path(cache_key)
@@ -7139,6 +7141,14 @@ async def api_translate_split_audio(
                         # Don't preload chunks - will load on-demand or reference cached files
                         use_cached_chunks = True
                         cached_manifests = cached_split_data.get("chunk_sessions") or []
+                        # Use cached base name for artifact discovery if available
+                        cached_base_name = cached_split_data.get("base_output_name")
+                        if cached_base_name:
+                            resolved_base_name = cached_base_name
+                            print(f"♻️ Using cached base name for artifact discovery: {resolved_base_name}")
+                        elif cached_manifests and cached_manifests[0].get("source_base_name"):
+                            resolved_base_name = cached_manifests[0]["source_base_name"]
+                            print(f"♻️ Using manifest base name for artifact discovery: {resolved_base_name}")
                         if cached_manifests:
                             manifest_lang = (cached_manifests[0].get("dest_language") or "").strip().lower()
                             requested_lang = dest_language_value.strip().lower()
@@ -7504,6 +7514,7 @@ async def api_translate_split_audio(
                                     chunk_audio_paths=chunk_audio_paths,
                                     chunk_session_manifests=chunk_session_manifests,
                                     chunk_batch_id=chunk_batch_id,
+                                    base_output_name=resolved_base_name,
                                 ),
                             )
                             split_profiler.mark(
@@ -8048,14 +8059,17 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
                 }
                 await queue.put(event)
 
-            async def run_batch():
-                await emit(
-                    "status",
-                    stage="start",
-                    message=f"Queued {len(sessions)} chunk(s) for generation.",
-                    summary=summary_payload,
-                )
+            async def heartbeat_task():
+                """Send periodic heartbeat to keep connection alive during long chunk generation."""
+                try:
+                    while True:
+                        await asyncio.sleep(15)
+                        await emit("heartbeat", message="Still generating chunks...")
+                except asyncio.CancelledError:
+                    pass
 
+            async def run_batch():
+                heartbeat = asyncio.create_task(heartbeat_task())
                 success_count = 0
                 failure_count = 0
                 counter_lock = asyncio.Lock()
@@ -8129,19 +8143,33 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
                             message=f"Chunk generation failed: {str(exc)}",
                         )
 
-                tasks = [
-                    asyncio.create_task(handle_chunk(session, idx))
-                    for idx, session in enumerate(sessions)
-                ]
-                await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    await emit(
+                        "status",
+                        stage="start",
+                        message=f"Queued {len(sessions)} chunk(s) for generation.",
+                        summary=summary_payload,
+                    )
 
-                await emit(
-                    "complete",
-                    message="Chunk batch generation finished.",
-                    total_chunks=len(sessions),
-                    completed_chunks=success_count,
-                    failed_chunks=failure_count,
-                )
+                    tasks = [
+                        asyncio.create_task(handle_chunk(session, idx))
+                        for idx, session in enumerate(sessions)
+                    ]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+                    await emit(
+                        "complete",
+                        message="Chunk batch generation finished.",
+                        total_chunks=len(sessions),
+                        completed_chunks=success_count,
+                        failed_chunks=failure_count,
+                    )
+                finally:
+                    heartbeat.cancel()
+                    try:
+                        await heartbeat
+                    except asyncio.CancelledError:
+                        pass
                 await queue.put(None)
 
             asyncio.create_task(run_batch())
