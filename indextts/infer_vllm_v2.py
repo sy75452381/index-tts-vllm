@@ -138,20 +138,66 @@ class IndexTTS2:
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
         self.use_torch_compile = use_torch_compile
 
+        # =============================================================
+        # vLLM ENGINE INITIALIZATION
+        # Parallel init only for GPUs with >40GB VRAM (e.g., A100)
+        # Sequential init for smaller GPUs (e.g., L4, T4) to avoid OOM
+        # =============================================================
+        from concurrent.futures import ThreadPoolExecutor
+        import time as _time
+        
         vllm_dir = os.path.join(model_dir, "gpt")
-        engine_args = AsyncEngineArgs(
-            model=vllm_dir,
-            tensor_parallel_size=1,
-            dtype="auto",
-            gpu_memory_utilization=gpu_memory_utilization,
-            # enforce_eager=True,
-        )
-        indextts_vllm = AsyncLLM.from_engine_args(engine_args)
-
-        self.qwen_emo = QwenEmotion(
-            os.path.join(self.model_dir, self.cfg.qwen_emo_path),
-            gpu_memory_utilization=qwenemo_gpu_memory_utilization,
-        )
+        qwen_emo_path = os.path.join(self.model_dir, self.cfg.qwen_emo_path)
+        
+        # Check GPU VRAM to decide initialization strategy
+        gpu_vram_gb = 0
+        if torch.cuda.is_available():
+            gpu_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            print(f"🔍 Detected GPU VRAM: {gpu_vram_gb:.1f} GB")
+        
+        use_parallel_init = gpu_vram_gb > 40  # Only parallel init for >40GB GPUs
+        
+        def init_gpt_vllm():
+            """Initialize GPT vLLM engine"""
+            _start = _time.time()
+            engine_args = AsyncEngineArgs(
+                model=vllm_dir,
+                tensor_parallel_size=1,
+                dtype="auto",
+                gpu_memory_utilization=gpu_memory_utilization,
+            )
+            engine = AsyncLLM.from_engine_args(engine_args)
+            print(f"⏱️ GPT vLLM engine initialized in {_time.time() - _start:.2f}s")
+            return engine
+        
+        def init_qwen_vllm():
+            """Initialize Qwen emotion vLLM engine"""
+            _start = _time.time()
+            qwen = QwenEmotion(
+                qwen_emo_path,
+                gpu_memory_utilization=qwenemo_gpu_memory_utilization,
+            )
+            print(f"⏱️ Qwen vLLM engine initialized in {_time.time() - _start:.2f}s")
+            return qwen
+        
+        _init_start = _time.time()
+        
+        if use_parallel_init:
+            # Parallel initialization for large VRAM GPUs (>40GB)
+            print("🚀 Starting parallel vLLM engine initialization (GPU VRAM > 40GB)...")
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                gpt_future = executor.submit(init_gpt_vllm)
+                qwen_future = executor.submit(init_qwen_vllm)
+                indextts_vllm = gpt_future.result()
+                self.qwen_emo = qwen_future.result()
+            print(f"✅ Parallel vLLM initialization completed in {_time.time() - _init_start:.2f}s")
+        else:
+            # Sequential initialization for smaller GPUs to avoid OOM
+            print("🚀 Starting sequential vLLM engine initialization (GPU VRAM <= 40GB)...")
+            indextts_vllm = init_gpt_vllm()
+            self.qwen_emo = init_qwen_vllm()
+            print(f"✅ Sequential vLLM initialization completed in {_time.time() - _init_start:.2f}s")
+        # =============================================================
 
         self.gpt = UnifiedVoice(indextts_vllm, **self.cfg.gpt)
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
