@@ -6709,8 +6709,13 @@ async def lifespan(app: FastAPI):
     print("🚀 Starting IndexTTS vLLM v2 FastAPI WebUI...")
     await tts_manager.initialize()
     
-    # Run warmup inference
-    await warmup_model()
+    # Only run warmup inference when torch_compile is enabled
+    # torch_compile benefits from warmup to compile optimized CUDA graphs
+    if cmd_args.use_torch_compile:
+        print("🔥 Running warmup (--use_torch_compile enabled)...")
+        await warmup_model()
+    else:
+        print("⏭️ Skipping warmup (--use_torch_compile not enabled)")
     
     yield
     # Shutdown (if needed)
