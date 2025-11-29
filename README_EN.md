@@ -15,6 +15,7 @@ pip install -r requirements.txt
 pip install pydub
 pip install flashinfer-python
 pip install flash-attn --no-build-isolation --no-cache-dir
+pip install audio-separator[gpu]
 pip install clearvoice
 pip install google-genai
 sudo apt install ffmpeg
