@@ -65,6 +65,11 @@ except ImportError:
     ClearVoice = None
 
 try:
+    from audio_separator.separator import Separator as AudioSeparator  # type: ignore[import]
+except ImportError:
+    AudioSeparator = None
+
+try:
     from google import genai  # type: ignore[import]
     from google.genai import types  # type: ignore[import]
 except ImportError:
@@ -120,6 +125,26 @@ executor = ThreadPoolExecutor(max_workers=_executor_workers, thread_name_prefix=
 # Global ClearVoice models (initialized lazily and reused)
 _enhancement_model: Optional[Any] = None
 _super_res_model: Optional[Any] = None
+_current_enhancement_model_name: Optional[str] = None
+
+# Available ClearVoice speech enhancement models
+# MossFormerGAN_SE_16K is the default (smaller and faster)
+# MossFormer2_SE_48K is the original model (larger, higher quality at 48kHz)
+# FRCRN_SE_16K is another smaller/faster option
+AVAILABLE_ENHANCEMENT_MODELS = ["MossFormerGAN_SE_16K", "FRCRN_SE_16K", "MossFormer2_SE_48K"]
+DEFAULT_ENHANCEMENT_MODEL = "MossFormerGAN_SE_16K"
+
+# Audio-Separator configuration for vocal/instrumental separation
+# Models: quality (best SDR), balance (good quality/speed), fast (fastest)
+AUDIO_SEPARATOR_MODELS = {
+    "quality": "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt",  # Best quality
+    "balance": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",  # Balance of quality/speed (default)
+    "fast": "UVR-MDX-NET-Inst_full_292.onnx",  # Fastest
+}
+DEFAULT_AUDIO_SEPARATOR_MODEL = "balance"
+# Global audio-separator instance (initialized lazily and reused)
+_audio_separator: Optional[Any] = None
+_audio_separator_model_name: Optional[str] = None
 
 
 @dataclass
@@ -357,6 +382,7 @@ class ClearVoiceParallelChunkJob:
     chunk_path: str
     apply_enhancement: bool
     apply_super_resolution: bool
+    enhancement_model_name: Optional[str] = None
 
 
 @dataclass
@@ -383,12 +409,13 @@ def _coerce_merge_backing_flag(
     requested: bool,
     apply_enhancement: bool,
     alternate_backing_available: bool = False,
+    audio_separator_enabled: bool = False,
 ) -> bool:
     if not requested:
         return False
-    if apply_enhancement or alternate_backing_available:
+    if audio_separator_enabled or apply_enhancement or alternate_backing_available:
         return True
-    print("⚠️ Merge-back requested without MossFormer2_SE_48K enhancement or custom/reused backing; ignoring request.")
+    print("⚠️ Merge-back requested without audio-separator, ClearVoice enhancement, or custom/reused backing; ignoring request.")
     return False
 
 
@@ -491,6 +518,237 @@ async def _load_audio_segment_from_path(path: str) -> AudioSegment:
     return await _run_blocking(_load_audio_segment_from_path_sync, path)
 
 
+# ==============================================================================
+# Audio-Separator: Vocal/Instrumental separation using audio-separator library
+# ==============================================================================
+
+@dataclass
+class AudioSeparatorResult:
+    """Result of audio-separator separation operation."""
+    vocals_path: str
+    instrumental_path: str
+    vocals_audio: Optional[AudioSegment] = None
+    instrumental_audio: Optional[AudioSegment] = None
+    cache_hash: str = ""
+    from_cache: bool = False
+
+
+def _get_audio_separator_model_path(model_key: str) -> str:
+    """Get the model filename for a given model key."""
+    return AUDIO_SEPARATOR_MODELS.get(model_key, AUDIO_SEPARATOR_MODELS[DEFAULT_AUDIO_SEPARATOR_MODEL])
+
+
+def _get_audio_separator_sync(model_key: str = DEFAULT_AUDIO_SEPARATOR_MODEL) -> Any:
+    """Initialize or return cached audio-separator instance (blocking)."""
+    global _audio_separator, _audio_separator_model_name
+    
+    if AudioSeparator is None:
+        raise RuntimeError(
+            "audio-separator is not installed. Install with: pip install audio-separator[gpu]"
+        )
+    
+    model_filename = _get_audio_separator_model_path(model_key)
+    
+    # Return existing instance if same model is loaded
+    if _audio_separator is not None and _audio_separator_model_name == model_key:
+        return _audio_separator
+    
+    # Always use the base AUDIO_SEPARATOR_CACHE_DIR as output
+    # We'll move files to the per-hash cache directory after separation
+    print(f"🎛️ Initializing audio-separator with model: {model_filename}")
+    _audio_separator = AudioSeparator(
+        log_level=logging.INFO,
+        model_file_dir=AUDIO_SEPARATOR_MODEL_DIR,
+        output_dir=AUDIO_SEPARATOR_CACHE_DIR,  # Fixed output directory
+        output_format="mp3",
+        use_soundfile=True,  # For long audio files
+        use_autocast=True,  # Faster GPU inference
+    )
+    _audio_separator.load_model(model_filename=model_filename)
+    _audio_separator_model_name = model_key
+    print(f"✅ Audio-separator model loaded: {model_filename}")
+    return _audio_separator
+
+
+async def _get_audio_separator(model_key: str = DEFAULT_AUDIO_SEPARATOR_MODEL) -> Any:
+    """Async wrapper to get audio-separator instance."""
+    return await _run_blocking(_get_audio_separator_sync, model_key)
+
+
+def _audio_separator_cache_paths(cache_hash: str, model_key: str) -> Tuple[str, str, str]:
+    """Get cache paths for audio-separator results."""
+    cache_dir = os.path.join(AUDIO_SEPARATOR_CACHE_DIR, f"{cache_hash}_{model_key}")
+    vocals_path = os.path.join(cache_dir, "vocals.mp3")
+    instrumental_path = os.path.join(cache_dir, "instrumental.mp3")
+    return cache_dir, vocals_path, instrumental_path
+
+
+def _run_audio_separator_sync(
+    input_path: str,
+    model_key: str = DEFAULT_AUDIO_SEPARATOR_MODEL,
+    cache_hash: Optional[str] = None,
+) -> AudioSeparatorResult:
+    """
+    Run audio-separator on input audio file to separate vocals and instrumentals.
+    Uses caching based on input file MD5 hash.
+    """
+    # Compute cache hash if not provided
+    if cache_hash is None:
+        cache_hash = _compute_file_md5(input_path)
+    
+    cache_dir, cached_vocals_path, cached_instrumental_path = _audio_separator_cache_paths(cache_hash, model_key)
+    
+    # Check cache
+    if os.path.exists(cached_vocals_path) and os.path.exists(cached_instrumental_path):
+        print(f"♻️ Audio-separator: Using cached results for {cache_hash[:8]}...")
+        return AudioSeparatorResult(
+            vocals_path=cached_vocals_path,
+            instrumental_path=cached_instrumental_path,
+            cache_hash=cache_hash,
+            from_cache=True,
+        )
+    
+    # Create cache directory for this hash
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Get separator instance (uses fixed AUDIO_SEPARATOR_CACHE_DIR for output)
+    separator = _get_audio_separator_sync(model_key)
+    
+    print(f"🎵 Running audio-separator ({model_key}) on: {input_path}")
+    
+    # Use simple output names - separator will place them in AUDIO_SEPARATOR_CACHE_DIR
+    output_names = {
+        "Vocals": "vocals",
+        "Instrumental": "instrumental",
+    }
+    
+    try:
+        output_files = separator.separate(input_path, output_names)
+        print(f"✅ Audio-separator completed. Output files: {output_files}")
+        
+        # Files are saved to AUDIO_SEPARATOR_CACHE_DIR, find them and move to per-hash cache
+        vocals_file = None
+        instrumental_file = None
+        
+        for f in output_files:
+            basename = os.path.basename(f)
+            # Check in the fixed output directory
+            full_path = os.path.join(AUDIO_SEPARATOR_CACHE_DIR, basename)
+            if not os.path.exists(full_path):
+                # Try the path as returned
+                full_path = f if os.path.isabs(f) else os.path.join(AUDIO_SEPARATOR_CACHE_DIR, f)
+            
+            f_lower = basename.lower()
+            if "vocal" in f_lower and os.path.exists(full_path):
+                vocals_file = full_path
+                print(f"📁 Found vocals at: {vocals_file}")
+            elif ("instrumental" in f_lower or "instrum" in f_lower) and os.path.exists(full_path):
+                instrumental_file = full_path
+                print(f"📁 Found instrumental at: {instrumental_file}")
+        
+        if vocals_file is None or instrumental_file is None:
+            # List files to help debug
+            if os.path.exists(AUDIO_SEPARATOR_CACHE_DIR):
+                files = os.listdir(AUDIO_SEPARATOR_CACHE_DIR)
+                print(f"📂 Files in {AUDIO_SEPARATOR_CACHE_DIR}: {files}")
+            raise RuntimeError(f"Could not find output files. Returned: {output_files}")
+        
+        # Move to per-hash cache directory
+        if vocals_file != cached_vocals_path:
+            shutil.move(vocals_file, cached_vocals_path)
+            print(f"📦 Moved vocals to cache: {cached_vocals_path}")
+        if instrumental_file != cached_instrumental_path:
+            shutil.move(instrumental_file, cached_instrumental_path)
+            print(f"📦 Moved instrumental to cache: {cached_instrumental_path}")
+        
+        return AudioSeparatorResult(
+            vocals_path=cached_vocals_path,
+            instrumental_path=cached_instrumental_path,
+            cache_hash=cache_hash,
+            from_cache=False,
+        )
+    except Exception as exc:
+        print(f"❌ Audio-separator failed: {exc}")
+        raise RuntimeError(f"Audio-separator separation failed: {exc}") from exc
+
+
+async def _run_audio_separator(
+    input_path: str,
+    model_key: str = DEFAULT_AUDIO_SEPARATOR_MODEL,
+    cache_hash: Optional[str] = None,
+    emit_status: Optional[Callable[..., Awaitable[None]]] = None,
+) -> AudioSeparatorResult:
+    """
+    Async wrapper for audio-separator separation.
+    Separates audio into vocals and instrumentals with caching.
+    """
+    if AudioSeparator is None:
+        raise TranslateWorkflowHttpError(
+            500,
+            {
+                "status": "error",
+                "message": "audio-separator is not installed. Install with: pip install audio-separator[gpu]",
+            },
+        )
+    
+    model_name = _get_audio_separator_model_path(model_key)
+    if emit_status:
+        await emit_status(
+            stage="audio_separation",
+            message=f"Separating vocals/instrumentals using {model_key} model ({model_name})...",
+        )
+    
+    result = await _run_blocking(_run_audio_separator_sync, input_path, model_key, cache_hash)
+    
+    if emit_status:
+        cache_note = " (cached)" if result.from_cache else ""
+        await emit_status(
+            stage="audio_separation",
+            message=f"Audio separation complete{cache_note}. Vocals and instrumentals separated.",
+        )
+    
+    return result
+
+
+async def _run_audio_separator_pipeline(
+    source_audio_path: str,
+    *,
+    model_key: str = DEFAULT_AUDIO_SEPARATOR_MODEL,
+    emit_status: Optional[Callable[..., Awaitable[None]]] = None,
+    cache_hash: Optional[str] = None,
+) -> Tuple[AudioSegment, AudioSegment, str]:
+    """
+    Run the full audio-separator pipeline on a source audio file.
+    
+    Args:
+        cache_hash: Optional pre-computed hash of the original audio (for consistent caching
+                    even when the input file is normalized/converted)
+    
+    Returns:
+        Tuple of (vocals_audio, instrumental_audio, cache_hash)
+    """
+    # Use provided cache_hash or compute from file
+    if cache_hash is None:
+        cache_hash = _compute_file_md5(source_audio_path)
+    
+    # Run separation
+    result = await _run_audio_separator(
+        source_audio_path,
+        model_key=model_key,
+        cache_hash=cache_hash,
+        emit_status=emit_status,
+    )
+    
+    # Load the separated audio segments
+    vocals_audio = await _load_audio_segment_from_path(result.vocals_path)
+    instrumental_audio = await _load_audio_segment_from_path(result.instrumental_path)
+    
+    return vocals_audio, instrumental_audio, result.cache_hash
+
+
+# ==============================================================================
+
+
 async def _run_clearvoice_pipeline(
     original_audio: AudioSegment,
     *,
@@ -500,6 +758,7 @@ async def _run_clearvoice_pipeline(
     emit_status: Optional[Callable[..., Awaitable[None]]],
     source_audio_path: Optional[str] = None,
     clearvoice_parallel_config: Optional[ClearVoiceParallelConfig] = None,
+    enhancement_model_name: Optional[str] = None,
 ) -> Tuple[AudioSegment, Optional[AudioSegment]]:
     if not (apply_enhancement or apply_super_resolution):
         return original_audio, None
@@ -513,13 +772,15 @@ async def _run_clearvoice_pipeline(
         )
 
     processed_paths: Set[str] = set()
+    # Determine the enhancement model to use
+    effective_model = enhancement_model_name if enhancement_model_name in AVAILABLE_ENHANCEMENT_MODELS else DEFAULT_ENHANCEMENT_MODEL
     try:
         if emit_status:
-            action = "Applying MossFormer2_SE_48K enhancement..."
+            action = f"Applying {effective_model} enhancement..."
             if apply_super_resolution and not apply_enhancement:
                 action = "Applying MossFormer2_SR_48K super-resolution..."
             elif apply_super_resolution and apply_enhancement:
-                action = "Applying MossFormer2_SE_48K enhancement + SR_48K super-resolution..."
+                action = f"Applying {effective_model} enhancement + SR_48K super-resolution..."
             await emit_status(stage="enhancement", message=action)
 
         wav_input_path: Optional[str] = None
@@ -567,7 +828,7 @@ async def _run_clearvoice_pipeline(
         elif apply_enhancement and use_cached_enhancement:
             final_processed_path = cached_enhanced_path
             enhancement_output_path = cached_enhanced_path
-            print(f"♻️ ClearVoice: Reusing cached MossFormer2_SE_48K output for {cache_hash}.")
+            print(f"♻️ ClearVoice: Reusing cached {effective_model} output for {cache_hash}.")
 
         if final_processed_path is None:
             if parallel_config:
@@ -579,18 +840,22 @@ async def _run_clearvoice_pipeline(
                 else:
                     print(f"⚡ ClearVoice: running parallel ClearVoice across {len(planned_chunks)} chunk(s).")
                 final_processed_local_path, clearvoice_paths, enhancement_output_local = await _run_blocking(
-                    _apply_clearvoice_parallel_sync,
-                    temp_input_path,
-                    total_duration_ms,
-                    apply_enhancement,
-                    apply_super_resolution,
-                    parallel_config,
+                    functools.partial(
+                        _apply_clearvoice_parallel_sync,
+                        temp_input_path,
+                        total_duration_ms,
+                        apply_enhancement,
+                        apply_super_resolution,
+                        parallel_config,
+                        enhancement_model_name=effective_model,
+                    ),
                 )
             else:
                 final_processed_local_path, clearvoice_paths, enhancement_output_local = await apply_clearvoice_processing(
                     temp_input_path,
                     apply_enhancement,
                     apply_super_resolution,
+                    enhancement_model_name=effective_model,
                 )
             processed_paths.update(clearvoice_paths)
             processed_paths.add(final_processed_local_path)
@@ -603,7 +868,7 @@ async def _run_clearvoice_pipeline(
                     cached_enhanced_path,
                     delete_source=True,
                 )
-                print(f"💾 ClearVoice: Cached MossFormer2_SE_48K output for {cache_hash}.")
+                print(f"💾 ClearVoice: Cached {effective_model} output for {cache_hash}.")
 
             if apply_super_resolution:
                 final_processed_path = await _normalize_audio_to_cached(
@@ -677,7 +942,7 @@ async def _run_clearvoice_pipeline(
                         sr_note = " (super-resolution applied after extraction)" if apply_super_resolution else ""
                         await emit_status(
                             stage="enhancement",
-                            message=f"Extracted instrumental backing track via MossFormer2_SE_48K{sr_note}.",
+                            message=f"Extracted instrumental backing track via {effective_model}{sr_note}.",
                         )
 
         if backing_track_audio is not None:
@@ -722,6 +987,9 @@ async def _prepare_audio_assets(
     custom_backing_mime_type_value: Optional[str] = None,
     emit_status: Optional[Callable[..., Awaitable[None]]] = None,
     clearvoice_parallel_config: Optional[ClearVoiceParallelConfig] = None,
+    enhancement_model_name: Optional[str] = None,
+    audio_separator_enabled: bool = False,
+    audio_separator_model: str = DEFAULT_AUDIO_SEPARATOR_MODEL,
 ) -> Tuple[AudioSegment, str, bytes, str, Optional[AudioSegment], bool, str]:
     source_audio_temp_path: Optional[str] = None
     custom_backing_audio: Optional[AudioSegment] = None
@@ -834,10 +1102,27 @@ async def _prepare_audio_assets(
             )
         original_filename = source_audio_filename or (audio_file.filename if audio_file else None)
         normalized_audio_temp_path: Optional[str] = None
-        if effective_apply_enhancement:
+        upload_temp_path: Optional[str] = None
+        audio_separator_input_path: Optional[str] = None  # Original file for audio-separator
+        
+        # Compute original audio hash BEFORE any normalization (for consistent caching)
+        original_audio_hash = _compute_bytes_md5(audio_bytes)
+        
+        # Persist uploaded audio for processing
+        if effective_apply_enhancement or audio_separator_enabled:
             upload_temp_path = _persist_audio_upload(audio_bytes, original_filename)
+        
+        # Audio-separator uses the original file directly (no normalization needed)
+        if audio_separator_enabled and upload_temp_path:
+            audio_separator_input_path = upload_temp_path
+        
+        # Normalize to WAV only for ClearVoice (when audio-separator not used)
+        # When audio-separator is enabled, ClearVoice will process the separated vocals directly
+        if effective_apply_enhancement and not audio_separator_enabled:
             normalized_audio_temp_path = await _normalize_uploaded_audio(upload_temp_path)
             source_audio_temp_path = normalized_audio_temp_path
+        else:
+            source_audio_temp_path = upload_temp_path
 
         input_mime_type = audio_mime_type_value or (audio_file.content_type if audio_file else None) or "audio/wav"
         audio_format = _guess_audio_format_from_mime(input_mime_type)
@@ -860,17 +1145,65 @@ async def _prepare_audio_assets(
                 message=f"Decoded audio ({len(original_audio) / 1000:.1f}s).",
             )
 
-        pre_clearvoice_mix_audio = original_audio if effective_apply_enhancement else None
-        processed_audio, backing_track_audio = await _run_clearvoice_pipeline(
-            original_audio,
+        # Audio-Separator: Separate vocals and instrumentals before ClearVoice
+        audio_separator_vocals: Optional[AudioSegment] = None
+        audio_separator_instrumental: Optional[AudioSegment] = None
+        backing_track_audio: Optional[AudioSegment] = None  # Will be set by audio-separator or clearvoice
+        if audio_separator_enabled and AudioSeparator is not None:
+            # Use original file for audio-separator (no WAV normalization needed)
+            separator_input = audio_separator_input_path
+            if not separator_input:
+                # Fallback: export audio segment to temp file if no path available
+                separator_input = await _export_audio_segment_to_tempfile(original_audio)
+            try:
+                # Use original audio hash for caching (consistent across sessions)
+                audio_separator_vocals, audio_separator_instrumental, _ = await _run_audio_separator_pipeline(
+                    separator_input,
+                    model_key=audio_separator_model,
+                    emit_status=emit_status,
+                    cache_hash=original_audio_hash,
+                )
+                # Use separated vocals as input to ClearVoice
+                original_audio = audio_separator_vocals
+                # Use separated instrumentals as backing track (better than ClearVoice extraction)
+                backing_track_audio = audio_separator_instrumental
+                backing_track_source = "audio_separator"
+                if emit_status:
+                    await emit_status(
+                        stage="audio_separation",
+                        message=f"Vocals ({len(audio_separator_vocals) / 1000:.1f}s) and instrumentals ({len(audio_separator_instrumental) / 1000:.1f}s) separated.",
+                    )
+            except Exception as exc:
+                print(f"⚠️ Audio-separator failed, falling back to ClearVoice extraction: {exc}")
+                if emit_status:
+                    await emit_status(
+                        stage="audio_separation",
+                        message=f"⚠️ Audio separation failed: {exc}. Falling back to ClearVoice extraction.",
+                    )
+        elif audio_separator_enabled and AudioSeparator is None:
+            if emit_status:
+                await emit_status(
+                    stage="audio_separation",
+                    message="⚠️ audio-separator not installed. Skipping vocal/instrumental separation.",
+                )
+
+        # ClearVoice: Enhancement and super-resolution (applied to vocals from audio-separator or original)
+        # Only extract backing track via ClearVoice if audio-separator was not used
+        pre_clearvoice_mix_audio = original_audio if (effective_apply_enhancement and not audio_separator_enabled) else None
+        clearvoice_input_audio = original_audio
+        processed_audio, clearvoice_backing = await _run_clearvoice_pipeline(
+            clearvoice_input_audio,
             apply_enhancement=effective_apply_enhancement,
             apply_super_resolution=apply_super_resolution,
             pre_clearvoice_mix_audio=pre_clearvoice_mix_audio,
             emit_status=emit_status,
-            source_audio_path=source_audio_temp_path,
+            source_audio_path=None,  # Already have audio segment
             clearvoice_parallel_config=clearvoice_parallel_config,
+            enhancement_model_name=enhancement_model_name,
         )
-        if backing_track_audio is not None:
+        # Use ClearVoice backing track only if audio-separator was not used
+        if backing_track_audio is None and clearvoice_backing is not None:
+            backing_track_audio = clearvoice_backing
             backing_track_source = "extracted"
         if custom_backing_audio is not None:
             backing_track_audio = custom_backing_audio
@@ -886,6 +1219,7 @@ async def _prepare_audio_assets(
             print("⚠️ Unable to merge with backing track because no instrumental was derived.")
 
         if emit_status:
+            effective_model = enhancement_model_name if enhancement_model_name in AVAILABLE_ENHANCEMENT_MODELS else DEFAULT_ENHANCEMENT_MODEL
             if apply_super_resolution:
                 await emit_status(
                     stage="gemini_prep",
@@ -894,7 +1228,7 @@ async def _prepare_audio_assets(
             elif apply_enhancement:
                 await emit_status(
                     stage="gemini_prep",
-                    message="📤 Sending enhanced audio (MossFormer2_SE_48K) to Gemini for transcription/translation.",
+                    message=f"📤 Sending enhanced audio ({effective_model}) to Gemini for transcription/translation.",
                 )
             else:
                 await emit_status(
@@ -983,6 +1317,7 @@ async def _prepare_clearvoice_for_split(
     apply_super_resolution: bool,
     emit_status: Optional[Callable[..., Awaitable[None]]] = None,
     clearvoice_parallel_config: Optional[ClearVoiceParallelConfig] = None,
+    enhancement_model_name: Optional[str] = None,
 ) -> SplitClearVoiceAssets:
     """
     Prepare ClearVoice-enhanced audio for chunk splitting without decoding the entire track when cached.
@@ -1083,6 +1418,7 @@ async def _prepare_clearvoice_for_split(
                 emit_status=emit_status,
                 source_audio_path=source_path,
                 clearvoice_parallel_config=clearvoice_parallel_config,
+                enhancement_model_name=enhancement_model_name,
             )
             processed_audio = None
             backing_track_audio = None
@@ -2114,6 +2450,10 @@ TRANSLATE_SESSION_MEDIA_DIR = str((ROOT_OUTPUT_DIR / "translate_session_media").
 os.makedirs(TRANSLATE_SESSION_MEDIA_DIR, exist_ok=True)
 CLEARVOICE_CACHE_DIR = str((ROOT_OUTPUT_DIR / "clearvoice_cache").resolve())
 os.makedirs(CLEARVOICE_CACHE_DIR, exist_ok=True)
+AUDIO_SEPARATOR_CACHE_DIR = str((ROOT_OUTPUT_DIR / "audio_separator_cache").resolve())
+os.makedirs(AUDIO_SEPARATOR_CACHE_DIR, exist_ok=True)
+AUDIO_SEPARATOR_MODEL_DIR = str((Path(current_dir) / "checkpoints").resolve())
+os.makedirs(AUDIO_SEPARATOR_MODEL_DIR, exist_ok=True)
 GEMINI_CACHE_DIR = str((ROOT_OUTPUT_DIR / "gemini_cache").resolve())
 os.makedirs(GEMINI_CACHE_DIR, exist_ok=True)
 SPLIT_AUDIO_CACHE_DIR = str((ROOT_OUTPUT_DIR / "split_audio_cache").resolve())
@@ -3320,6 +3660,7 @@ async def _generate_chunk_audio_from_session(
     clearvoice_settings = chunk_session.clearvoice_settings or {}
     apply_enhancement = bool(clearvoice_settings.get("enhancement"))
     apply_super_resolution = bool(clearvoice_settings.get("super_resolution"))
+    enhancement_model_from_session = clearvoice_settings.get("enhancement_model")
     if apply_super_resolution and not apply_enhancement:
         apply_enhancement = True
         clearvoice_settings["enhancement"] = True
@@ -3351,6 +3692,7 @@ async def _generate_chunk_audio_from_session(
         custom_backing_mime_type_value=None,
         emit_status=None,
         clearvoice_parallel_config=parallel_config,
+        enhancement_model_name=enhancement_model_from_session,
     )
 
     final_prompt = _resolve_final_prompt(
@@ -3603,6 +3945,7 @@ def _run_clearvoice_chunk_job(job: ClearVoiceParallelChunkJob) -> ClearVoicePara
         job.chunk_path,
         job.apply_enhancement,
         job.apply_super_resolution,
+        enhancement_model_name=job.enhancement_model_name,
     )
     cleanup_targets = set(generated_paths or [])
     cleanup_targets.add(final_path)
@@ -3622,16 +3965,17 @@ def _apply_clearvoice_parallel_sync(
     apply_enhancement: bool,
     apply_super_resolution: bool,
     config: ClearVoiceParallelConfig,
+    enhancement_model_name: Optional[str] = None,
 ) -> Tuple[str, List[str], Optional[str]]:
     if not config or not config.enabled:
-        return _apply_clearvoice_processing_sync(input_path, apply_enhancement, apply_super_resolution)
+        return _apply_clearvoice_processing_sync(input_path, apply_enhancement, apply_super_resolution, enhancement_model_name=enhancement_model_name)
     if not _ffmpeg_available():
         print("⚠️ ClearVoice parallel requested but ffmpeg is unavailable. Falling back to sequential run.")
-        return _apply_clearvoice_processing_sync(input_path, apply_enhancement, apply_super_resolution)
+        return _apply_clearvoice_processing_sync(input_path, apply_enhancement, apply_super_resolution, enhancement_model_name=enhancement_model_name)
 
     chunk_ranges = _plan_clearvoice_parallel_chunks(total_duration_ms, config.chunk_ms)
     if len(chunk_ranges) <= 1:
-        return _apply_clearvoice_processing_sync(input_path, apply_enhancement, apply_super_resolution)
+        return _apply_clearvoice_processing_sync(input_path, apply_enhancement, apply_super_resolution, enhancement_model_name=enhancement_model_name)
 
     cleanup_paths: Set[str] = set()
 
@@ -3652,6 +3996,7 @@ def _apply_clearvoice_parallel_sync(
                     chunk_path=chunk_path,
                     apply_enhancement=apply_enhancement,
                     apply_super_resolution=apply_super_resolution,
+                    enhancement_model_name=enhancement_model_name,
                 )
             )
     except Exception:
@@ -3710,12 +4055,16 @@ def _apply_clearvoice_processing_sync(
     input_path: str,
     apply_enhancement: bool,
     apply_super_resolution: bool,
+    enhancement_model_name: Optional[str] = None,
 ) -> Tuple[str, List[str], Optional[str]]:
     """Run ClearVoice enhancement/super-resolution synchronously."""
-    global _enhancement_model, _super_res_model
+    global _enhancement_model, _super_res_model, _current_enhancement_model_name
     
     if ClearVoice is None:
         raise RuntimeError("ClearVoice package is not available in the environment.")
+    
+    # Determine which enhancement model to use
+    model_name = enhancement_model_name if enhancement_model_name in AVAILABLE_ENHANCEMENT_MODELS else DEFAULT_ENHANCEMENT_MODEL
     
     generated_paths: List[str] = []
     enhancement_output_path: Optional[str] = None
@@ -3724,11 +4073,15 @@ def _apply_clearvoice_processing_sync(
     
     try:
         if apply_enhancement:
-            print("✨ ClearVoice: Applying MossFormer2_SE_48K enhancement...")
-            # Initialize enhancement model if not already created
-            if _enhancement_model is None:
-                print("🔧 Initializing enhancement model (first use)...")
-                _enhancement_model = ClearVoice(task="speech_enhancement", model_names=["MossFormer2_SE_48K"])
+            print(f"✨ ClearVoice: Applying {model_name} enhancement...")
+            # Initialize enhancement model if not already created or if model changed
+            if _enhancement_model is None or _current_enhancement_model_name != model_name:
+                if _enhancement_model is not None:
+                    print(f"🔄 Switching enhancement model from {_current_enhancement_model_name} to {model_name}...")
+                else:
+                    print(f"🔧 Initializing enhancement model ({model_name}) (first use)...")
+                _enhancement_model = ClearVoice(task="speech_enhancement", model_names=[model_name])
+                _current_enhancement_model_name = model_name
             enhancement_output = _enhancement_model(input_path=current_input, online_write=False)
             enhanced_path = _append_suffix_to_path(current_input, "_se")
             _enhancement_model.write(enhancement_output, output_path=enhanced_path)
@@ -3765,6 +4118,7 @@ async def apply_clearvoice_processing(
     input_path: str,
     apply_enhancement: bool,
     apply_super_resolution: bool,
+    enhancement_model_name: Optional[str] = None,
 ) -> Tuple[str, List[str], Optional[str]]:
     """Async wrapper for ClearVoice processing."""
     if not (apply_enhancement or apply_super_resolution):
@@ -3773,10 +4127,13 @@ async def apply_clearvoice_processing(
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
         executor,
-        _apply_clearvoice_processing_sync,
-        input_path,
-        apply_enhancement,
-        apply_super_resolution,
+        functools.partial(
+            _apply_clearvoice_processing_sync,
+            input_path,
+            apply_enhancement,
+            apply_super_resolution,
+            enhancement_model_name=enhancement_model_name,
+        ),
     )
 
 async def convert_audio_to_format(wav_data, sample_rate, output_format="mp3", bitrate="128k"):
@@ -6048,6 +6405,7 @@ class SpeakerAPIWrapper:
         filenames: List[str],
         apply_enhancement: bool = False,
         apply_super_resolution: bool = False,
+        enhancement_model_name: Optional[str] = None,
     ) -> Dict[str, str]:
         """Add a new speaker with audio files and optional ClearVoice processing."""
         try:
@@ -6112,6 +6470,7 @@ class SpeakerAPIWrapper:
                             final_audio_path,
                             apply_enhancement,
                             apply_super_resolution,
+                            enhancement_model_name=enhancement_model_name,
                         )
                         processed_paths.update(clearvoice_paths)
                     except Exception as cv_error:
@@ -6125,7 +6484,8 @@ class SpeakerAPIWrapper:
                 if clearvoice_requested:
                     cv_features = []
                     if apply_enhancement:
-                        cv_features.append("MossFormer2_SE_48K enhancement")
+                        effective_model = enhancement_model_name if enhancement_model_name in AVAILABLE_ENHANCEMENT_MODELS else DEFAULT_ENHANCEMENT_MODEL
+                        cv_features.append(f"{effective_model} enhancement")
                     if apply_super_resolution:
                         cv_features.append("MossFormer2_SR_48K super-resolution")
                     description_parts.append("ClearVoice: " + " + ".join(cv_features))
@@ -6290,7 +6650,11 @@ class TranslateRequest(BaseModel):
     )
     enhance_voice: Optional[bool] = Field(
         default=False,
-        description="Apply ClearVoice MossFormer2_SE_48K enhancement before translation.",
+        description="Apply ClearVoice speech enhancement before translation.",
+    )
+    enhancement_model: Optional[str] = Field(
+        default=None,
+        description="ClearVoice speech enhancement model to use. Options: 'MossFormerGAN_SE_16K' (default, smaller/faster), 'FRCRN_SE_16K' (smaller/faster), 'MossFormer2_SE_48K' (larger, higher quality).",
     )
     super_resolution_voice: Optional[bool] = Field(
         default=False,
@@ -6882,23 +7246,22 @@ async def api_translate_split_audio(
     min_silence_ms: Optional[int] = Form(None),
     silence_threshold_db: Optional[float] = Form(None),
     super_resolution_voice: Optional[bool] = Form(False),
+    audio_separator_enabled: Optional[bool] = Form(False, description="Enable audio-separator for vocal/instrumental separation"),
+    audio_separator_model: Optional[str] = Form(None, description="Audio-separator model: 'fast', 'balance' (default), or 'quality'"),
     clearvoice_parallel_enabled: Optional[bool] = Form(False),
     clearvoice_parallel_chunk_seconds: Optional[int] = Form(None),
     clearvoice_parallel_max_workers: Optional[int] = Form(None),
+    enhancement_model: Optional[str] = Form(None, description="ClearVoice enhancement model: 'MossFormerGAN_SE_16K' (default), 'FRCRN_SE_16K', or 'MossFormer2_SE_48K'"),
     audio_file: Optional[UploadFile] = File(None),
 ):
     """API: Split long audio into ClearVoice-enhanced chunks for reuse."""
-    if ClearVoice is None:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "error",
-                "message": "ClearVoice package is required for audio chunking. Install the `clearvoice` package to enable this feature.",
-            },
-        )
+    # Note: ClearVoice/Audio-Separator recommended for better silence detection on mixed audio,
+    # but not required for vocal-only audio uploads
 
     try:
         payload: Optional[Dict[str, Any]] = None
+        audio_separator_enabled_value = audio_separator_enabled
+        audio_separator_model_value = audio_separator_model
         clearvoice_parallel_enabled_value = clearvoice_parallel_enabled
         clearvoice_parallel_chunk_seconds_value = clearvoice_parallel_chunk_seconds
         clearvoice_parallel_max_workers_value = clearvoice_parallel_max_workers
@@ -6926,6 +7289,9 @@ async def api_translate_split_audio(
             min_silence_ms = payload.get("min_silence_ms", min_silence_ms)
             silence_threshold_db = payload.get("silence_threshold_db", silence_threshold_db)
             super_resolution_voice = payload.get("super_resolution_voice", super_resolution_voice)
+            audio_separator_enabled_value = payload.get("audio_separator_enabled", audio_separator_enabled_value)
+            audio_separator_model_value = payload.get("audio_separator_model", audio_separator_model_value)
+            enhancement_model = payload.get("enhancement_model", enhancement_model)
             clearvoice_parallel_enabled_value = payload.get(
                 "clearvoice_parallel_enabled", clearvoice_parallel_enabled_value
             )
@@ -6936,6 +7302,12 @@ async def api_translate_split_audio(
                 "clearvoice_parallel_max_workers", clearvoice_parallel_max_workers_value
             )
 
+        enhancement_model_name_value = enhancement_model if enhancement_model in AVAILABLE_ENHANCEMENT_MODELS else DEFAULT_ENHANCEMENT_MODEL
+        # Audio-separator settings for split_audio
+        audio_separator_enabled_flag = _coerce_to_bool(audio_separator_enabled_value or False)
+        audio_separator_model_key = (audio_separator_model_value or "").strip().lower()
+        if audio_separator_model_key not in AUDIO_SEPARATOR_MODELS:
+            audio_separator_model_key = DEFAULT_AUDIO_SEPARATOR_MODEL
         audio_reference_value = (audio or "").strip()
         if audio_file is None and not audio_reference_value:
             return JSONResponse(
@@ -7065,6 +7437,7 @@ async def api_translate_split_audio(
                         apply_super_resolution=apply_super_resolution,
                         emit_status=emit_status,
                         clearvoice_parallel_config=parallel_config if parallel_config.enabled else None,
+                        enhancement_model_name=enhancement_model_name_value,
                     )
                     split_profiler.mark(
                         "prepare_clearvoice_assets",
@@ -8212,7 +8585,10 @@ async def api_translate_segments(
     gemini_model: Optional[str] = Form(None),
     gemini_api_key: Optional[str] = Form(None),
     enhance_voice: Optional[bool] = Form(False),
+    enhancement_model: Optional[str] = Form(None, description="ClearVoice enhancement model: 'MossFormerGAN_SE_16K' (default), 'FRCRN_SE_16K', or 'MossFormer2_SE_48K'"),
     super_resolution_voice: Optional[bool] = Form(False),
+    audio_separator_enabled: Optional[bool] = Form(False, description="Enable audio-separator for vocal/instrumental separation"),
+    audio_separator_model: Optional[str] = Form(None, description="Audio-separator model: 'fast', 'balance' (default), or 'quality'"),
     clearvoice_parallel_enabled: Optional[bool] = Form(False),
     clearvoice_parallel_chunk_seconds: Optional[int] = Form(None),
     clearvoice_parallel_max_workers: Optional[int] = Form(None),
@@ -8249,7 +8625,10 @@ async def api_translate_segments(
         gemini_model_value = gemini_model
         gemini_api_key_value = gemini_api_key
         enhance_voice_value = enhance_voice
+        enhancement_model_value = enhancement_model
         super_resolution_voice_value = super_resolution_voice
+        audio_separator_enabled_value = audio_separator_enabled
+        audio_separator_model_value = audio_separator_model
         clearvoice_parallel_enabled_value = clearvoice_parallel_enabled
         clearvoice_parallel_chunk_seconds_value = clearvoice_parallel_chunk_seconds
         clearvoice_parallel_max_workers_value = clearvoice_parallel_max_workers
@@ -8299,7 +8678,10 @@ async def api_translate_segments(
             gemini_model_value = payload.get("gemini_model", gemini_model_value)
             gemini_api_key_value = payload.get("gemini_api_key", gemini_api_key_value)
             enhance_voice_value = payload.get("enhance_voice", enhance_voice_value)
+            enhancement_model_value = payload.get("enhancement_model", enhancement_model_value)
             super_resolution_voice_value = payload.get("super_resolution_voice", super_resolution_voice_value)
+            audio_separator_enabled_value = payload.get("audio_separator_enabled", audio_separator_enabled_value)
+            audio_separator_model_value = payload.get("audio_separator_model", audio_separator_model_value)
             clearvoice_parallel_enabled_value = payload.get(
                 "clearvoice_parallel_enabled", clearvoice_parallel_enabled_value
             )
@@ -8398,16 +8780,26 @@ async def api_translate_segments(
                     },
                 )
         reuse_backing_available = bool(reuse_source_session and _session_has_backing_audio(reuse_source_session))
+        # Audio-separator settings (parse early since merge_backing depends on it)
+        audio_separator_enabled_flag = _coerce_to_bool(audio_separator_enabled_value or False)
+        audio_separator_model_key = (audio_separator_model_value or "").strip().lower()
+        if audio_separator_model_key not in AUDIO_SEPARATOR_MODELS:
+            audio_separator_model_key = DEFAULT_AUDIO_SEPARATOR_MODEL
         requested_merge_backing = _coerce_merge_backing_flag(
             merge_backing_requested_raw,
             apply_enhancement,
             custom_backing_present or reuse_backing_available,
+            audio_separator_enabled=audio_separator_enabled_flag,
         )
         if reuse_source_session is not None and reuse_source_session.chunk_parent_id:
             requested_merge_backing = False
+        enhancement_model_name_value = enhancement_model_value if enhancement_model_value in AVAILABLE_ENHANCEMENT_MODELS else DEFAULT_ENHANCEMENT_MODEL
         clearvoice_settings: Dict[str, Any] = {
             "enhancement": apply_enhancement,
+            "enhancement_model": enhancement_model_name_value,
             "super_resolution": apply_super_resolution,
+            "audio_separator_enabled": audio_separator_enabled_flag,
+            "audio_separator_model": audio_separator_model_key,
         }
         if parallel_config.enabled:
             clearvoice_settings.update(parallel_config.to_metadata())
@@ -8522,6 +8914,9 @@ async def api_translate_segments(
                         custom_backing_mime_type_value=custom_backing_audio_mime_type_value,
                         emit_status=emit_status,
                         clearvoice_parallel_config=parallel_config if parallel_config.enabled else None,
+                        enhancement_model_name=enhancement_model_name_value,
+                        audio_separator_enabled=audio_separator_enabled_flag,
+                        audio_separator_model=audio_separator_model_key,
                     )
 
                     final_prompt = _resolve_final_prompt(
@@ -9300,7 +9695,10 @@ async def api_translate_audio(
     gemini_model: Optional[str] = Form(None),
     gemini_api_key: Optional[str] = Form(None),
     enhance_voice: Optional[bool] = Form(False),
+    enhancement_model: Optional[str] = Form(None, description="ClearVoice enhancement model: 'MossFormerGAN_SE_16K' (default), 'FRCRN_SE_16K', or 'MossFormer2_SE_48K'"),
     super_resolution_voice: Optional[bool] = Form(False),
+    audio_separator_enabled: Optional[bool] = Form(False, description="Enable audio-separator for vocal/instrumental separation"),
+    audio_separator_model: Optional[str] = Form(None, description="Audio-separator model: 'fast', 'balance' (default), or 'quality'"),
     clearvoice_parallel_enabled: Optional[bool] = Form(False),
     clearvoice_parallel_chunk_seconds: Optional[int] = Form(None),
     clearvoice_parallel_max_workers: Optional[int] = Form(None),
@@ -9336,7 +9734,10 @@ async def api_translate_audio(
         gemini_model_value = gemini_model
         gemini_api_key_value = gemini_api_key
         enhance_voice_value = enhance_voice
+        enhancement_model_value = enhancement_model
         super_resolution_voice_value = super_resolution_voice
+        audio_separator_enabled_value = audio_separator_enabled
+        audio_separator_model_value = audio_separator_model
         clearvoice_parallel_enabled_value = clearvoice_parallel_enabled
         clearvoice_parallel_chunk_seconds_value = clearvoice_parallel_chunk_seconds
         clearvoice_parallel_max_workers_value = clearvoice_parallel_max_workers
@@ -9489,16 +9890,26 @@ async def api_translate_audio(
         custom_backing_present = bool(custom_backing_audio_file) or bool((custom_backing_audio_value or "").strip())
         merge_backing_requested_raw = _coerce_to_bool(merge_backing_track_value)
         reuse_backing_available = bool(reuse_source_session and _session_has_backing_audio(reuse_source_session))
+        # Audio-separator settings (parse early since merge_backing depends on it)
+        audio_separator_enabled_flag = _coerce_to_bool(audio_separator_enabled_value or False)
+        audio_separator_model_key = (audio_separator_model_value or "").strip().lower()
+        if audio_separator_model_key not in AUDIO_SEPARATOR_MODELS:
+            audio_separator_model_key = DEFAULT_AUDIO_SEPARATOR_MODEL
         requested_merge_backing = _coerce_merge_backing_flag(
             merge_backing_requested_raw,
             apply_enhancement,
             custom_backing_present or reuse_backing_available,
+            audio_separator_enabled=audio_separator_enabled_flag,
         )
         if reuse_source_session is not None and reuse_source_session.chunk_parent_id:
             requested_merge_backing = False
+        enhancement_model_name_value = enhancement_model_value if enhancement_model_value in AVAILABLE_ENHANCEMENT_MODELS else DEFAULT_ENHANCEMENT_MODEL
         clearvoice_settings: Dict[str, Any] = {
             "enhancement": apply_enhancement,
+            "enhancement_model": enhancement_model_name_value,
             "super_resolution": apply_super_resolution,
+            "audio_separator_enabled": audio_separator_enabled_flag,
+            "audio_separator_model": audio_separator_model_key,
         }
         if parallel_config.enabled:
             clearvoice_settings.update(parallel_config.to_metadata())
@@ -9648,6 +10059,9 @@ async def api_translate_audio(
                         custom_backing_mime_type_value=custom_backing_audio_mime_type_value,
                         emit_status=emit_status,
                         clearvoice_parallel_config=parallel_config if parallel_config.enabled else None,
+                        enhancement_model_name=enhancement_model_name_value,
+                        audio_separator_enabled=audio_separator_enabled_flag,
+                        audio_separator_model=audio_separator_model_key,
                     )
                     input_mime_type_local = input_mime_type_resolved or input_mime_type
 
@@ -9998,7 +10412,8 @@ async def add_speaker(
     audio: Optional[str] = Form(None, description="Reference audio URL or base64"),
     reference_text: Optional[str] = Form(None, description="Optional transcript"),
     audio_file: Optional[UploadFile] = File(None, description="Upload reference audio file"),
-    enhance_voice: bool = Form(False, description="Apply ClearVoice MossFormer2_SE_48K enhancement"),
+    enhance_voice: bool = Form(False, description="Apply ClearVoice speech enhancement"),
+    enhancement_model: Optional[str] = Form(None, description="ClearVoice enhancement model: 'MossFormerGAN_SE_16K' (default), 'FRCRN_SE_16K', or 'MossFormer2_SE_48K'"),
     super_resolution_voice: bool = Form(False, description="Apply ClearVoice MossFormer2_SR_48K super-resolution"),
 ):
     """API: Add a new speaker"""
@@ -10051,6 +10466,7 @@ async def add_speaker(
             [filename],
             apply_enhancement=apply_enhancement,
             apply_super_resolution=apply_super_resolution_flag,
+            enhancement_model_name=enhancement_model,
         )
         
         if result["status"] == "success":
