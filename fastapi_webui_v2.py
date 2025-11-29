@@ -278,12 +278,18 @@ TRANSLATION_PROMPT_TEMPLATE = (
     "\"id\" (deterministic labels \"speaker1\", \"speaker2\", ...), "
     "and \"description\" (≤12 words highlighting gender, approximate age range, and personality or tone). "
     "\"segments\" must be an array where each item represents a contiguous utterance with the keys "
-    "\"start\" (timestamp mm:ss or mm:ss.xxx), "
-    "\"end\" (same format), "
+    "\"start\" (timestamp in mm:ss.xxx format with millisecond precision), "
+    "\"end\" (same format, mm:ss.xxx), "
     "\"speaker\" (one of the ids from the speakers list), "
     "\"source_text\" (original-language transcript), "
     "\"translated_text\" (translation in {dest_language}). "
-    "Ensure timestamps align with the audio, keep segments coherent, and add a new speaker entry whenever a new voice appears. "
+    "TIMESTAMP PRECISION IS CRITICAL - these timestamps will be used to cut audio clips for voice cloning: "
+    "Always use millisecond format (mm:ss.xxx). "
+    "\"start\" must be the EXACT moment the speaker begins speaking (first syllable onset). "
+    "\"end\" must be the EXACT moment the speaker finishes speaking (last syllable offset, before any silence or next speaker). "
+    "Do NOT pad timestamps with extra silence. Do NOT round to whole seconds. "
+    "Each segment's boundaries should tightly enclose only that speaker's utterance. "
+    "Add a new speaker entry whenever a new voice appears. "
     "Respond with JSON only—no explanations, markdown, or additional prose."
 )
 TRANSCRIPTION_PROMPT_TEMPLATE = (
@@ -296,12 +302,17 @@ TRANSCRIPTION_PROMPT_TEMPLATE = (
     "\"id\" (speaker1, speaker2, ... in order of first appearance) "
     "and \"description\" (short summary focusing on gender, approximate age, and personality/tone). "
     "\"segments\" is an array where each entry contains "
-    "\"start\" (timestamp mm:ss or mm:ss.xxx), "
-    "\"end\" (same), "
+    "\"start\" (timestamp in mm:ss.xxx format with millisecond precision), "
+    "\"end\" (same format, mm:ss.xxx), "
     "\"speaker\" (speaker id), "
     "\"source_text\" (transcript in the original language), "
     "\"translated_text\" (use empty string \"\" because no translation is requested). "
-    "Make sure timestamps are accurate and segments remain speaker-homogeneous. "
+    "TIMESTAMP PRECISION IS CRITICAL - these timestamps will be used to cut audio clips for voice cloning: "
+    "Always use millisecond format (mm:ss.xxx). "
+    "\"start\" must be the EXACT moment the speaker begins speaking (first syllable onset). "
+    "\"end\" must be the EXACT moment the speaker finishes speaking (last syllable offset, before any silence or next speaker). "
+    "Do NOT pad timestamps with extra silence. Do NOT round to whole seconds. "
+    "Each segment's boundaries should tightly enclose only that speaker's utterance. "
     "Respond with JSON only—no markdown or commentary."
 )
 IGNORE_NON_SPEECH_PROMPT_SUFFIX = (
@@ -808,11 +819,10 @@ async def _run_clearvoice_pipeline(
             parallel_config = None
 
         cache_hash = _compute_file_md5(temp_input_path)
-        cache_dir = os.path.join(CLEARVOICE_CACHE_DIR, cache_hash)
+        cache_dir, cached_enhanced_path, cached_sr_path, cached_backing_path = _clearvoice_cache_paths(
+            cache_hash, effective_model
+        )
         os.makedirs(cache_dir, exist_ok=True)
-        cached_enhanced_path = os.path.join(cache_dir, "mossformer2_se.mp3")
-        cached_sr_path = os.path.join(cache_dir, "mossformer2_sr.mp3")
-        cached_backing_path = os.path.join(cache_dir, "backing_track.mp3")
         use_cached_enhancement = apply_enhancement and os.path.exists(cached_enhanced_path)
         use_cached_sr = apply_super_resolution and os.path.exists(cached_sr_path)
         clearvoice_paths: List[str] = []
@@ -1300,11 +1310,17 @@ def _write_clearvoice_input_manifest(
         print(f"⚠️ Failed to write ClearVoice input manifest '{path}': {exc}")
 
 
-def _clearvoice_cache_paths(cache_hash: str) -> Tuple[str, str, str]:
+def _clearvoice_cache_paths(cache_hash: str, enhancement_model: Optional[str] = None) -> Tuple[str, str, str, str]:
+    """
+    Get cache paths for ClearVoice outputs.
+    Enhancement model is included in the cache filename to prevent different models from hitting the same cache.
+    """
     cache_dir = os.path.join(CLEARVOICE_CACHE_DIR, cache_hash)
-    cached_enhanced_path = os.path.join(cache_dir, "mossformer2_se.mp3")
-    cached_sr_path = os.path.join(cache_dir, "mossformer2_sr.mp3")
-    cached_backing_path = os.path.join(cache_dir, "backing_track.mp3")
+    # Include enhancement model in cache filename to distinguish between different models
+    model_suffix = enhancement_model.lower().replace("_", "-") if enhancement_model else "default"
+    cached_enhanced_path = os.path.join(cache_dir, f"enhanced_{model_suffix}.mp3")
+    cached_sr_path = os.path.join(cache_dir, "mossformer2_sr.mp3")  # SR is always MossFormer2_SR_48K
+    cached_backing_path = os.path.join(cache_dir, f"backing_{model_suffix}.mp3")
     return cache_dir, cached_enhanced_path, cached_sr_path, cached_backing_path
 
 
@@ -1314,13 +1330,18 @@ async def _prepare_clearvoice_for_split(
     audio_reference: Optional[str],
     preloaded_audio_bytes: Optional[bytes],
     source_audio_filename: Optional[str],
+    apply_enhancement: bool,
     apply_super_resolution: bool,
     emit_status: Optional[Callable[..., Awaitable[None]]] = None,
     clearvoice_parallel_config: Optional[ClearVoiceParallelConfig] = None,
     enhancement_model_name: Optional[str] = None,
+    audio_separator_enabled: bool = False,
+    audio_separator_model: str = DEFAULT_AUDIO_SEPARATOR_MODEL,
 ) -> SplitClearVoiceAssets:
     """
-    Prepare ClearVoice-enhanced audio for chunk splitting without decoding the entire track when cached.
+    Prepare audio for chunk splitting, optionally with Audio-Separator and/or ClearVoice enhancement.
+    Audio-Separator separates vocals from instrumentals (recommended for mixed audio).
+    ClearVoice enhancement is optional - recommended for noisy audio but not needed for clean vocal-only uploads.
     """
     cleanup_paths: List[str] = []
     upload_temp_path: Optional[str] = None
@@ -1337,7 +1358,9 @@ async def _prepare_clearvoice_for_split(
 
     def _update_cache_paths(hash_value: str) -> None:
         nonlocal cache_hash, cache_dir, cached_enhanced_path, cached_sr_path, cached_backing_path
-        cache_dir, cached_enhanced_path, cached_sr_path, cached_backing_path = _clearvoice_cache_paths(hash_value)
+        cache_dir, cached_enhanced_path, cached_sr_path, cached_backing_path = _clearvoice_cache_paths(
+            hash_value, enhancement_model_name
+        )
         os.makedirs(cache_dir, exist_ok=True)
         cache_hash = hash_value
 
@@ -1371,7 +1394,63 @@ async def _prepare_clearvoice_for_split(
                 {"status": "error", "message": "Provided audio data is empty."},
             )
         source_hash = _compute_bytes_md5(audio_bytes)
-        manifest = _load_clearvoice_input_manifest(source_hash)
+        
+        # Audio-Separator: Run first to separate vocals from instrumentals (if enabled)
+        audio_separator_vocals_path: Optional[str] = None
+        audio_separator_instrumental_path: Optional[str] = None
+        audio_for_processing: Optional[bytes] = audio_bytes
+        
+        if audio_separator_enabled and AudioSeparator is not None:
+            if emit_status:
+                await emit_status(
+                    stage="audio_separation",
+                    message="Separating vocals from instrumentals with Audio-Separator...",
+                )
+            upload_temp_path = _persist_audio_upload(audio_bytes, source_audio_filename)
+            cleanup_paths.append(upload_temp_path)
+            try:
+                audio_separator_vocals, audio_separator_instrumental, _ = await _run_audio_separator_pipeline(
+                    upload_temp_path,
+                    model_key=audio_separator_model,
+                    emit_status=emit_status,
+                    cache_hash=source_hash,
+                )
+                # Export vocals to temp file for further processing
+                vocals_temp_path = await _export_audio_segment_to_tempfile(audio_separator_vocals)
+                cleanup_paths.append(vocals_temp_path)
+                audio_separator_vocals_path = vocals_temp_path
+                # Export instrumental to backing cache
+                _update_cache_paths(source_hash)
+                instrumental_cache_path = os.path.join(cache_dir, f"audio_sep_{audio_separator_model}_instrumental.mp3")
+                if not os.path.exists(instrumental_cache_path):
+                    audio_separator_instrumental.export(instrumental_cache_path, format="mp3", bitrate="192k")
+                    print(f"💾 Cached audio-separator instrumental for {source_hash}.")
+                audio_separator_instrumental_path = instrumental_cache_path
+                # Use vocals for subsequent processing
+                audio_for_processing = await _run_blocking(lambda: audio_separator_vocals.export(format="wav").read())
+                if emit_status:
+                    await emit_status(
+                        stage="audio_separation",
+                        message=f"Vocals ({len(audio_separator_vocals) / 1000:.1f}s) and instrumentals ({len(audio_separator_instrumental) / 1000:.1f}s) separated.",
+                    )
+            except Exception as exc:
+                print(f"⚠️ Audio-separator failed: {exc}")
+                if emit_status:
+                    await emit_status(
+                        stage="audio_separation",
+                        message=f"⚠️ Audio separation failed: {exc}. Processing original audio.",
+                    )
+        elif audio_separator_enabled and AudioSeparator is None:
+            if emit_status:
+                await emit_status(
+                    stage="audio_separation",
+                    message="⚠️ audio-separator not installed. Processing original audio.",
+                )
+        
+        # Use separated vocals hash if available, otherwise use source hash
+        processing_source_hash = _compute_bytes_md5(audio_for_processing) if audio_separator_vocals_path else source_hash
+        
+        manifest = _load_clearvoice_input_manifest(processing_source_hash)
         if manifest:
             manifest_hash = manifest.get("clearvoice_hash")
             processed_hash = manifest.get("processed_hash")
@@ -1379,58 +1458,92 @@ async def _prepare_clearvoice_for_split(
                 _update_cache_paths(manifest_hash)
                 if os.path.exists(cached_enhanced_path) or os.path.exists(cached_sr_path):
                     print(
-                        f"♻️ ClearVoice: Reusing cached assets for upload hash {source_hash[:8]} → {cache_hash}."
+                        f"♻️ ClearVoice: Reusing cached assets for upload hash {processing_source_hash[:8]} → {cache_hash}."
                     )
                 else:
                     cache_hash = None
                     manifest = None
         if cache_hash is None:
-            wav_input_path = await _ensure_wav_input_path(audio_bytes)
-            _update_cache_paths(_compute_file_md5(wav_input_path))
-        final_processed_target = cached_sr_path if apply_super_resolution else cached_enhanced_path
+            if audio_separator_vocals_path:
+                _update_cache_paths(_compute_file_md5(audio_separator_vocals_path))
+            else:
+                wav_input_path = await _ensure_wav_input_path(audio_for_processing)
+                _update_cache_paths(_compute_file_md5(wav_input_path))
 
-        need_processing = not os.path.exists(final_processed_target)
-        if apply_super_resolution and not os.path.exists(cached_enhanced_path):
-            need_processing = True
-        backing_needed = not os.path.exists(cached_backing_path)
+        # Determine the final target based on enhancement/super-resolution settings
+        needs_clearvoice = apply_enhancement or apply_super_resolution
+        if needs_clearvoice:
+            final_processed_target = cached_sr_path if apply_super_resolution else cached_enhanced_path
+            need_processing = not os.path.exists(final_processed_target)
+            if apply_super_resolution and not os.path.exists(cached_enhanced_path):
+                need_processing = True
+            # Only extract backing via ClearVoice if audio-separator was not used
+            backing_needed = not os.path.exists(cached_backing_path) and not audio_separator_instrumental_path
 
-        if need_processing or backing_needed:
-            if emit_status:
-                await emit_status(
-                    stage="enhancement",
-                    message="Generating ClearVoice cache for splitting...",
+            if need_processing or backing_needed:
+                if emit_status:
+                    await emit_status(
+                        stage="enhancement",
+                        message="Generating ClearVoice cache for splitting...",
+                    )
+                # Use separated vocals if available, otherwise use original audio
+                source_path = audio_separator_vocals_path or normalized_audio_temp_path
+                if source_path is None:
+                    await _ensure_wav_input_path(audio_for_processing)
+                    source_path = normalized_audio_temp_path or wav_input_path
+                if source_path is None:
+                    raise TranslateWorkflowHttpError(
+                        500,
+                        {"status": "error", "message": "Unable to prepare source audio for ClearVoice."},
+                    )
+                original_audio = await _load_audio_segment_from_path(source_path)
+                # Only extract backing track via ClearVoice if audio-separator was not used
+                pre_clearvoice_mix = original_audio if not audio_separator_instrumental_path else None
+                processed_audio, backing_track_audio = await _run_clearvoice_pipeline(
+                    original_audio,
+                    apply_enhancement=apply_enhancement,
+                    apply_super_resolution=apply_super_resolution,
+                    pre_clearvoice_mix_audio=pre_clearvoice_mix,
+                    emit_status=emit_status,
+                    source_audio_path=source_path,
+                    clearvoice_parallel_config=clearvoice_parallel_config,
+                    enhancement_model_name=enhancement_model_name,
                 )
-            source_path = normalized_audio_temp_path
+                processed_audio = None
+                backing_track_audio = None
+
+            if not os.path.exists(final_processed_target):
+                raise TranslateWorkflowHttpError(
+                    500,
+                    {
+                        "status": "error",
+                        "message": "ClearVoice processing did not produce an enhanced track.",
+                    },
+                )
+        else:
+            # No ClearVoice enhancement requested
+            # Use separated vocals if available, otherwise use normalized source audio
+            if emit_status:
+                status_msg = "Preparing audio for splitting"
+                if audio_separator_vocals_path:
+                    status_msg += " (using separated vocals, no ClearVoice enhancement)"
+                else:
+                    status_msg += " (no preprocessing)"
+                await emit_status(stage="preparation", message=status_msg + "...")
+            source_path = audio_separator_vocals_path or normalized_audio_temp_path
             if source_path is None:
-                await _ensure_wav_input_path(audio_bytes)
+                await _ensure_wav_input_path(audio_for_processing)
                 source_path = normalized_audio_temp_path or wav_input_path
             if source_path is None:
                 raise TranslateWorkflowHttpError(
                     500,
-                    {"status": "error", "message": "Unable to prepare source audio for ClearVoice."},
+                    {"status": "error", "message": "Unable to prepare source audio."},
                 )
-            original_audio = await _load_audio_segment_from_path(source_path)
-            processed_audio, backing_track_audio = await _run_clearvoice_pipeline(
-                original_audio,
-                apply_enhancement=True,
-                apply_super_resolution=apply_super_resolution,
-                pre_clearvoice_mix_audio=original_audio,
-                emit_status=emit_status,
-                source_audio_path=source_path,
-                clearvoice_parallel_config=clearvoice_parallel_config,
-                enhancement_model_name=enhancement_model_name,
-            )
-            processed_audio = None
-            backing_track_audio = None
-
-        if not os.path.exists(final_processed_target):
-            raise TranslateWorkflowHttpError(
-                500,
-                {
-                    "status": "error",
-                    "message": "ClearVoice processing did not produce an enhanced track.",
-                },
-            )
+            # Cache the source as the final target for consistency
+            final_processed_target = cached_enhanced_path
+            if not os.path.exists(final_processed_target):
+                await _normalize_audio_to_cached(source_path, final_processed_target, delete_source=False)
+                print(f"💾 Cached audio for splitting {cache_hash}.")
 
         try:
             processed_info = _probe_audio_metadata_from_path(
@@ -1445,12 +1558,19 @@ async def _prepare_clearvoice_for_split(
 
         backing_info: Optional[AudioAssetInfo] = None
         backing_source = "none"
-        if os.path.exists(cached_backing_path):
+        actual_backing_path: Optional[str] = None
+        # Prefer audio-separator instrumental over ClearVoice extracted backing
+        if audio_separator_instrumental_path and os.path.exists(audio_separator_instrumental_path):
+            actual_backing_path = audio_separator_instrumental_path
+            backing_source = "audio_separator"
+        elif os.path.exists(cached_backing_path):
+            actual_backing_path = cached_backing_path
+            backing_source = "cache"
+        if actual_backing_path:
             try:
-                backing_info = _probe_audio_metadata_from_path(cached_backing_path, compute_hash=False)
-                backing_source = "cache"
+                backing_info = _probe_audio_metadata_from_path(actual_backing_path, compute_hash=False)
             except Exception as exc:
-                print(f"⚠️ Failed to probe cached backing track: {exc}")
+                print(f"⚠️ Failed to probe backing track: {exc}")
 
         if processed_hash and not processed_info.hash_md5:
             processed_info = AudioAssetInfo(
@@ -1472,7 +1592,7 @@ async def _prepare_clearvoice_for_split(
             processed_audio_info=processed_info,
             clearvoice_hash=clearvoice_hash,
             processed_mime_type="audio/mpeg",
-            backing_track_path=cached_backing_path if os.path.exists(cached_backing_path) else None,
+            backing_track_path=actual_backing_path,
             backing_audio_info=backing_info,
             backing_track_source=backing_source,
             applied_super_resolution=apply_super_resolution,
@@ -5888,6 +6008,7 @@ async def _synthesize_translated_audio(
     pad_to_original: bool = True,
     default_speaker_preset: Optional[str] = None,
     default_emotion_weight: Optional[float] = None,
+    emit_status: Optional[Callable[..., Awaitable[None]]] = None,
 ) -> Tuple[bytes, str, Dict[str, Any]]:
     tts = tts_manager.get_tts()
     frame_rate = int(original_audio.frame_rate or 22050)
@@ -6094,13 +6215,45 @@ async def _synthesize_translated_audio(
 
         return index, generated_audio, log_entry
 
-    segment_tasks = [process_segment(idx, segment) for idx, segment in enumerate(segments)]
+    # Count speech segments for progress tracking
+    speech_segments = [seg for seg in segments if seg.get("type") == "speech"]
+    total_speech = len(speech_segments)
+    completed_count = 0
+    completed_lock = asyncio.Lock()
+    
+    async def process_segment_with_progress(idx: int, segment: Dict[str, Any]):
+        nonlocal completed_count
+        result = await process_segment(idx, segment)
+        
+        # Track progress for speech segments only
+        if segment.get("type") == "speech":
+            async with completed_lock:
+                completed_count += 1
+                current = completed_count
+            
+            # Emit progress update
+            if emit_status and total_speech > 0:
+                await emit_status(
+                    stage="tts",
+                    message=f"🎙️ Generating speech segment {current}/{total_speech}...",
+                )
+        
+        return result
+
+    segment_tasks = [process_segment_with_progress(idx, segment) for idx, segment in enumerate(segments)]
     results = await asyncio.gather(*segment_tasks)
     results.sort(key=lambda item: item[0])
 
     for _, audio_segment, log_entry in results:
         combined_audio += audio_segment
         generation_log.append(log_entry)
+    
+    # Emit completion message
+    if emit_status:
+        await emit_status(
+            stage="tts_complete",
+            message=f"✅ Generated {total_speech} speech segments. Finalizing audio...",
+        )
 
     original_duration_ms = len(original_audio)
     final_duration_ms = len(combined_audio)
@@ -7246,6 +7399,7 @@ async def api_translate_split_audio(
     min_silence_ms: Optional[int] = Form(None),
     silence_threshold_db: Optional[float] = Form(None),
     super_resolution_voice: Optional[bool] = Form(False),
+    enhance_voice: Optional[bool] = Form(False, description="Apply ClearVoice speech enhancement (optional, recommended for mixed audio)"),
     audio_separator_enabled: Optional[bool] = Form(False, description="Enable audio-separator for vocal/instrumental separation"),
     audio_separator_model: Optional[str] = Form(None, description="Audio-separator model: 'fast', 'balance' (default), or 'quality'"),
     clearvoice_parallel_enabled: Optional[bool] = Form(False),
@@ -7254,12 +7408,13 @@ async def api_translate_split_audio(
     enhancement_model: Optional[str] = Form(None, description="ClearVoice enhancement model: 'MossFormerGAN_SE_16K' (default), 'FRCRN_SE_16K', or 'MossFormer2_SE_48K'"),
     audio_file: Optional[UploadFile] = File(None),
 ):
-    """API: Split long audio into ClearVoice-enhanced chunks for reuse."""
+    """API: Split long audio into chunks for reuse. ClearVoice/Audio-Separator optional but recommended for mixed audio."""
     # Note: ClearVoice/Audio-Separator recommended for better silence detection on mixed audio,
     # but not required for vocal-only audio uploads
 
     try:
         payload: Optional[Dict[str, Any]] = None
+        enhance_voice_value = enhance_voice
         audio_separator_enabled_value = audio_separator_enabled
         audio_separator_model_value = audio_separator_model
         clearvoice_parallel_enabled_value = clearvoice_parallel_enabled
@@ -7289,6 +7444,7 @@ async def api_translate_split_audio(
             min_silence_ms = payload.get("min_silence_ms", min_silence_ms)
             silence_threshold_db = payload.get("silence_threshold_db", silence_threshold_db)
             super_resolution_voice = payload.get("super_resolution_voice", super_resolution_voice)
+            enhance_voice_value = payload.get("enhance_voice", enhance_voice_value)
             audio_separator_enabled_value = payload.get("audio_separator_enabled", audio_separator_enabled_value)
             audio_separator_model_value = payload.get("audio_separator_model", audio_separator_model_value)
             enhancement_model = payload.get("enhancement_model", enhancement_model)
@@ -7320,6 +7476,7 @@ async def api_translate_split_audio(
 
         dest_language_value = (dest_language or "").strip() or "unspecified"
         apply_super_resolution = _coerce_to_bool(super_resolution_voice)
+        apply_enhancement = _coerce_to_bool(enhance_voice_value)
         parallel_config = _coerce_clearvoice_parallel_config(
             clearvoice_parallel_enabled_value,
             clearvoice_parallel_chunk_seconds_value,
@@ -7394,6 +7551,10 @@ async def api_translate_split_audio(
             "chunk_max_minutes": max_minutes,
             "min_silence_ms": min_silence_ms_value,
             "silence_threshold_db": silence_threshold_value,
+            "audio_separator_enabled": audio_separator_enabled_flag,
+            "audio_separator_model": audio_separator_model_key if audio_separator_enabled_flag else None,
+            "enhancement": apply_enhancement,
+            "enhancement_model": enhancement_model_name_value if apply_enhancement else None,
             "super_resolution": apply_super_resolution,
             "clearvoice_parallel": parallel_config.to_metadata(),
             "base_output_name": resolved_base_name,
@@ -7424,6 +7585,7 @@ async def api_translate_split_audio(
                     pass
 
             async def run_pipeline():
+                nonlocal resolved_base_name  # Allow reassignment from cached data
                 heartbeat = asyncio.create_task(heartbeat_task())
                 try:
                     await emit_status(stage="start", message="Split request accepted.", summary=split_request_summary)
@@ -7434,10 +7596,13 @@ async def api_translate_split_audio(
                         audio_reference=audio_reference_value if audio_reference_value else None,
                         preloaded_audio_bytes=preloaded_audio_bytes,
                         source_audio_filename=uploaded_filename,
+                        apply_enhancement=apply_enhancement,
                         apply_super_resolution=apply_super_resolution,
                         emit_status=emit_status,
                         clearvoice_parallel_config=parallel_config if parallel_config.enabled else None,
                         enhancement_model_name=enhancement_model_name_value,
+                        audio_separator_enabled=audio_separator_enabled_flag,
+                        audio_separator_model=audio_separator_model_key,
                     )
                     split_profiler.mark(
                         "prepare_clearvoice_assets",
@@ -9217,9 +9382,10 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                     final_segments.sort(key=lambda seg: (int(seg.get("start_ms", 0)), int(seg.get("index", 0))))
                     sanitized_segments.sort(key=lambda seg: (int(seg.get("start_ms", 0)), int(seg.get("index", 0))))
 
+                    speech_count = sum(1 for s in final_segments if s.get("type") == "speech")
                     await emit_status(
                         stage="synthesis",
-                        message=f"Synthesizing translated speech ({len(final_segments)} selected segments)...",
+                        message=f"Synthesizing translated speech ({speech_count} speech segments)...",
                         session_id=session.session_id,
                     )
 
@@ -9241,6 +9407,7 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                         backing_volume_percent=backing_volume_percent,
                         default_speaker_preset=session.default_speaker_preset,
                         default_emotion_weight=session.default_emotion_weight,
+                        emit_status=emit_status,
                     )
 
                     backing_meta = metadata.setdefault("backing_track", {})
@@ -10110,9 +10277,10 @@ async def api_translate_audio(
                     session = segment_result.session
                     segments = segment_result.segments
 
+                    speech_count = sum(1 for s in segments if s.get("type") == "speech")
                     await emit_status(
                         stage="synthesis",
-                        message=f"Synthesizing translated speech ({len(segments)} total segments)...",
+                        message=f"Synthesizing translated speech ({speech_count} speech segments)...",
                     )
 
                     audio_payload, media_type, synthesis_metadata = await _synthesize_translated_audio(
@@ -10136,6 +10304,7 @@ async def api_translate_audio(
                         backing_volume_percent=backing_volume_percent_value,
                         default_speaker_preset=session.default_speaker_preset,
                         default_emotion_weight=session.default_emotion_weight,
+                        emit_status=emit_status,
                     )
 
                     metadata = dict(segment_result.metadata)

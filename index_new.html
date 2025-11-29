@@ -3812,7 +3812,7 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                     formData.append('min_silence_ms', translateChunkMinSilenceInput.value);
                 }
                 formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
-                formData.append('enhance_voice', 'true');
+                formData.append('enhance_voice', translateEnhanceEl && translateEnhanceEl.checked ? 'true' : 'false');
                 formData.append('enhancement_model', translateEnhancementModelEl ? translateEnhancementModelEl.value : 'MossFormerGAN_SE_16K');
                 formData.append('audio_separator_enabled', translateAudioSeparatorEl && translateAudioSeparatorEl.checked ? 'true' : 'false');
                 formData.append('audio_separator_model', translateAudioSeparatorModelEl ? translateAudioSeparatorModelEl.value : 'balance');
@@ -4003,10 +4003,8 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
             if (translateEnableChunkSplit) {
                 translateEnableChunkSplit.addEventListener('change', () => {
                     const enabled = translateEnableChunkSplit.checked;
-                    if (enabled && translateEnhanceEl && !translateEnhanceEl.checked) {
-                        translateEnhanceEl.checked = true;
-                        syncTranslateMergeBackState();
-                    }
+                    // ClearVoice and Audio Separation are optional for chunk splitting
+                    // User may upload vocal-only audio that doesn't need preprocessing
                     toggleChunkControls(enabled);
                 });
                 toggleChunkControls(translateEnableChunkSplit.checked);
