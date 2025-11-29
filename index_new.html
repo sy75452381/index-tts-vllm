@@ -1509,13 +1509,35 @@
                                                 <small style="color: var(--text-muted); display: block; margin-top: 4px; font-size: 0.75rem;">For output files & FFmpeg commands</small>
                                             </div>
                                         </div>
-                                        <div class="form-group" id="translateClearVoiceBlock">
-                                            <label>ClearVoice Separation & Chunking:</label>
-                                            <div class="checkbox-group">
-                                                <label><input type="checkbox" id="translateEnhancement" checked> Enhance (MossFormer2_SE)</label>
-                                                <label><input type="checkbox" id="translateSuperResolution"> Super Resolution (MossFormer2_SR)</label>
-                                                <label><input type="checkbox" id="translateMergeBack" checked> Mix back into instrumental</label>
+                                        <div class="form-group" id="translateAudioSeparatorBlock">
+                                            <label>Audio Separation (Vocal/Instrumental):</label>
+                                            <div class="checkbox-group" style="display: flex; flex-wrap: wrap; gap: 12px; align-items: center;">
+                                                <label><input type="checkbox" id="translateAudioSeparator" checked> Enable Audio-Separator</label>
+                                                <select id="translateAudioSeparatorModel" style="padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border-color); background: var(--bg-color); color: var(--text-color); font-size: 0.9em;">
+                                                    <option value="fast">Fast (UVR-MDX-NET)</option>
+                                                    <option value="balance" selected>Balance (BS-Roformer)</option>
+                                                    <option value="quality">Quality (Mel-Band-Roformer)</option>
+                                                </select>
+                                                <label id="translateMergeBackLabel"><input type="checkbox" id="translateMergeBack" checked> Mix back into instrumental</label>
                                             </div>
+                                            <small style="color: var(--text-muted); display: block; margin-top: 5px;">
+                                                Separates vocals from background music/sounds before processing. More stable than ClearVoice extraction. "Mix back" only available when Audio-Separator is enabled.
+                                            </small>
+                                        </div>
+                                        <div class="form-group" id="translateClearVoiceBlock">
+                                            <label>ClearVoice Enhancement & Super Resolution:</label>
+                                            <div class="checkbox-group" style="display: flex; flex-wrap: wrap; gap: 12px; align-items: center;">
+                                                <label><input type="checkbox" id="translateEnhancement"> Enhance</label>
+                                                <select id="translateEnhancementModel" style="padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border-color); background: var(--bg-color); color: var(--text-color); font-size: 0.9em;">
+                                                    <option value="MossFormerGAN_SE_16K" selected>MossFormerGAN_SE_16K (fast)</option>
+                                                    <option value="FRCRN_SE_16K">FRCRN_SE_16K (fast)</option>
+                                                    <option value="MossFormer2_SE_48K">MossFormer2_SE_48K (quality)</option>
+                                                </select>
+                                                <label><input type="checkbox" id="translateSuperResolution"> Super Resolution (MossFormer2_SR_48K)</label>
+                                            </div>
+                                            <small style="color: var(--text-muted); display: block; margin-top: 5px;">
+                                                ClearVoice enhancement and super resolution apply to vocals only (from Audio-Separator if enabled, or original audio).
+                                            </small>
                                             <div style="margin-top: 10px; padding: 10px; border-radius: 10px; background: rgba(118,75,162,0.08);">
                                                 <label style="display: flex; align-items: center; gap: 8px; font-weight: 500; font-size: 0.85rem;">
                                                     <input type="checkbox" id="translateClearVoiceParallel">
@@ -1537,7 +1559,7 @@
                                             <div style="margin-top: 10px; padding: 10px; border-radius: 10px; background: rgba(102,126,234,0.08);">
                                                 <label style="display: flex; align-items: center; gap: 8px; font-weight: 500; font-size: 0.85rem;">
                                                     <input type="checkbox" id="translateEnableChunkSplit">
-                                                    <span>Split long audio into chunks (requires ClearVoice)</span>
+                                                    <span>Split long audio into chunks (recommend with Audio-Separator/ClearVoice for better silence detection)</span>
                                                 </label>
                                                 <div id="translateChunkSettings" style="display: none; margin-top: 8px;">
                                                     <div class="inline-controls">
@@ -1830,18 +1852,23 @@
                             
                             <div class="form-group">
                                 <label>Pure Voice Extraction (ClearVoice, optional):</label>
-                                <div style="display: flex; gap: 16px; flex-wrap: wrap;">
+                                <div style="display: flex; gap: 16px; flex-wrap: wrap; align-items: center;">
                                     <label style="display: flex; align-items: center; gap: 8px;">
                                         <input type="checkbox" id="applyEnhancement">
-                                        <span>Enhance with MossFormer2_SE_48K</span>
+                                        <span>Enable Speech Enhancement</span>
                                     </label>
+                                    <select id="enhancementModel" style="padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border-color); background: var(--bg-color); color: var(--text-color);">
+                                        <option value="MossFormerGAN_SE_16K" selected>MossFormerGAN_SE_16K (fast)</option>
+                                        <option value="FRCRN_SE_16K">FRCRN_SE_16K (fast)</option>
+                                        <option value="MossFormer2_SE_48K">MossFormer2_SE_48K (quality)</option>
+                                    </select>
                                     <label style="display: flex; align-items: center; gap: 8px;">
                                         <input type="checkbox" id="applySuperResolution">
-                                        <span>Super Resolution with MossFormer2_SR_48K</span>
+                                        <span>Super Resolution (MossFormer2_SR_48K)</span>
                                     </label>
                                 </div>
                                 <small style="color: var(--text-muted); margin-top: 5px; display: block;">
-                                    Enable ClearVoice MossFormer2 models to clean and upscale the reference audio. When both are selected, enhancement runs before super-resolution.
+                                    Enable ClearVoice to clean and upscale the reference audio. MossFormerGAN_SE_16K and FRCRN_SE_16K are smaller/faster models. MossFormer2_SE_48K is larger but offers higher quality at 48kHz.
                                 </small>
                             </div>
                             
@@ -2007,11 +2034,17 @@ Status: CONTINUE (more chunks) or LAST (final chunk)</div>
                                                 <div class="api-param"><span class="api-param-name">audio_file</span> <span class="api-param-type">file</span> <span class="api-param-desc">— Source audio file</span></div>
                                                 <div class="api-param"><span class="api-param-name">dest_language</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Target language (e.g., "English", "Chinese")</span></div>
                                             </div>
-                                            <div class="api-param-group">
+                                                <div class="api-param-group">
+                                                <div class="api-param-group-title">Audio Separation (Vocal/Instrumental)</div>
+                                                <div class="api-param"><span class="api-param-name">audio_separator_enabled</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable audio-separator for vocal/instrumental separation (recommended for backing track)</span></div>
+                                                <div class="api-param"><span class="api-param-name">audio_separator_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Model: 'fast' (UVR-MDX-NET), 'balance' (default, BS-Roformer), or 'quality' (Mel-Band-Roformer)</span></div>
+                                            </div>
+                                                <div class="api-param-group">
                                                 <div class="api-param-group-title">ClearVoice Enhancement</div>
-                                                <div class="api-param"><span class="api-param-name">enhance_voice</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable voice enhancement</span></div>
+                                                <div class="api-param"><span class="api-param-name">enhance_voice</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable voice enhancement (applied to vocals)</span></div>
+                                                <div class="api-param"><span class="api-param-name">enhancement_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Model: 'MossFormerGAN_SE_16K' (default), 'FRCRN_SE_16K', or 'MossFormer2_SE_48K'</span></div>
                                                 <div class="api-param"><span class="api-param-name">super_resolution_voice</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable 48kHz super resolution</span></div>
-                                                <div class="api-param"><span class="api-param-name">merge_backing_track</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Blend with extracted instrumental</span></div>
+                                                <div class="api-param"><span class="api-param-name">merge_backing_track</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Blend with instrumental (requires audio_separator_enabled)</span></div>
                                             </div>
                                             <div class="api-param-group">
                                                 <div class="api-param-group-title">Advanced Options</div>
@@ -2263,6 +2296,7 @@ Content-Type: audio/mpeg</div>
                                                 <div class="api-param"><span class="api-param-name">name</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Speaker name</span></div>
                                                 <div class="api-param"><span class="api-param-name">audio_file</span> <span class="api-param-type">file</span> <span class="api-param-desc">— Reference audio</span></div>
                                                 <div class="api-param"><span class="api-param-name">enhance_voice</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— ClearVoice enhancement</span></div>
+                                                <div class="api-param"><span class="api-param-name">enhancement_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'MossFormerGAN_SE_16K' (default), 'FRCRN_SE_16K', 'MossFormer2_SE_48K'</span></div>
                                                 <div class="api-param"><span class="api-param-name">super_resolution_voice</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— 48kHz upsampling</span></div>
                                             </div>
                                         </div>
@@ -2723,6 +2757,7 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                     formData.append('name', speakerName);
                     formData.append('audio_file', audioFiles[0]); // /add_speaker uses single file
                     formData.append('enhance_voice', document.getElementById('applyEnhancement').checked ? 'true' : 'false');
+                    formData.append('enhancement_model', document.getElementById('enhancementModel').value);
                     formData.append('super_resolution_voice', document.getElementById('applySuperResolution').checked ? 'true' : 'false');
                     
                     const response = await fetch('/add_speaker', {
@@ -2809,8 +2844,12 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
             const translateForceGeminiRefresh = document.getElementById('translateForceGeminiRefresh');
             const translateDestLanguageSelect = document.getElementById('translateDestLanguage');
             const translateEnhanceEl = document.getElementById('translateEnhancement');
+            const translateEnhancementModelEl = document.getElementById('translateEnhancementModel');
             const translateSuperEl = document.getElementById('translateSuperResolution');
+            const translateAudioSeparatorEl = document.getElementById('translateAudioSeparator');
+            const translateAudioSeparatorModelEl = document.getElementById('translateAudioSeparatorModel');
             const translateMergeBackEl = document.getElementById('translateMergeBack');
+            const translateMergeBackLabelEl = document.getElementById('translateMergeBackLabel');
             const translateCustomBackingInput = document.getElementById('translateCustomBackingFile');
             const translateCustomBackingClearBtn = document.getElementById('translateCustomBackingClear');
             const translateCustomBackingSummary = document.getElementById('translateCustomBackingSummary');
@@ -3774,6 +3813,9 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                 }
                 formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
                 formData.append('enhance_voice', 'true');
+                formData.append('enhancement_model', translateEnhancementModelEl ? translateEnhancementModelEl.value : 'MossFormerGAN_SE_16K');
+                formData.append('audio_separator_enabled', translateAudioSeparatorEl && translateAudioSeparatorEl.checked ? 'true' : 'false');
+                formData.append('audio_separator_model', translateAudioSeparatorModelEl ? translateAudioSeparatorModelEl.value : 'balance');
                 appendClearVoiceParallelSettings(formData);
                 if (translateBaseFilenameInput && translateBaseFilenameInput.value.trim()) {
                     formData.append('base_filename', translateBaseFilenameInput.value.trim());
@@ -4270,13 +4312,18 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                 if (!translateMergeBackEl) {
                     return;
                 }
-                const enhancementEnabled = translateEnhanceEl && translateEnhanceEl.checked;
+                // Merge back requires Audio-Separator, custom backing, or stored backing from session
+                const audioSeparatorEnabled = translateAudioSeparatorEl && translateAudioSeparatorEl.checked;
                 const customSelected = hasCustomBackingSelection();
                 const storedBacking = translateBackingAvailableFromSession;
-                const canEnableMerge = enhancementEnabled || customSelected || storedBacking;
+                const canEnableMerge = audioSeparatorEnabled || customSelected || storedBacking;
                 translateMergeBackEl.disabled = !canEnableMerge;
                 if (!canEnableMerge) {
                     translateMergeBackEl.checked = false;
+                }
+                // Update label styling
+                if (translateMergeBackLabelEl) {
+                    translateMergeBackLabelEl.style.opacity = canEnableMerge ? '1' : '0.5';
                 }
             }
 
@@ -4289,19 +4336,17 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                     translateEnhanceEl.checked = true;
                 }
                 translateEnhanceEl.disabled = Boolean(superEnabled);
-                syncTranslateMergeBackState();
             }
 
-            if (translateEnhanceEl) {
-                translateEnhanceEl.addEventListener('change', syncTranslateMergeBackState);
-                syncTranslateMergeBackState();
-            }
+            // Super resolution requires enhancement
             if (translateSuperEl) {
                 translateSuperEl.addEventListener('change', enforceEnhancementForSuperRes);
                 enforceEnhancementForSuperRes();
             } else {
                 enforceEnhancementForSuperRes();
             }
+            // Initialize merge back state
+            syncTranslateMergeBackState();
             if (translateCustomBackingInput) {
                 translateCustomBackingInput.addEventListener('change', () => {
                     updateCustomBackingSummary();
@@ -4341,6 +4386,20 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                 translateIgnoreNonSpeechEl.addEventListener('change', () => {
                     refreshPromptTemplates();
                 });
+            }
+
+            // Audio-Separator: toggle model selector and sync merge back state
+            function syncAudioSeparatorUI() {
+                const audioSepEnabled = translateAudioSeparatorEl && translateAudioSeparatorEl.checked;
+                if (translateAudioSeparatorModelEl) {
+                    translateAudioSeparatorModelEl.disabled = !audioSepEnabled;
+                }
+                // Also sync the merge back state since it depends on audio-separator
+                syncTranslateMergeBackState();
+            }
+            if (translateAudioSeparatorEl) {
+                translateAudioSeparatorEl.addEventListener('change', syncAudioSeparatorUI);
+                syncAudioSeparatorUI();  // Initial state
             }
 
             function appendSegmentParameters(formData) {
@@ -5669,7 +5728,10 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                         formData.append('dest_language', destLanguage);
                         formData.append('response_format', selectedFormat);
                         formData.append('enhance_voice', translateEnhanceEl && translateEnhanceEl.checked ? 'true' : 'false');
+                        formData.append('enhancement_model', translateEnhancementModelEl ? translateEnhancementModelEl.value : 'MossFormerGAN_SE_16K');
                         formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
+                        formData.append('audio_separator_enabled', translateAudioSeparatorEl && translateAudioSeparatorEl.checked ? 'true' : 'false');
+                        formData.append('audio_separator_model', translateAudioSeparatorModelEl ? translateAudioSeparatorModelEl.value : 'balance');
                         formData.append('merge_backing_track', translateMergeBackEl && translateMergeBackEl.checked ? 'true' : 'false');
                         formData.append('ignore_non_speech', translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? 'true' : 'false');
                         formData.append('preserve_silence_audio', translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? 'true' : 'false');
@@ -5734,7 +5796,10 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                     formData.append('dest_language', destLanguage);
                     formData.append('response_format', selectedFormat);
                     formData.append('enhance_voice', translateEnhanceEl && translateEnhanceEl.checked ? 'true' : 'false');
+                    formData.append('enhancement_model', translateEnhancementModelEl ? translateEnhancementModelEl.value : 'MossFormerGAN_SE_16K');
                     formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
+                    formData.append('audio_separator_enabled', translateAudioSeparatorEl && translateAudioSeparatorEl.checked ? 'true' : 'false');
+                    formData.append('audio_separator_model', translateAudioSeparatorModelEl ? translateAudioSeparatorModelEl.value : 'balance');
                     formData.append('merge_backing_track', translateMergeBackEl && translateMergeBackEl.checked ? 'true' : 'false');
                     formData.append('ignore_non_speech', translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? 'true' : 'false');
                     formData.append('preserve_silence_audio', translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? 'true' : 'false');
