@@ -386,7 +386,7 @@ class SpeakerPresetManager:
         self.logger.info(f"Cleared {count} speaker presets from memory cache")
 
 
-def initialize_preset_manager(tts_model, cache_dir: str = "speaker_presets", preload_all: bool = True):
+def initialize_preset_manager(tts_model, cache_dir: str = "speaker_presets", preload_all: bool = False):
     """
     Initialize speaker preset manager for IndexTTS2 model.
     This is thread-safe and doesn't modify the inference pipeline.
@@ -394,7 +394,7 @@ def initialize_preset_manager(tts_model, cache_dir: str = "speaker_presets", pre
     Args:
         tts_model: The IndexTTS2 model instance
         cache_dir: Directory to store speaker presets
-        preload_all: If True, preload all speakers into memory at startup (recommended)
+        preload_all: If True, preload all speakers into memory at startup
         
     Returns:
         SpeakerPresetManager: Initialized preset manager
@@ -403,7 +403,12 @@ def initialize_preset_manager(tts_model, cache_dir: str = "speaker_presets", pre
     tts_model.preset_manager = preset_manager
     
     # Preload all speakers for zero-latency access
-    if preload_all and len(preset_manager.presets) > 0:
-        preset_manager.preload_all_speakers()
+    if preload_all:
+        if len(preset_manager.presets) > 0:
+            preset_manager.preload_all_speakers()
+        else:
+            preset_manager.logger.info("No speaker presets found to preload; will load on-demand")
+    else:
+        preset_manager.logger.info("Speaker presets will load on-demand (preload_all=False)")
     
     return preset_manager
