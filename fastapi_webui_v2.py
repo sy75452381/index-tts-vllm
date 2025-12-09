@@ -472,12 +472,77 @@ async def _decode_audio_segment(audio_bytes: bytes, audio_format: Optional[str])
 
 
 def _export_audio_segment_bytes_sync(audio: AudioSegment, fmt: str = "mp3", bitrate: Optional[str] = None) -> bytes:
+    """Export audio segment to bytes. Uses FFmpeg for long audio (>5 min) for better performance."""
+    duration_sec = len(audio) / 1000.0
+    
+    # Use FFmpeg for long audio files (>5 minutes) - much faster
+    if duration_sec > 300 and _ffmpeg_available():
+        return _export_audio_via_ffmpeg_sync(audio, fmt, bitrate)
+    
     with BytesIO() as buffer:
         export_kwargs: Dict[str, Any] = {"format": fmt}
         if bitrate and fmt in {"mp3", "ogg", "opus", "aac"}:
             export_kwargs["bitrate"] = bitrate
         audio.export(buffer, **export_kwargs)
         return buffer.getvalue()
+
+
+def _export_audio_via_ffmpeg_sync(audio: AudioSegment, fmt: str = "mp3", bitrate: Optional[str] = None) -> bytes:
+    """Export audio via FFmpeg for better performance on long files."""
+    temp_input = None
+    temp_output = None
+    try:
+        # Save to temp WAV file
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_in:
+            temp_input = tmp_in.name
+        audio.export(temp_input, format="wav")
+        
+        # Create temp output file
+        with tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False) as tmp_out:
+            temp_output = tmp_out.name
+        
+        # Build FFmpeg command
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", temp_input]
+        
+        if fmt == "mp3":
+            cmd.extend(["-codec:a", "libmp3lame"])
+            if bitrate:
+                cmd.extend(["-b:a", bitrate])
+        elif fmt == "aac":
+            cmd.extend(["-codec:a", "aac"])
+            if bitrate:
+                cmd.extend(["-b:a", bitrate])
+        elif fmt == "opus":
+            cmd.extend(["-codec:a", "libopus"])
+            if bitrate:
+                cmd.extend(["-b:a", bitrate])
+        elif fmt == "ogg":
+            cmd.extend(["-codec:a", "libvorbis"])
+            if bitrate:
+                cmd.extend(["-b:a", bitrate])
+        elif fmt == "flac":
+            cmd.extend(["-codec:a", "flac"])
+        # WAV - no additional codec needed
+        
+        cmd.append(temp_output)
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg export failed: {result.stderr[:200]}")
+        
+        with open(temp_output, "rb") as f:
+            return f.read()
+    finally:
+        if temp_input and os.path.exists(temp_input):
+            try:
+                os.remove(temp_input)
+            except:
+                pass
+        if temp_output and os.path.exists(temp_output):
+            try:
+                os.remove(temp_output)
+            except:
+                pass
 
 
 async def _export_audio_segment_bytes(audio: AudioSegment, fmt: str = "mp3", bitrate: Optional[str] = None) -> bytes:
@@ -490,9 +555,67 @@ def _export_audio_segment_to_path_sync(
     fmt: str = "mp3",
     bitrate: Optional[str] = None,
 ) -> str:
+    """Export audio segment to path. Uses FFmpeg for long audio (>5 min) for better performance."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    duration_sec = len(audio) / 1000.0
+    
+    # Use FFmpeg for long audio files (>5 minutes) - much faster
+    if duration_sec > 300 and _ffmpeg_available():
+        return _export_audio_to_path_via_ffmpeg_sync(audio, path, fmt, bitrate)
+    
     audio.export(path, format=fmt, bitrate=bitrate)
     return path
+
+
+def _export_audio_to_path_via_ffmpeg_sync(
+    audio: AudioSegment,
+    path: str,
+    fmt: str = "mp3",
+    bitrate: Optional[str] = None,
+) -> str:
+    """Export audio to path via FFmpeg for better performance on long files."""
+    temp_input = None
+    try:
+        # Save to temp WAV file
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_in:
+            temp_input = tmp_in.name
+        audio.export(temp_input, format="wav")
+        
+        # Build FFmpeg command
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", temp_input]
+        
+        if fmt == "mp3":
+            cmd.extend(["-codec:a", "libmp3lame"])
+            if bitrate:
+                cmd.extend(["-b:a", bitrate])
+        elif fmt == "aac":
+            cmd.extend(["-codec:a", "aac"])
+            if bitrate:
+                cmd.extend(["-b:a", bitrate])
+        elif fmt == "opus":
+            cmd.extend(["-codec:a", "libopus"])
+            if bitrate:
+                cmd.extend(["-b:a", bitrate])
+        elif fmt == "ogg":
+            cmd.extend(["-codec:a", "libvorbis"])
+            if bitrate:
+                cmd.extend(["-b:a", bitrate])
+        elif fmt == "flac":
+            cmd.extend(["-codec:a", "flac"])
+        
+        cmd.append(path)
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg export failed: {result.stderr[:200]}")
+        
+        return path
+    finally:
+        if temp_input and os.path.exists(temp_input):
+            try:
+                os.remove(temp_input)
+            except:
+                pass
 
 
 async def _export_audio_segment_to_path(
@@ -721,22 +844,35 @@ async def _run_audio_separator(
     return result
 
 
+@dataclass
+class AudioSeparatorPipelineResult:
+    """Result of the audio-separator pipeline with both AudioSegments and file paths."""
+    vocals_audio: AudioSegment
+    instrumental_audio: AudioSegment
+    vocals_path: str
+    instrumental_path: str
+    cache_hash: str
+    from_cache: bool = False
+
+
 async def _run_audio_separator_pipeline(
     source_audio_path: str,
     *,
     model_key: str = DEFAULT_AUDIO_SEPARATOR_MODEL,
     emit_status: Optional[Callable[..., Awaitable[None]]] = None,
     cache_hash: Optional[str] = None,
-) -> Tuple[AudioSegment, AudioSegment, str]:
+    skip_audio_loading: bool = False,
+) -> AudioSeparatorPipelineResult:
     """
     Run the full audio-separator pipeline on a source audio file.
     
     Args:
         cache_hash: Optional pre-computed hash of the original audio (for consistent caching
                     even when the input file is normalized/converted)
+        skip_audio_loading: If True, skip loading AudioSegments (for when only paths are needed)
     
     Returns:
-        Tuple of (vocals_audio, instrumental_audio, cache_hash)
+        AudioSeparatorPipelineResult with audio segments, paths, and cache info
     """
     # Use provided cache_hash or compute from file
     if cache_hash is None:
@@ -749,6 +885,18 @@ async def _run_audio_separator_pipeline(
         cache_hash=cache_hash,
         emit_status=emit_status,
     )
+    
+    if skip_audio_loading:
+        # Return empty AudioSegments when loading is skipped
+        # Caller should use the paths directly
+        return AudioSeparatorPipelineResult(
+            vocals_audio=AudioSegment.empty(),
+            instrumental_audio=AudioSegment.empty(),
+            vocals_path=result.vocals_path,
+            instrumental_path=result.instrumental_path,
+            cache_hash=result.cache_hash,
+            from_cache=result.from_cache,
+        )
     
     # Load the separated audio segments
     print(f"[audio-separator] Loading vocals from: {result.vocals_path}")
@@ -766,10 +914,17 @@ async def _run_audio_separator_pipeline(
     if emit_status:
         await emit_status(
             stage="audio_separation",
-            message="Loading separated audio tracks from cache...",
+            message="Separated audio tracks loaded.",
         )
     
-    return vocals_audio, instrumental_audio, result.cache_hash
+    return AudioSeparatorPipelineResult(
+        vocals_audio=vocals_audio,
+        instrumental_audio=instrumental_audio,
+        vocals_path=result.vocals_path,
+        instrumental_path=result.instrumental_path,
+        cache_hash=result.cache_hash,
+        from_cache=result.from_cache,
+    )
 
 
 # ==============================================================================
@@ -920,7 +1075,7 @@ async def _run_clearvoice_pipeline(
         backing_track_audio: Optional[AudioSegment] = None
         if os.path.exists(cached_backing_path):
             try:
-                backing_track_audio = AudioSegment.from_file(cached_backing_path, format="mp3")
+                backing_track_audio = await _load_audio_segment_from_path(cached_backing_path)
                 print(
                     "♻️ ClearVoice: Reusing cached backing track for %s (%.2fs)"
                     % (cache_hash, len(backing_track_audio) / 1000.0)
@@ -934,10 +1089,15 @@ async def _run_clearvoice_pipeline(
                 if enhancement_output_path is None:
                     print("⚠️ Enhancement output path not available, cannot extract backing track.")
                 else:
-                    try:
-                        enhancement_audio = await _load_audio_segment_from_path(enhancement_output_path)
-                    except Exception as enhancement_load_error:
-                        print(f"⚠️ Failed to load ClearVoice enhancement output: {enhancement_load_error}")
+                    # Avoid duplicate load: if final_processed_path == enhancement_output_path, reuse processed_audio
+                    if final_processed_path == enhancement_output_path:
+                        enhancement_audio = processed_audio
+                        print(f"[clearvoice] Reusing already-loaded processed audio for backing extraction")
+                    else:
+                        try:
+                            enhancement_audio = await _load_audio_segment_from_path(enhancement_output_path)
+                        except Exception as enhancement_load_error:
+                            print(f"⚠️ Failed to load ClearVoice enhancement output: {enhancement_load_error}")
                 if enhancement_audio is None:
                     print("⚠️ Cannot extract backing track: enhancement audio not available.")
                 else:
@@ -1015,7 +1175,8 @@ async def _prepare_audio_assets(
     enhancement_model_name: Optional[str] = None,
     audio_separator_enabled: bool = False,
     audio_separator_model: str = DEFAULT_AUDIO_SEPARATOR_MODEL,
-) -> Tuple[AudioSegment, str, bytes, str, Optional[AudioSegment], bool, str]:
+) -> Tuple[AudioSegment, str, bytes, str, Optional[AudioSegment], bool, str, Optional[str], Optional[str]]:
+    """Returns: (processed_audio, input_mime, processed_bytes, gemini_mime, backing_audio, merge_backing, backing_source, vocals_path, backing_path)"""
     source_audio_temp_path: Optional[str] = None
     custom_backing_audio: Optional[AudioSegment] = None
     backing_track_source = "none"
@@ -1099,6 +1260,7 @@ async def _prepare_audio_assets(
         merge_with_backing = requested_merge_backing and backing_track_audio is not None
         if requested_merge_backing and backing_track_audio is None:
             print("⚠️ Unable to merge with backing track because no instrumental was derived.")
+        # Return None for cached paths when reusing session (paths already stored in session)
         return (
             original_audio,
             input_mime_type,
@@ -1107,6 +1269,8 @@ async def _prepare_audio_assets(
             backing_track_audio,
             merge_with_backing,
             backing_track_source,
+            getattr(reuse_source_session, 'original_audio_path', None),  # Reuse existing path
+            getattr(reuse_source_session, 'backing_track_path', None),  # Reuse existing path
         )
 
     try:
@@ -1173,7 +1337,11 @@ async def _prepare_audio_assets(
         # Audio-Separator: Separate vocals and instrumentals before ClearVoice
         audio_separator_vocals: Optional[AudioSegment] = None
         audio_separator_instrumental: Optional[AudioSegment] = None
+        audio_separator_vocals_path: Optional[str] = None
+        audio_separator_instrumental_path: Optional[str] = None
         backing_track_audio: Optional[AudioSegment] = None  # Will be set by audio-separator or clearvoice
+        audio_separator_from_cache = False
+        
         if audio_separator_enabled and AudioSeparator is not None:
             # Use original file for audio-separator (no WAV normalization needed)
             separator_input = audio_separator_input_path
@@ -1182,22 +1350,39 @@ async def _prepare_audio_assets(
                 separator_input = await _export_audio_segment_to_tempfile(original_audio)
             try:
                 # Use original audio hash for caching (consistent across sessions)
-                audio_separator_vocals, audio_separator_instrumental, _ = await _run_audio_separator_pipeline(
+                # Skip loading AudioSegments if enhancement is disabled - we can use cached files directly
+                skip_loading = not effective_apply_enhancement
+                separator_result = await _run_audio_separator_pipeline(
                     separator_input,
                     model_key=audio_separator_model,
                     emit_status=emit_status,
                     cache_hash=original_audio_hash,
+                    skip_audio_loading=skip_loading,
                 )
-                # Use separated vocals as input to ClearVoice
-                original_audio = audio_separator_vocals
-                # Use separated instrumentals as backing track (better than ClearVoice extraction)
-                backing_track_audio = audio_separator_instrumental
-                backing_track_source = "audio_separator"
-                if emit_status:
-                    await emit_status(
-                        stage="audio_separation",
-                        message=f"Vocals ({len(audio_separator_vocals) / 1000:.1f}s) and instrumentals ({len(audio_separator_instrumental) / 1000:.1f}s) separated.",
-                    )
+                audio_separator_vocals_path = separator_result.vocals_path
+                audio_separator_instrumental_path = separator_result.instrumental_path
+                audio_separator_from_cache = separator_result.from_cache
+                
+                if not skip_loading:
+                    # Use separated vocals as input to ClearVoice
+                    audio_separator_vocals = separator_result.vocals_audio
+                    audio_separator_instrumental = separator_result.instrumental_audio
+                    original_audio = audio_separator_vocals
+                    backing_track_audio = audio_separator_instrumental
+                    backing_track_source = "audio_separator"
+                    if emit_status:
+                        await emit_status(
+                            stage="audio_separation",
+                            message=f"Vocals ({len(audio_separator_vocals) / 1000:.1f}s) and instrumentals ({len(audio_separator_instrumental) / 1000:.1f}s) separated.",
+                        )
+                else:
+                    # When skipping loading, we'll load later or use cached paths directly
+                    backing_track_source = "audio_separator"
+                    if emit_status:
+                        await emit_status(
+                            stage="audio_separation",
+                            message=f"Audio separation complete (using cached files).",
+                        )
             except Exception as exc:
                 print(f"⚠️ Audio-separator failed, falling back to ClearVoice extraction: {exc}")
                 if emit_status:
@@ -1212,37 +1397,91 @@ async def _prepare_audio_assets(
                     message="⚠️ audio-separator not installed. Skipping vocal/instrumental separation.",
                 )
 
-        # ClearVoice: Enhancement and super-resolution (applied to vocals from audio-separator or original)
-        # Only extract backing track via ClearVoice if audio-separator was not used
-        pre_clearvoice_mix_audio = original_audio if (effective_apply_enhancement and not audio_separator_enabled) else None
-        clearvoice_input_audio = original_audio
-        processed_audio, clearvoice_backing = await _run_clearvoice_pipeline(
-            clearvoice_input_audio,
-            apply_enhancement=effective_apply_enhancement,
-            apply_super_resolution=apply_super_resolution,
-            pre_clearvoice_mix_audio=pre_clearvoice_mix_audio,
-            emit_status=emit_status,
-            source_audio_path=None,  # Already have audio segment
-            clearvoice_parallel_config=clearvoice_parallel_config,
-            enhancement_model_name=enhancement_model_name,
+        # Optimization: If audio-separator produced cached MP3 and no enhancement needed,
+        # read the cached MP3 directly for Gemini instead of re-encoding
+        can_use_cached_mp3 = (
+            audio_separator_vocals_path is not None
+            and audio_separator_vocals_path.lower().endswith('.mp3')
+            and not effective_apply_enhancement
+            and os.path.exists(audio_separator_vocals_path)
         )
-        # Use ClearVoice backing track only if audio-separator was not used
-        if backing_track_audio is None and clearvoice_backing is not None:
-            backing_track_audio = clearvoice_backing
-            backing_track_source = "extracted"
+        
+        processed_audio_bytes: Optional[bytes] = None
+        processed_audio: Optional[AudioSegment] = None
+        
+        if can_use_cached_mp3:
+            # Read cached MP3 directly - much faster than decode + re-encode!
+            print(f"[audio] Using cached vocals MP3 directly for Gemini: {audio_separator_vocals_path}")
+            read_start = time.perf_counter()
+            cached_bytes = await _run_blocking(lambda: _read_file_bytes(audio_separator_vocals_path))
+            read_elapsed = (time.perf_counter() - read_start) * 1000
+            
+            if cached_bytes is None:
+                print(f"⚠️ Failed to read cached MP3, falling back to standard processing")
+                can_use_cached_mp3 = False
+            else:
+                processed_audio_bytes = cached_bytes
+                print(f"[audio] Cached MP3 read ({len(processed_audio_bytes) / 1024:.1f} KB) in {read_elapsed:.1f}ms")
+                
+                # OPTIMIZATION: Load audio in parallel, but also track paths for session storage
+                # Session can copy files instead of re-encoding if paths match
+                if emit_status:
+                    await emit_status(
+                        stage="decode",
+                        message="Loading separated audio tracks in parallel...",
+                    )
+                print(f"[audio] Loading vocals and instrumentals AudioSegments in parallel...")
+                load_start = time.perf_counter()
+                
+                # Load both in parallel using asyncio.gather
+                load_tasks = [_load_audio_segment_from_path(audio_separator_vocals_path)]
+                if audio_separator_instrumental_path and os.path.exists(audio_separator_instrumental_path):
+                    load_tasks.append(_load_audio_segment_from_path(audio_separator_instrumental_path))
+                
+                load_results = await asyncio.gather(*load_tasks)
+                processed_audio = load_results[0]
+                if len(load_results) > 1:
+                    backing_track_audio = load_results[1]
+                
+                load_elapsed = (time.perf_counter() - load_start) * 1000
+                print(f"[audio] Parallel load complete: vocals ({len(processed_audio) / 1000:.1f}s), instrumentals ({len(backing_track_audio) / 1000:.1f}s if loaded) in {load_elapsed:.1f}ms")
+        
+        if not can_use_cached_mp3:
+            # ClearVoice: Enhancement and super-resolution (applied to vocals from audio-separator or original)
+            # Only extract backing track via ClearVoice if audio-separator was not used
+            if audio_separator_vocals is not None:
+                original_audio = audio_separator_vocals
+            
+            pre_clearvoice_mix_audio = original_audio if (effective_apply_enhancement and not audio_separator_enabled) else None
+            clearvoice_input_audio = original_audio
+            processed_audio, clearvoice_backing = await _run_clearvoice_pipeline(
+                clearvoice_input_audio,
+                apply_enhancement=effective_apply_enhancement,
+                apply_super_resolution=apply_super_resolution,
+                pre_clearvoice_mix_audio=pre_clearvoice_mix_audio,
+                emit_status=emit_status,
+                source_audio_path=None,  # Already have audio segment
+                clearvoice_parallel_config=clearvoice_parallel_config,
+                enhancement_model_name=enhancement_model_name,
+            )
+            # Use ClearVoice backing track only if audio-separator was not used
+            if backing_track_audio is None and clearvoice_backing is not None:
+                backing_track_audio = clearvoice_backing
+                backing_track_source = "extracted"
+            
+            print(f"[audio] Exporting processed audio ({len(processed_audio) / 1000:.1f}s) to MP3 for Gemini...")
+            export_start = time.perf_counter()
+            processed_audio_bytes = await _export_audio_segment_bytes(
+                processed_audio,
+                fmt="mp3",
+                bitrate=GEMINI_AUDIO_EXPORT_BITRATE,
+            )
+            export_elapsed = (time.perf_counter() - export_start) * 1000
+            print(f"[audio] Export complete ({len(processed_audio_bytes) / 1024:.1f} KB) in {export_elapsed:.1f}ms")
+        
         if custom_backing_audio is not None:
             backing_track_audio = custom_backing_audio
             backing_track_source = "custom"
-
-        print(f"[audio] Exporting processed audio ({len(processed_audio) / 1000:.1f}s) to MP3 for Gemini...")
-        export_start = time.perf_counter()
-        processed_audio_bytes = await _export_audio_segment_bytes(
-            processed_audio,
-            fmt="mp3",
-            bitrate=GEMINI_AUDIO_EXPORT_BITRATE,
-        )
-        export_elapsed = (time.perf_counter() - export_start) * 1000
-        print(f"[audio] Export complete ({len(processed_audio_bytes) / 1024:.1f} KB) in {export_elapsed:.1f}ms")
         merge_with_backing = requested_merge_backing and backing_track_audio is not None
         if requested_merge_backing and backing_track_audio is None:
             print("⚠️ Unable to merge with backing track because no instrumental was derived.")
@@ -1265,6 +1504,7 @@ async def _prepare_audio_assets(
                     message="📤 Sending original audio to Gemini for transcription/translation.",
                 )
 
+        # Return tuple now includes cached paths for fast session storage
         return (
             processed_audio,
             input_mime_type,
@@ -1273,6 +1513,8 @@ async def _prepare_audio_assets(
             backing_track_audio,
             merge_with_backing,
             backing_track_source,
+            audio_separator_vocals_path,  # Cached vocals path (for fast session storage)
+            audio_separator_instrumental_path,  # Cached backing path (for fast session storage)
         )
     finally:
         if source_audio_temp_path:
@@ -1668,6 +1910,9 @@ async def _build_translation_segments(
     default_speaker_preset: Optional[str] = None,
     default_emotion_weight: Optional[float] = None,
     clearvoice_settings: Optional[Dict[str, Any]] = None,
+    # Cached source paths for fast session storage (avoids re-encoding)
+    original_audio_source_path: Optional[str] = None,
+    backing_track_source_path: Optional[str] = None,
 ) -> SegmentBuildResult:
     manual_chunk_data = None
     manual_speaker_profiles: List[Dict[str, Any]] = []
@@ -1820,6 +2065,9 @@ async def _build_translation_segments(
         source_base_name=source_base_name,
         default_speaker_preset=normalized_default_speaker,
         default_emotion_weight=normalized_default_emotion,
+        # Pass cached paths for fast session storage
+        original_audio_path=original_audio_source_path,
+        backing_track_path=backing_track_source_path,
     )
     session_create_elapsed = (time.perf_counter() - session_create_start) * 1000
     print(f"[translate] Session created: {session.session_id} in {session_create_elapsed:.1f}ms")
@@ -2385,20 +2633,125 @@ async def _materialize_split_chunks_pydub(
             await emit_status(stage="chunking", message=f"Exported chunk {idx}/{total}...")
 
 
-def _persist_session_audio_segment(
+def _transcode_file_with_ffmpeg(
+    source_path: str,
+    target_path: str,
+    target_fmt: str = "wav",
+) -> bool:
+    """Transcode audio file directly using FFmpeg (no memory loading!)."""
+    if not _ffmpeg_available():
+        return False
+    try:
+        os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+        cmd = ["ffmpeg", "-y", "-i", source_path]
+        
+        if target_fmt == "wav":
+            cmd.extend(["-codec:a", "pcm_s16le"])
+        elif target_fmt == "mp3":
+            cmd.extend(["-codec:a", "libmp3lame", "-b:a", "192k"])
+        elif target_fmt == "aac":
+            cmd.extend(["-codec:a", "aac", "-b:a", "192k"])
+        
+        cmd.append(target_path)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        return result.returncode == 0 and os.path.exists(target_path)
+    except Exception as exc:
+        print(f"⚠️ FFmpeg transcode failed: {exc}")
+        return False
+
+
+def _copy_or_transcode_file(
+    source_path: str,
+    target_path: str,
+    target_fmt: str,
+) -> bool:
+    """Copy file if same format, or transcode if different. Returns success."""
+    source_ext = os.path.splitext(source_path)[1].lstrip(".").lower()
+    
+    # Same format - just copy!
+    if source_ext == target_fmt.lower():
+        try:
+            os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+            shutil.copy2(source_path, target_path)
+            print(f"[session] Copied {os.path.basename(source_path)} → {os.path.basename(target_path)}")
+            return True
+        except Exception as exc:
+            print(f"⚠️ File copy failed: {exc}")
+            return False
+    
+    # Different format - transcode with FFmpeg
+    return _transcode_file_with_ffmpeg(source_path, target_path, target_fmt)
+
+
+def _persist_session_audio_segment_sync(
     session_id: str,
     audio: AudioSegment,
     kind: str,
     fmt: str = "mp3",
 ) -> Tuple[str, AudioAssetInfo]:
+    """Synchronous version of session audio persistence."""
     path = _session_media_path(session_id, kind, fmt)
     duration_sec = len(audio) / 1000.0
-    print(f"[session] Persisting {kind} audio ({duration_sec:.1f}s) to {path}...")
+    
+    # Use FFmpeg for long audio (>5 min) - much faster
+    use_ffmpeg = duration_sec > 300 and _ffmpeg_available()
+    method = "FFmpeg" if use_ffmpeg else "pydub"
+    print(f"[session] Persisting {kind} audio ({duration_sec:.1f}s) to {path} using {method}...")
     persist_start = time.perf_counter()
-    audio.export(path, format=fmt)
+    
+    if use_ffmpeg:
+        _export_audio_to_path_via_ffmpeg_sync(audio, path, fmt)
+    else:
+        audio.export(path, format=fmt)
+    
     persist_elapsed = (time.perf_counter() - persist_start) * 1000
     print(f"[session] Audio persist complete in {persist_elapsed:.1f}ms")
     return path, _audio_segment_metadata(audio)
+
+
+def _persist_session_audio_from_path_sync(
+    session_id: str,
+    source_path: str,
+    kind: str,
+    fmt: str = "mp3",
+) -> Tuple[str, AudioAssetInfo]:
+    """Persist session audio by copying/transcoding from source file (no memory loading!)."""
+    target_path = _session_media_path(session_id, kind, fmt)
+    
+    print(f"[session] Persisting {kind} audio from {os.path.basename(source_path)} to {os.path.basename(target_path)}...")
+    persist_start = time.perf_counter()
+    
+    if _copy_or_transcode_file(source_path, target_path, fmt):
+        persist_elapsed = (time.perf_counter() - persist_start) * 1000
+        print(f"[session] Audio persist (from path) complete in {persist_elapsed:.1f}ms")
+        # Get metadata without loading full file
+        info = _probe_audio_metadata_from_path(target_path, compute_hash=False)
+        return target_path, info
+    else:
+        # Fallback: load and export
+        print(f"[session] Fallback to load+export for {kind}")
+        audio = _load_audio_segment_from_path_sync(source_path)
+        return _persist_session_audio_segment_sync(session_id, audio, kind, fmt)
+
+
+async def _persist_session_audio_from_path(
+    session_id: str,
+    source_path: str,
+    kind: str,
+    fmt: str = "mp3",
+) -> Tuple[str, AudioAssetInfo]:
+    """Async version - persist from source file path."""
+    return await _run_blocking(_persist_session_audio_from_path_sync, session_id, source_path, kind, fmt)
+
+
+async def _persist_session_audio_segment(
+    session_id: str,
+    audio: AudioSegment,
+    kind: str,
+    fmt: str = "mp3",
+) -> Tuple[str, AudioAssetInfo]:
+    """Async version - runs persistence in thread pool to avoid blocking event loop."""
+    return await _run_blocking(_persist_session_audio_segment_sync, session_id, audio, kind, fmt)
 
 
 def _get_session_original_audio(session: TranslateSessionData) -> AudioSegment:
@@ -3852,6 +4205,8 @@ async def _generate_chunk_audio_from_session(
         backing_track_audio,
         merge_with_backing,
         backing_track_source,
+        cached_vocals_path,
+        cached_backing_path,
     ) = await _prepare_audio_assets(
         reuse_source_session=chunk_session,
         audio_file=None,
@@ -5471,35 +5826,6 @@ def _merge_short_speech_segments(
     return merged_segments
 
 
-def _segment_audio_data_uri(
-    audio: AudioSegment,
-    start_ms: int,
-    end_ms: int,
-    fmt: str = "mp3",
-    bitrate: str = "128k",
-) -> Optional[str]:
-    start = max(0, int(start_ms))
-    end = max(start, int(end_ms))
-    audio_len = len(audio)
-    if start >= audio_len or start == end:
-        return None
-    if end > audio_len:
-        end = audio_len
-    snippet = audio[start:end]
-    if len(snippet) == 0:
-        return None
-    buffer = BytesIO()
-    export_kwargs: Dict[str, Any] = {}
-    if fmt == "mp3":
-        export_kwargs["bitrate"] = bitrate
-        mime_type = "audio/mpeg"
-    else:
-        mime_type = f"audio/{fmt}"
-    snippet.export(buffer, format=fmt, **export_kwargs)
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
-
-
 def _save_segment_audio_preview(
     session_id: str,
     segment_index: int,
@@ -5536,6 +5862,40 @@ def _save_segment_audio_preview(
         return f"/api/segment_preview/{session_id}/{segment_index}"
     except Exception as exc:
         print(f"⚠️ Failed to save segment preview for session {session_id}, segment {segment_index}: {exc}")
+        return None
+
+
+def _save_segment_preview_from_path(
+    session_id: str,
+    segment_index: int,
+    source_path: str,
+    start_ms: int,
+    end_ms: int,
+    fmt: str = "mp3",
+    bitrate: str = "128k",
+) -> Optional[str]:
+    """Save segment preview by extracting from source file using FFmpeg (fast, no full load)."""
+    # Create filename for this segment preview
+    filename = f"{session_id}_segment_{segment_index}.{fmt}"
+    file_path = os.path.join(TRANSLATE_SESSION_MEDIA_DIR, filename)
+    
+    # Try FFmpeg first (fast, copy if possible)
+    try:
+        source_ext = os.path.splitext(source_path)[1].lower()
+        fmt_ext = (fmt or "mp3").lower()
+        # Copy without re-encode only when container matches to avoid slow transcodes
+        reencode = not (source_ext == f".{fmt_ext}")
+        _ffmpeg_extract_segment(
+            source_path,
+            file_path,
+            start_ms,
+            end_ms,
+            reencode=reencode,
+            bitrate=bitrate,
+        )
+        return f"/api/segment_preview/{session_id}/{segment_index}"
+    except Exception as exc:
+        print(f"[segment_preview] FFmpeg extraction failed for segment {segment_index}: {exc}")
         return None
 
 
@@ -5625,7 +5985,7 @@ async def _create_translate_session(
     chunk_cut_reason: Optional[str] = None,
     chunk_silence_midpoint_ms: Optional[int] = None,
     persist_media: bool = True,
-    media_format: str = "wav",
+    media_format: str = "mp3",
     source_audio_filename: Optional[str] = None,
     source_base_name: Optional[str] = None,
     default_speaker_preset: Optional[str] = None,
@@ -5651,10 +6011,28 @@ async def _create_translate_session(
         raise ValueError("Either original_audio or original_audio_path must be provided.")
     should_persist_audio = persist_media or not audio_path or (audio_path and not os.path.exists(audio_path))
     if should_persist_audio:
-        if original_audio is None:
-            raise ValueError("Original audio data is required to persist session media.")
         target_format = media_format or "wav"
-        audio_path, audio_info = _persist_session_audio_segment(session_id, original_audio, "vocals", fmt=target_format)
+        # If the source is already an MP3 file on disk, reuse it directly to avoid re-encoding/copying.
+        if original_audio_path and os.path.exists(original_audio_path) and original_audio_path.lower().endswith(".mp3"):
+            print(f"[session] Reusing cached MP3 for vocals (no persistence): {original_audio_path}")
+            audio_path = original_audio_path
+            try:
+                audio_info = _probe_audio_metadata_from_path(audio_path, compute_hash=False)
+            except Exception as exc:
+                print(f"⚠️ Failed to probe audio metadata for {audio_path}: {exc}")
+                audio_info = None
+            should_persist_audio = False
+        if should_persist_audio:
+            # OPTIMIZATION: If we have a source path, use FFmpeg transcode instead of load+export
+            if original_audio_path and os.path.exists(original_audio_path):
+                print(f"[session] Using fast path-based persistence for vocals (no memory loading)")
+                audio_path, audio_info = await _persist_session_audio_from_path(
+                    session_id, original_audio_path, "vocals", fmt=target_format
+                )
+            elif original_audio is not None:
+                audio_path, audio_info = await _persist_session_audio_segment(session_id, original_audio, "vocals", fmt=target_format)
+            else:
+                raise ValueError("Original audio data is required to persist session media.")
     if audio_info is None and audio_path:
         try:
             audio_info = _probe_audio_metadata_from_path(audio_path, compute_hash=False)
@@ -5665,7 +6043,23 @@ async def _create_translate_session(
     backing_path = backing_track_path
     backing_info = backing_audio_info
     if backing_path is None and backing_track_audio is not None:
-        backing_path, backing_info = _persist_session_audio_segment(session_id, backing_track_audio, "backing", fmt="mp3")
+        # OPTIMIZATION: If we have a source backing path, use FFmpeg transcode
+        backing_source_path = getattr(backing_track_audio, '_source_path', None)  # Check for attached path
+        if backing_track_path and os.path.exists(backing_track_path):
+            print(f"[session] Using fast path-based persistence for backing (no memory loading)")
+            backing_path, backing_info = await _persist_session_audio_from_path(
+                session_id, backing_track_path, "backing", fmt="mp3"
+            )
+        else:
+            backing_path, backing_info = await _persist_session_audio_segment(session_id, backing_track_audio, "backing", fmt="mp3")
+    elif backing_path and os.path.exists(backing_path) and backing_path.lower().endswith(".mp3"):
+        # Reuse cached backing mp3 directly if present
+        print(f"[session] Reusing cached backing MP3 (no persistence): {backing_path}")
+        try:
+            backing_info = _probe_audio_metadata_from_path(backing_path, compute_hash=False)
+        except Exception as exc:
+            print(f"⚠️ Failed to probe backing metadata for {backing_path}: {exc}")
+            backing_info = None
     if backing_info is None and backing_path:
         try:
             backing_info = _probe_audio_metadata_from_path(backing_path, compute_hash=False)
@@ -6587,62 +6981,329 @@ async def _synthesize_translated_audio(
 
     segment_tasks = [process_segment_with_progress(idx, segment) for idx, segment in enumerate(segments)]
     results = await asyncio.gather(*segment_tasks)
+    
+    print(f"[synthesize] All {len(results)} segment tasks completed. Sorting results...")
+    sort_start = time.perf_counter()
     results.sort(key=lambda item: item[0])
-
-    for _, audio_segment, log_entry in results:
-        combined_audio += audio_segment
-        generation_log.append(log_entry)
+    sort_elapsed = (time.perf_counter() - sort_start) * 1000
+    print(f"[synthesize] Results sorted in {sort_elapsed:.1f}ms")
     
     # Emit completion message
     if emit_status:
         await emit_status(
             stage="tts_complete",
-            message=f"✅ Generated {total_speech} speech segments. Finalizing audio...",
+            message=f"✅ Generated {total_speech} speech segments. Preparing for concatenation...",
         )
 
+    # Collect audio segments and log entries
+    audio_chunks: List[AudioSegment] = []
+    for idx, (_, audio_segment, log_entry) in enumerate(results):
+        audio_chunks.append(audio_segment)
+        generation_log.append(log_entry)
+
     original_duration_ms = len(original_audio)
-    final_duration_ms = len(combined_audio)
-    if pad_to_original and final_duration_ms < original_duration_ms:
-        combined_audio += _create_silence_segment(original_duration_ms - final_duration_ms, frame_rate, sample_width, channels)
-        final_duration_ms = len(combined_audio)
-
-    backing_applied = False
-    if merge_with_backing and backing_track_audio is not None:
-        try:
-            prepared_backing = (
-                backing_track_audio.set_frame_rate(frame_rate)
-                .set_sample_width(sample_width)
-                .set_channels(channels)
-            )
-            if abs(backing_volume_percent - DEFAULT_GENERATED_VOLUME_PERCENT) >= 0.01:
-                volume_factor = max(backing_volume_percent, MIN_GENERATED_VOLUME_PERCENT) / 100.0
-                gain_db = 20 * math.log10(volume_factor) if volume_factor > 0 else -120.0
-                prepared_backing = prepared_backing.apply_gain(gain_db)
-            prepared_backing = _match_segment_duration(
-                prepared_backing,
-                len(combined_audio),
-                frame_rate,
-                sample_width,
-                channels,
-                loop_fill=backing_track_source == "custom",
-                allow_trim=backing_track_source == "custom",
-            )
-            if backing_track_source == "custom":
-                fade_duration = min(2000, len(prepared_backing))
-                if fade_duration > 0:
-                    prepared_backing = prepared_backing.fade_out(fade_duration)
-            combined_audio = prepared_backing.overlay(combined_audio)
-            backing_applied = True
-        except Exception as merge_error:
-            print(f"⚠️ Failed to merge translated audio with backing track: {merge_error}")
-
-    buffer = BytesIO()
-    export_kwargs: Dict[str, Any] = {}
     audio_format = (response_format or TRANSLATE_DEFAULT_OUTPUT_FORMAT).lower()
-    if audio_format == "mp3" and bitrate:
-        export_kwargs["bitrate"] = bitrate
-    combined_audio.export(buffer, format=audio_format, **export_kwargs)
-    audio_bytes = buffer.getvalue()
+    
+    # Use FFmpeg for fast concatenation and post-processing (much faster than pydub for large files)
+    use_ffmpeg_concat = len(audio_chunks) > 100  # Use FFmpeg for larger files
+    
+    if use_ffmpeg_concat:
+        print(f"[synthesize] Using FFmpeg for fast concatenation of {len(audio_chunks)} segments...")
+        if emit_status:
+            await emit_status(
+                stage="concatenation",
+                message=f"🚀 Using FFmpeg for fast concatenation ({len(audio_chunks)} segments)...",
+            )
+        
+        concat_start = time.perf_counter()
+        
+        # Create temp directory for segment files
+        temp_dir = tempfile.mkdtemp(prefix="synth_concat_")
+        paths_to_cleanup: List[str] = []
+        try:
+            # Save segments to temp files and create concat list
+            segment_files: List[str] = []
+            
+            print(f"[synthesize] Writing {len(audio_chunks)} segment files...")
+            write_start = time.perf_counter()
+            
+            def _write_segments_to_files():
+                """Write all segments to temp files - runs in thread pool"""
+                files = []
+                for idx, audio_seg in enumerate(audio_chunks):
+                    seg_path = os.path.join(temp_dir, f"seg_{idx:05d}.wav")
+                    audio_seg.export(seg_path, format="wav")
+                    files.append(seg_path)
+                    if (idx + 1) % 200 == 0:
+                        print(f"[synthesize] Written {idx + 1}/{len(audio_chunks)} segment files...")
+                return files
+            
+            segment_files = await _run_blocking(_write_segments_to_files)
+            write_elapsed = (time.perf_counter() - write_start) * 1000
+            print(f"[synthesize] Segment files written in {write_elapsed:.1f}ms")
+            
+            if emit_status:
+                await emit_status(
+                    stage="concatenation",
+                    message=f"🔗 Running FFmpeg concat on {len(segment_files)} files...",
+                )
+            
+            # Use shared concat helper (copy codec)
+            concat_output_path = await _run_blocking(
+                _ffmpeg_concat_to_tempfile,
+                segment_files,
+                output_format="wav",
+                bitrate=None,
+            )
+            paths_to_cleanup.append(concat_output_path)
+            ffmpeg_concat_elapsed = (time.perf_counter() - concat_start) * 1000
+            print(f"[synthesize] FFmpeg concat complete in {ffmpeg_concat_elapsed:.1f}ms")
+            
+            # Track current WAV file path - avoid loading into memory unless necessary
+            current_wav_path = concat_output_path
+            combined_audio: Optional[AudioSegment] = None  # Only load when needed
+            
+            # Get duration using ffprobe (fast) instead of loading entire file
+            def _get_wav_duration_ms(path: str) -> int:
+                try:
+                    probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path]
+                    result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+                    if result.returncode == 0 and result.stdout.strip():
+                        return int(float(result.stdout.strip()) * 1000)
+                except Exception:
+                    pass
+                # Fallback: load and check (slower)
+                return -1
+            
+            concat_duration_ms = await _run_blocking(lambda: _get_wav_duration_ms(concat_output_path))
+            if concat_duration_ms < 0:
+                # Fallback: load to get duration
+                combined_audio = await _load_audio_segment_from_path(concat_output_path)
+                concat_duration_ms = len(combined_audio)
+            
+            concat_elapsed = (time.perf_counter() - concat_start) * 1000
+            print(f"[synthesize] Total concatenation time: {concat_elapsed:.1f}ms. Duration: {concat_duration_ms / 1000:.1f}s")
+            
+            # Pad to original duration if needed
+            if pad_to_original and concat_duration_ms < original_duration_ms:
+                print(f"[synthesize] Padding audio from {concat_duration_ms}ms to {original_duration_ms}ms...")
+                silence_duration = original_duration_ms - concat_duration_ms
+                # Need to load for padding
+                if combined_audio is None:
+                    combined_audio = await _load_audio_segment_from_path(current_wav_path)
+                combined_audio = combined_audio + _create_silence_segment(silence_duration, frame_rate, sample_width, channels)
+                # Save padded audio
+                padded_path = os.path.join(temp_dir, "padded.wav")
+                await _run_blocking(lambda: combined_audio.export(padded_path, format="wav"))
+                current_wav_path = padded_path
+                paths_to_cleanup.append(padded_path)
+                concat_duration_ms = original_duration_ms
+            
+            # Mix with backing track using FFmpeg if needed
+            backing_applied = False
+            if merge_with_backing and backing_track_audio is not None:
+                if emit_status:
+                    await emit_status(
+                        stage="backing_merge",
+                        message=f"🎵 Mixing with backing track using FFmpeg...",
+                    )
+                print(f"[synthesize] Mixing with backing track using FFmpeg...")
+                merge_start = time.perf_counter()
+                
+                try:
+                    # Save backing track to temp file
+                    backing_path = os.path.join(temp_dir, "backing.wav")
+                    
+                    # Prepare backing track (need to load backing into memory for processing)
+                    def _prepare_backing():
+                        prepared_backing = (
+                            backing_track_audio.set_frame_rate(frame_rate)
+                            .set_sample_width(sample_width)
+                            .set_channels(channels)
+                        )
+                        # Match duration
+                        target_duration = concat_duration_ms
+                        if len(prepared_backing) < target_duration:
+                            if backing_track_source == "custom":
+                                # Loop to fill
+                                loops_needed = (target_duration // len(prepared_backing)) + 1
+                                prepared_backing = prepared_backing * loops_needed
+                            else:
+                                # Pad with silence
+                                prepared_backing = prepared_backing + AudioSegment.silent(duration=target_duration - len(prepared_backing))
+                        prepared_backing = prepared_backing[:target_duration]
+                        prepared_backing.export(backing_path, format="wav")
+                        return backing_path
+                    
+                    await _run_blocking(_prepare_backing)
+                    paths_to_cleanup.append(backing_path)
+                    
+                    # Mix using shared overlay helper (FFmpeg)
+                    backing_vol = max(backing_volume_percent, MIN_GENERATED_VOLUME_PERCENT) / 100.0
+                    vocals_vol = max(generated_volume_percent, MIN_GENERATED_VOLUME_PERCENT) / 100.0
+                    mixed_output_path = await _run_blocking(
+                        _ffmpeg_overlay_to_tempfile,
+                        current_wav_path,
+                        backing_path,
+                        output_format="wav",
+                        bitrate=None,
+                        vocals_volume=vocals_vol,
+                        backing_volume=backing_vol,
+                    )
+                    paths_to_cleanup.append(mixed_output_path)
+                    current_wav_path = mixed_output_path
+                    backing_applied = True
+                    merge_elapsed = (time.perf_counter() - merge_start) * 1000
+                    print(f"[synthesize] FFmpeg backing track mix complete in {merge_elapsed:.1f}ms")
+                except Exception as merge_error:
+                    print(f"⚠️ Failed to merge backing track: {merge_error}")
+                    # Fall back to pydub overlay - need to load
+                    print("[synthesize] Falling back to pydub overlay...")
+                    if combined_audio is None:
+                        combined_audio = await _load_audio_segment_from_path(current_wav_path)
+                    prepared_backing = backing_track_audio.set_frame_rate(frame_rate).set_sample_width(sample_width).set_channels(channels)
+                    if len(prepared_backing) < len(combined_audio):
+                        prepared_backing = prepared_backing + AudioSegment.silent(duration=len(combined_audio) - len(prepared_backing))
+                    prepared_backing = prepared_backing[:len(combined_audio)]
+                    combined_audio = await _run_blocking(lambda: prepared_backing.overlay(combined_audio))
+                    # Save back to path
+                    mixed_output_path = os.path.join(temp_dir, "mixed.wav")
+                    await _run_blocking(lambda: combined_audio.export(mixed_output_path, format="wav"))
+                    paths_to_cleanup.append(mixed_output_path)
+                    current_wav_path = mixed_output_path
+                    backing_applied = True
+            
+            # Export final audio using FFmpeg - use current_wav_path directly!
+            if emit_status:
+                await emit_status(
+                    stage="export",
+                    message=f"💾 Exporting final audio ({concat_duration_ms / 1000:.1f}s) to {audio_format}...",
+                )
+            print(f"[synthesize] Exporting final audio using FFmpeg (from {os.path.basename(current_wav_path)})...")
+            export_start = time.perf_counter()
+            
+            # Use current_wav_path directly - no need to re-export to final.wav!
+            final_output_path = os.path.join(temp_dir, f"output.{audio_format}")
+            
+            export_cmd = ["ffmpeg", "-y", "-i", current_wav_path]
+            export_cmd += _ffmpeg_codec_args_for_format(audio_format, bitrate or TRANSLATE_DEFAULT_BITRATE)
+            export_cmd.append(final_output_path)
+            
+            export_result = await _run_blocking(
+                lambda: subprocess.run(export_cmd, capture_output=True, text=True, timeout=600)
+            )
+            
+            if export_result.returncode != 0:
+                print(f"⚠️ FFmpeg export failed: {export_result.stderr[:300]}")
+                # Fall back to pydub export - need to load if not already
+                if combined_audio is None:
+                    combined_audio = await _load_audio_segment_from_path(current_wav_path)
+                buffer = BytesIO()
+                await _run_blocking(lambda: combined_audio.export(buffer, format=audio_format, bitrate=bitrate or "192k"))
+                audio_bytes = buffer.getvalue()
+            else:
+                with open(final_output_path, "rb") as f:
+                    audio_bytes = f.read()
+            
+            export_elapsed = (time.perf_counter() - export_start) * 1000
+            print(f"[synthesize] Export complete in {export_elapsed:.1f}ms ({len(audio_bytes) / 1024 / 1024:.1f} MB)")
+            
+        finally:
+            # Cleanup temp directory
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception as cleanup_error:
+                print(f"⚠️ Failed to cleanup temp dir: {cleanup_error}")
+            for path in paths_to_cleanup:
+                _safe_remove_file(path)
+    
+    else:
+        # For smaller files, use pydub (simpler and sufficient)
+        print(f"[synthesize] Using pydub for concatenation of {len(audio_chunks)} segments...")
+        concat_start = time.perf_counter()
+        
+        if emit_status:
+            await emit_status(
+                stage="concatenation",
+                message=f"🔗 Concatenating {len(audio_chunks)} audio segments...",
+            )
+        
+        # Simple sum for smaller files
+        combined_audio = await _run_blocking(lambda: sum(audio_chunks, combined_audio))
+        
+        concat_elapsed = (time.perf_counter() - concat_start) * 1000
+        print(f"[synthesize] Concatenation complete in {concat_elapsed:.1f}ms. Duration: {len(combined_audio) / 1000:.1f}s")
+
+        original_duration_ms = len(original_audio)
+        final_duration_ms = len(combined_audio)
+        if pad_to_original and final_duration_ms < original_duration_ms:
+            print(f"[synthesize] Padding audio from {final_duration_ms}ms to {original_duration_ms}ms...")
+            combined_audio = combined_audio + _create_silence_segment(original_duration_ms - final_duration_ms, frame_rate, sample_width, channels)
+
+        backing_applied = False
+        if merge_with_backing and backing_track_audio is not None:
+            if emit_status:
+                await emit_status(
+                    stage="backing_merge",
+                    message=f"🎵 Mixing with backing track ({len(backing_track_audio) / 1000:.1f}s)...",
+                )
+            print(f"[synthesize] Mixing with backing track ({len(backing_track_audio) / 1000:.1f}s)...")
+            merge_start = time.perf_counter()
+            try:
+                def _blocking_backing_merge(audio_to_mix: AudioSegment) -> AudioSegment:
+                    prepared_backing = (
+                        backing_track_audio.set_frame_rate(frame_rate)
+                        .set_sample_width(sample_width)
+                        .set_channels(channels)
+                    )
+                    if abs(backing_volume_percent - DEFAULT_GENERATED_VOLUME_PERCENT) >= 0.01:
+                        volume_factor = max(backing_volume_percent, MIN_GENERATED_VOLUME_PERCENT) / 100.0
+                        gain_db = 20 * math.log10(volume_factor) if volume_factor > 0 else -120.0
+                        prepared_backing = prepared_backing.apply_gain(gain_db)
+                    prepared_backing = _match_segment_duration(
+                        prepared_backing,
+                        len(audio_to_mix),
+                        frame_rate,
+                        sample_width,
+                        channels,
+                        loop_fill=backing_track_source == "custom",
+                        allow_trim=backing_track_source == "custom",
+                    )
+                    if backing_track_source == "custom":
+                        fade_duration = min(2000, len(prepared_backing))
+                        if fade_duration > 0:
+                            prepared_backing = prepared_backing.fade_out(fade_duration)
+                    return prepared_backing.overlay(audio_to_mix)
+                
+                combined_audio = await _run_blocking(_blocking_backing_merge, combined_audio)
+                backing_applied = True
+                merge_elapsed = (time.perf_counter() - merge_start) * 1000
+                print(f"[synthesize] Backing track mixed in {merge_elapsed:.1f}ms")
+            except Exception as merge_error:
+                print(f"⚠️ Failed to merge translated audio with backing track: {merge_error}")
+
+        # Export final audio
+        if emit_status:
+            await emit_status(
+                stage="export",
+                message=f"💾 Exporting final audio ({len(combined_audio) / 1000:.1f}s) to {audio_format}...",
+            )
+        print(f"[synthesize] Exporting final audio ({len(combined_audio) / 1000:.1f}s) to {audio_format}...")
+        export_start = time.perf_counter()
+        
+        export_kwargs: Dict[str, Any] = {}
+        if audio_format == "mp3" and bitrate:
+            export_kwargs["bitrate"] = bitrate
+        
+        def _blocking_export():
+            buffer = BytesIO()
+            combined_audio.export(buffer, format=audio_format, **export_kwargs)
+            return buffer.getvalue()
+        
+        audio_bytes = await _run_blocking(_blocking_export)
+        
+        export_elapsed = (time.perf_counter() - export_start) * 1000
+        print(f"[synthesize] Export complete in {export_elapsed:.1f}ms ({len(audio_bytes) / 1024 / 1024:.1f} MB)")
 
     media_type_map = {
         "mp3": "audio/mpeg",
@@ -8719,25 +9380,35 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
                                 extra=str(exc),
                             )
                             print(f"⚠️ FFmpeg overlay failed, falling back to Python mix: {exc}")
-                    if final_audio_segment is None:
-                        if final_audio_path:
-                            final_audio_segment = await _load_audio_segment_from_path(final_audio_path)
-                        else:
-                            final_audio_segment = merged_audio_segment
+                            # FFmpeg failed - need to fall back to Python overlay
+                            if final_audio_segment is None:
+                                if final_audio_path:
+                                    final_audio_segment = await _load_audio_segment_from_path(final_audio_path)
+                                else:
+                                    final_audio_segment = merged_audio_segment
+                    # Only run Python overlay if FFmpeg wasn't used (final_audio_segment is still set)
                     if final_audio_segment is not None:
                         overlay_python_start = time.perf_counter()
-                        backing_ext = os.path.splitext(backing_path)[1].lstrip(".") or None
-                        full_backing_audio = AudioSegment.from_file(backing_path, format=backing_ext)
-                        backing_len = len(full_backing_audio)
                         vocal_len = len(final_audio_segment)
-                        if backing_len >= vocal_len:
-                            final_audio_segment = full_backing_audio.overlay(final_audio_segment)
-                        else:
-                            print(
-                                f"⚠️ Backing track ({backing_len} ms) shorter than merged vocals ({vocal_len} ms); using vocal timeline as base."
-                            )
-                            final_audio_segment = final_audio_segment.overlay(full_backing_audio)
+                        print(f"[merge] Running Python overlay for {vocal_len / 1000:.1f}s audio...")
+                        
+                        # Run overlay in thread pool to avoid blocking event loop
+                        def _do_python_overlay():
+                            backing_ext = os.path.splitext(backing_path)[1].lstrip(".") or None
+                            full_backing_audio = AudioSegment.from_file(backing_path, format=backing_ext)
+                            backing_len = len(full_backing_audio)
+                            if backing_len >= vocal_len:
+                                return full_backing_audio.overlay(final_audio_segment), backing_len
+                            else:
+                                print(
+                                    f"⚠️ Backing track ({backing_len} ms) shorter than merged vocals ({vocal_len} ms); using vocal timeline as base."
+                                )
+                                return final_audio_segment.overlay(full_backing_audio), backing_len
+                        
+                        final_audio_segment, backing_len = await _run_blocking(_do_python_overlay)
                         final_audio_path = None
+                        overlay_elapsed = (time.perf_counter() - overlay_python_start) * 1000
+                        print(f"[merge] Python overlay complete in {overlay_elapsed:.1f}ms")
                         merge_profiler.mark(
                             "python_overlay",
                             overlay_python_start,
@@ -9463,6 +10134,8 @@ async def api_translate_segments(
                         backing_track_audio,
                         merge_with_backing,
                         backing_track_source,
+                        cached_vocals_path,
+                        cached_backing_path,
                     ) = await _prepare_audio_assets(
                         reuse_source_session=reuse_session_for_segments,
                         audio_file=audio_file,
@@ -9523,6 +10196,9 @@ async def api_translate_segments(
                         default_speaker_preset=default_speaker_value,
                         default_emotion_weight=default_emotion_weight_value,
                         clearvoice_settings=clearvoice_settings,
+                        # Pass cached paths for fast session storage
+                        original_audio_source_path=cached_vocals_path,
+                        backing_track_source_path=cached_backing_path,
                     )
 
                     metadata = segment_result.metadata
@@ -10161,6 +10837,17 @@ async def api_translate_backing_track(session_id: str):
             status_code=404,
             content={"status": "error", "message": "Translate session not found or expired."},
         )
+    # Fast path: serve the persisted MP3 directly (separation output is stored as MP3)
+    backing_path = getattr(session, "backing_track_path", None)
+    if backing_path and os.path.exists(backing_path) and backing_path.lower().endswith(".mp3"):
+        return FileResponse(
+            backing_path,
+            media_type="audio/mpeg",
+            filename=f"translate_backing_{session_id}.mp3",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    # Fallback to in-memory export if for some reason the path is missing
     backing_audio = _get_session_backing_audio(session)
     if backing_audio is None:
         return JSONResponse(
@@ -10194,6 +10881,17 @@ async def api_translate_vocals(session_id: str):
             status_code=404,
             content={"status": "error", "message": "Translate session not found or expired."},
         )
+    # Fast path: serve the persisted MP3 directly (separation output is stored as MP3)
+    vocals_path = getattr(session, "original_audio_path", None)
+    if vocals_path and os.path.exists(vocals_path) and vocals_path.lower().endswith(".mp3"):
+        return FileResponse(
+            vocals_path,
+            media_type="audio/mpeg",
+            filename=f"translate_vocals_{session_id}.mp3",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    # Fallback to in-memory export if for some reason the path is missing
     try:
         original_audio = _get_session_original_audio(session)
     except RuntimeError:
@@ -10677,6 +11375,8 @@ async def api_translate_audio(
                         backing_track_audio,
                         merge_with_backing,
                         backing_track_source,
+                        cached_vocals_path,
+                        cached_backing_path,
                     ) = await _prepare_audio_assets(
                         reuse_source_session=reuse_session_for_translate,
                         audio_file=None if reuse_session_for_translate else audio_file,
@@ -10739,6 +11439,9 @@ async def api_translate_audio(
                         default_speaker_preset=default_speaker_value,
                         default_emotion_weight=default_emotion_weight_value,
                         clearvoice_settings=clearvoice_settings,
+                        # Pass cached paths for fast session storage
+                        original_audio_source_path=cached_vocals_path,
+                        backing_track_source_path=cached_backing_path,
                     )
                     session = segment_result.session
                     segments = segment_result.segments
@@ -11259,17 +11962,43 @@ async def api_segment_preview(
                 raise HTTPException(status_code=404, detail=f"Segment {segment_index} not found in session")
 
             try:
-                original_audio = _get_session_original_audio(session)
                 start_ms = int(segment.get("start_ms", 0))
                 end_ms = int(segment.get("end_ms", start_ms))
-
-                preview_result = _save_segment_audio_preview(
-                    session_id,
-                    segment_index,
-                    original_audio,
-                    start_ms,
-                    end_ms,
-                )
+                
+                print(f"[segment_preview] Generating preview for segment {segment_index} ({start_ms}ms - {end_ms}ms)")
+                
+                # Try FFmpeg extraction from stored audio file (fast - no full file loading!)
+                source_path = getattr(session, "original_audio_path", None)
+                preview_result = None
+                slice_timeout_seconds = 20
+                
+                print(f"[segment_preview] Session original_audio_path: {source_path}")
+                print(f"[segment_preview] Path exists: {os.path.exists(source_path) if source_path else 'N/A'}")
+                
+                if source_path and os.path.exists(source_path):
+                    print(f"[segment_preview] Using FFmpeg to extract segment {segment_index} from {os.path.basename(source_path)} ({start_ms}ms - {end_ms}ms)")
+                    try:
+                        preview_result = await asyncio.wait_for(
+                            _run_blocking(
+                                _save_segment_preview_from_path,
+                                session_id,
+                                segment_index,
+                                source_path,
+                                start_ms,
+                                end_ms,
+                            ),
+                            timeout=slice_timeout_seconds,
+                        )
+                    except asyncio.TimeoutError:
+                        print(f"[segment_preview] FFmpeg extraction timed out for segment {segment_index}")
+                        preview_result = None
+                    print(f"[segment_preview] FFmpeg extraction result: {preview_result}")
+                else:
+                    print(f"[segment_preview] Source path not available or doesn't exist")
+                
+                # No fallback to pydub to avoid loading full audio; fail fast if ffmpeg did not produce a result
+                if not preview_result:
+                    raise HTTPException(status_code=500, detail="Failed to generate segment preview (ffmpeg)")
 
                 if preview_result:
                     file_path = _resolve_existing_path(original_candidates)

@@ -4224,22 +4224,52 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                 
                 stopCompactAudio();
                 
-                btn.textContent = '⏹';
-                btn.classList.add('playing');
+                // Show loading state while fetching audio
+                btn.textContent = '⏳';
+                btn.classList.add('loading');
                 currentPlayingBtn = btn;
                 
                 if (!compactAudioPlayer) {
                     compactAudioPlayer = new Audio();
                     compactAudioPlayer.addEventListener('ended', stopCompactAudio);
-                    compactAudioPlayer.addEventListener('error', () => {
+                    compactAudioPlayer.addEventListener('error', (e) => {
+                        console.error('Error playing audio:', e);
+                        btn.textContent = '❌';
+                        btn.title = 'Failed to load audio - click to retry';
+                        setTimeout(() => {
+                            btn.textContent = '▶';
+                            btn.title = 'Play original';
+                        }, 2000);
                         stopCompactAudio();
-                        console.error('Error playing audio');
                     });
+                    // When audio is ready to play, update button
+                    const markPlaying = () => {
+                        if (currentPlayingBtn === btn) {
+                            btn.textContent = '⏹';
+                            btn.classList.remove('loading');
+                            btn.classList.add('playing');
+                        }
+                    };
+                    compactAudioPlayer.addEventListener('canplay', markPlaying);
+                    compactAudioPlayer.addEventListener('loadeddata', markPlaying);
+                    compactAudioPlayer.addEventListener('playing', markPlaying);
                 }
                 
                 compactAudioPlayer.src = audioUrl;
-                compactAudioPlayer.play().catch(err => {
+                compactAudioPlayer.load(); // Explicitly load to trigger canplay event
+                compactAudioPlayer.play().then(() => {
+                    // If play resolves before canplay/playing fired (cached file), ensure state updates
+                    if (currentPlayingBtn === btn && btn.classList.contains('loading')) {
+                        btn.textContent = '⏹';
+                        btn.classList.remove('loading');
+                        btn.classList.add('playing');
+                    }
+                }).catch(err => {
                     console.error('Play error:', err);
+                    btn.textContent = '❌';
+                    setTimeout(() => {
+                        btn.textContent = '▶';
+                    }, 2000);
                     stopCompactAudio();
                 });
             }
