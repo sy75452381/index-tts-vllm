@@ -751,8 +751,23 @@ async def _run_audio_separator_pipeline(
     )
     
     # Load the separated audio segments
+    print(f"[audio-separator] Loading vocals from: {result.vocals_path}")
+    load_start = time.perf_counter()
     vocals_audio = await _load_audio_segment_from_path(result.vocals_path)
+    vocals_elapsed = (time.perf_counter() - load_start) * 1000
+    print(f"[audio-separator] Vocals loaded ({len(vocals_audio) / 1000:.1f}s) in {vocals_elapsed:.1f}ms")
+    
+    print(f"[audio-separator] Loading instrumentals from: {result.instrumental_path}")
+    load_start = time.perf_counter()
     instrumental_audio = await _load_audio_segment_from_path(result.instrumental_path)
+    instrumental_elapsed = (time.perf_counter() - load_start) * 1000
+    print(f"[audio-separator] Instrumentals loaded ({len(instrumental_audio) / 1000:.1f}s) in {instrumental_elapsed:.1f}ms")
+    
+    if emit_status:
+        await emit_status(
+            stage="audio_separation",
+            message="Loading separated audio tracks from cache...",
+        )
     
     return vocals_audio, instrumental_audio, result.cache_hash
 
@@ -1219,11 +1234,15 @@ async def _prepare_audio_assets(
             backing_track_audio = custom_backing_audio
             backing_track_source = "custom"
 
+        print(f"[audio] Exporting processed audio ({len(processed_audio) / 1000:.1f}s) to MP3 for Gemini...")
+        export_start = time.perf_counter()
         processed_audio_bytes = await _export_audio_segment_bytes(
             processed_audio,
             fmt="mp3",
             bitrate=GEMINI_AUDIO_EXPORT_BITRATE,
         )
+        export_elapsed = (time.perf_counter() - export_start) * 1000
+        print(f"[audio] Export complete ({len(processed_audio_bytes) / 1024:.1f} KB) in {export_elapsed:.1f}ms")
         merge_with_backing = requested_merge_backing and backing_track_audio is not None
         if requested_merge_backing and backing_track_audio is None:
             print("⚠️ Unable to merge with backing track because no instrumental was derived.")
@@ -1679,6 +1698,12 @@ async def _build_translation_segments(
     if manual_chunk_data is not None:
         gemini_chunks = manual_chunk_data
         speaker_profiles = manual_speaker_profiles or []
+        print(f"[translate] Using {len(gemini_chunks)} manual segments (SRT/JSON), skipping Gemini inference")
+        if emit_status:
+            await emit_status(
+                stage="manual_segments",
+                message=f"Using {len(gemini_chunks)} manual segments from SRT/JSON input...",
+            )
     else:
         (
             gemini_chunks,
@@ -1700,10 +1725,12 @@ async def _build_translation_segments(
     if emit_status:
         await emit_status(
             stage="segmentation",
-            message=f"Received {len(gemini_chunks)} raw segments; preparing timeline...",
+            message=f"Processing {len(gemini_chunks)} segments; preparing timeline...",
         )
 
     original_duration_ms = len(original_audio)
+    print(f"[translate] Preparing {len(gemini_chunks)} segments for timeline processing...")
+    segment_prep_start = time.perf_counter()
     segments = _prepare_translation_segments(
         original_duration_ms,
         gemini_chunks,
@@ -1712,6 +1739,8 @@ async def _build_translation_segments(
         min_speech_duration_ms=min_speech_duration,
         max_merge_interval_ms=max_merge_interval,
     )
+    segment_prep_elapsed = (time.perf_counter() - segment_prep_start) * 1000
+    print(f"[translate] Segment preparation complete: {len(segments)} segments in {segment_prep_elapsed:.1f}ms")
 
     detected_speaker_ids: Set[str] = set()
     for segment in segments:
@@ -1752,6 +1781,13 @@ async def _build_translation_segments(
             if not translated_text and source_text:
                 segment["translated_text"] = source_text
 
+    if emit_status:
+        await emit_status(
+            stage="session",
+            message=f"Creating translation session with {len(segments)} segments...",
+        )
+    print(f"[translate] Creating session with {len(segments)} segments...")
+    session_create_start = time.perf_counter()
     session = await _create_translate_session(
         original_audio,
         dest_language,
@@ -1785,6 +1821,9 @@ async def _build_translation_segments(
         default_speaker_preset=normalized_default_speaker,
         default_emotion_weight=normalized_default_emotion,
     )
+    session_create_elapsed = (time.perf_counter() - session_create_start) * 1000
+    print(f"[translate] Session created: {session.session_id} in {session_create_elapsed:.1f}ms")
+    
     if source_chunk_session and source_chunk_session.chunk_parent_id:
         session.chunk_parent_id = source_chunk_session.chunk_parent_id
         session.chunk_index = source_chunk_session.chunk_index
@@ -1793,7 +1832,17 @@ async def _build_translation_segments(
         session.chunk_cut_reason = source_chunk_session.chunk_cut_reason
         session.chunk_silence_midpoint_ms = source_chunk_session.chunk_silence_midpoint_ms
         session.chunk_source_session_id = source_chunk_session.session_id
+    
+    if emit_status:
+        await emit_status(
+            stage="serialization",
+            message=f"Serializing {len(segments)} segments for UI...",
+        )
+    print(f"[translate] Serializing {len(segments)} segments for UI...")
+    serialize_start = time.perf_counter()
     ui_segments = _serialize_segments_for_ui(segments, session.session_id)
+    serialize_elapsed = (time.perf_counter() - serialize_start) * 1000
+    print(f"[translate] Serialization complete in {serialize_elapsed:.1f}ms")
 
     metadata = {
         "dest_language": dest_language,
@@ -2343,7 +2392,12 @@ def _persist_session_audio_segment(
     fmt: str = "mp3",
 ) -> Tuple[str, AudioAssetInfo]:
     path = _session_media_path(session_id, kind, fmt)
+    duration_sec = len(audio) / 1000.0
+    print(f"[session] Persisting {kind} audio ({duration_sec:.1f}s) to {path}...")
+    persist_start = time.perf_counter()
     audio.export(path, format=fmt)
+    persist_elapsed = (time.perf_counter() - persist_start) * 1000
+    print(f"[session] Audio persist complete in {persist_elapsed:.1f}ms")
     return path, _audio_segment_metadata(audio)
 
 
@@ -4590,6 +4644,297 @@ def _format_ms_to_srt_timestamp(milliseconds: int) -> str:
     seconds = (ms % 60_000) // 1000
     millis = ms % 1000
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def _parse_srt_timestamp_to_ms(timestamp: str) -> int:
+    """
+    Parse SRT timestamp to milliseconds.
+    Supports formats like:
+      - 00:01:23,456 (SRT standard)
+      - 00:01:23.456 (VTT style)
+      - 01:23,456 (mm:ss,ms)
+      - 01:23.456 (mm:ss.ms)
+    """
+    timestamp = timestamp.strip()
+    # Replace comma with period for uniform parsing
+    timestamp = timestamp.replace(",", ".")
+    
+    parts = timestamp.split(":")
+    if len(parts) == 3:
+        # HH:MM:SS.mmm
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        sec_ms = parts[2].split(".")
+        seconds = int(sec_ms[0])
+        millis = int(sec_ms[1].ljust(3, "0")[:3]) if len(sec_ms) > 1 else 0
+    elif len(parts) == 2:
+        # MM:SS.mmm
+        hours = 0
+        minutes = int(parts[0])
+        sec_ms = parts[1].split(".")
+        seconds = int(sec_ms[0])
+        millis = int(sec_ms[1].ljust(3, "0")[:3]) if len(sec_ms) > 1 else 0
+    else:
+        return 0
+    
+    return (hours * 3600 + minutes * 60 + seconds) * 1000 + millis
+
+
+def _parse_srt_file_with_timestamps(srt_content: str) -> List[Dict[str, Any]]:
+    """
+    Parse SRT/VTT file content and return list of entries with timestamps and text.
+    Each entry has: sequence (sequence number), start_ms, end_ms, text
+    
+    Supports:
+    - Standard SRT format
+    - WebVTT format (with WEBVTT header)
+    """
+    entries: List[Dict[str, Any]] = []
+    lines = srt_content.strip().split("\n")
+    
+    i = 0
+    current_sequence: Optional[int] = None
+    auto_sequence = 0  # Fallback counter if no sequence numbers
+    
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        # Skip empty lines
+        if not line:
+            i += 1
+            continue
+        
+        # Skip VTT header and metadata
+        if line.upper().startswith("WEBVTT") or line.startswith("Kind:") or line.startswith("Language:") or line.startswith("NOTE"):
+            i += 1
+            continue
+        
+        # Check for sequence number (just a digit)
+        if line.isdigit():
+            current_sequence = int(line)
+            i += 1
+            continue
+        
+        # Check for timestamp line (contains "-->")
+        if "-->" in line:
+            # Parse timestamps
+            timestamp_parts = line.split("-->")
+            if len(timestamp_parts) == 2:
+                start_ts = timestamp_parts[0].strip()
+                end_ts = timestamp_parts[1].strip()
+                # Remove any position info after the timestamp
+                if " " in end_ts:
+                    end_ts = end_ts.split(" ")[0]
+                
+                start_ms = _parse_srt_timestamp_to_ms(start_ts)
+                end_ms = _parse_srt_timestamp_to_ms(end_ts)
+                
+                # Collect text lines until empty line or next sequence number
+                i += 1
+                text_lines: List[str] = []
+                while i < len(lines):
+                    text_line = lines[i].strip()
+                    if not text_line:
+                        i += 1
+                        break
+                    # Check if this looks like a sequence number for next entry
+                    if text_line.isdigit() and i + 1 < len(lines) and "-->" in lines[i + 1]:
+                        break
+                    text_lines.append(text_line)
+                    i += 1
+                
+                text = "\n".join(text_lines).strip()
+                if text:
+                    auto_sequence += 1
+                    entries.append({
+                        "sequence": current_sequence if current_sequence is not None else auto_sequence,
+                        "start_ms": start_ms,
+                        "end_ms": end_ms,
+                        "text": text,
+                    })
+                    current_sequence = None  # Reset for next entry
+                continue
+        
+        i += 1
+    
+    return entries
+
+
+def _combine_srt_subtitles_to_segments(
+    original_srt_entries: List[Dict[str, Any]],
+    translated_srt_entries: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Combine original language SRT and translated SRT into segment format compatible with generation.
+    
+    Matching is done by sequence number (1, 2, 3, etc.) - the standard SRT numbering.
+    Timestamps are taken from the original SRT file.
+    
+    Since subtitles don't have speaker information, all segments are assigned to 'speaker1'.
+    
+    Returns tuple of (segments_data, speaker_profiles).
+    """
+    # Use original SRT timestamps as primary
+    segments: List[Dict[str, Any]] = []
+    
+    # Build a lookup for translated entries by sequence number
+    translated_lookup: Dict[int, Dict[str, Any]] = {}
+    for entry in translated_srt_entries:
+        seq = entry.get("sequence")
+        if seq is not None:
+            translated_lookup[seq] = entry
+    
+    for orig_entry in original_srt_entries:
+        start_ms = orig_entry["start_ms"]
+        end_ms = orig_entry["end_ms"]
+        source_text = orig_entry["text"]
+        sequence = orig_entry.get("sequence")
+        
+        # Find matching translated entry by sequence number
+        translated_text = ""
+        if sequence is not None and sequence in translated_lookup:
+            translated_text = translated_lookup[sequence].get("text", "")
+        
+        # Format timestamps in mm:ss.xxx format for compatibility
+        start_formatted = _format_ms_to_timestamp(start_ms)
+        end_formatted = _format_ms_to_timestamp(end_ms)
+        
+        segments.append({
+            "start": start_formatted,
+            "end": end_formatted,
+            "source_text": source_text,
+            "translated_text": translated_text,
+            "speaker": "speaker1",  # Subtitles don't have speaker info
+        })
+    
+    # Create single speaker profile
+    speaker_profiles = [
+        {
+            "id": "speaker1",
+            "description": "Single speaker (from subtitle)",
+        }
+    ]
+    
+    return segments, speaker_profiles
+
+
+def _combine_srt_translated_only_to_segments(
+    translated_srt_entries: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Create segments from translated SRT only (when no original SRT is provided).
+    Source text will be empty.
+    
+    Returns tuple of (segments_data, speaker_profiles).
+    """
+    segments: List[Dict[str, Any]] = []
+    
+    for entry in translated_srt_entries:
+        start_ms = entry["start_ms"]
+        end_ms = entry["end_ms"]
+        translated_text = entry["text"]
+        
+        start_formatted = _format_ms_to_timestamp(start_ms)
+        end_formatted = _format_ms_to_timestamp(end_ms)
+        
+        segments.append({
+            "start": start_formatted,
+            "end": end_formatted,
+            "source_text": "",
+            "translated_text": translated_text,
+            "speaker": "speaker1",
+        })
+    
+    speaker_profiles = [
+        {
+            "id": "speaker1",
+            "description": "Single speaker (from subtitle)",
+        }
+    ]
+    
+    return segments, speaker_profiles
+
+
+def _combine_srt_original_only_to_segments(
+    original_srt_entries: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Create segments from original SRT only (for transcription mode without translation).
+    Translated text will be the same as source text.
+    
+    Returns tuple of (segments_data, speaker_profiles).
+    """
+    segments: List[Dict[str, Any]] = []
+    
+    for entry in original_srt_entries:
+        start_ms = entry["start_ms"]
+        end_ms = entry["end_ms"]
+        source_text = entry["text"]
+        
+        start_formatted = _format_ms_to_timestamp(start_ms)
+        end_formatted = _format_ms_to_timestamp(end_ms)
+        
+        segments.append({
+            "start": start_formatted,
+            "end": end_formatted,
+            "source_text": source_text,
+            "translated_text": source_text,  # Use source as translated for generation
+            "speaker": "speaker1",
+        })
+    
+    speaker_profiles = [
+        {
+            "id": "speaker1",
+            "description": "Single speaker (from subtitle)",
+        }
+    ]
+    
+    return segments, speaker_profiles
+
+
+def _parse_srt_input_to_segments(
+    original_srt_content: Optional[str],
+    translated_srt_content: Optional[str],
+) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
+    """
+    Parse SRT subtitle inputs and convert to segment format.
+    
+    Args:
+        original_srt_content: Content of original language SRT file (optional)
+        translated_srt_content: Content of translated SRT file (optional)
+    
+    Returns:
+        Tuple of (segments, speaker_profiles) or None if no valid SRT content provided.
+    
+    Raises:
+        ValueError: If SRT parsing fails.
+    """
+    original_entries: List[Dict[str, Any]] = []
+    translated_entries: List[Dict[str, Any]] = []
+    
+    if original_srt_content:
+        original_srt_str = original_srt_content.strip()
+        if original_srt_str:
+            original_entries = _parse_srt_file_with_timestamps(original_srt_str)
+    
+    if translated_srt_content:
+        translated_srt_str = translated_srt_content.strip()
+        if translated_srt_str:
+            translated_entries = _parse_srt_file_with_timestamps(translated_srt_str)
+    
+    # Return None if no SRT content provided
+    if not original_entries and not translated_entries:
+        return None
+    
+    # Combine based on what's available
+    if original_entries and translated_entries:
+        return _combine_srt_subtitles_to_segments(original_entries, translated_entries)
+    elif translated_entries:
+        return _combine_srt_translated_only_to_segments(translated_entries)
+    elif original_entries:
+        return _combine_srt_original_only_to_segments(original_entries)
+    
+    return None
 
 
 def _build_srt_entries_from_segments(
@@ -8772,6 +9117,9 @@ async def api_translate_segments(
     force_gemini_regenerate: Optional[bool] = Form(False),
     default_speaker_preset: Optional[str] = Form(None),
     default_emotion_weight: Optional[float] = Form(None),
+    # SRT subtitle upload support
+    original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
+    translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
 ):
     """API: Prepare translation segments for advanced translate/edit workflow."""
     reuse_session_id_value: Optional[str] = reuse_session_id
@@ -8880,6 +9228,56 @@ async def api_translate_segments(
                 default_speaker_value = payload.get("default_speaker_preset")
             if "default_emotion_weight" in payload:
                 default_emotion_weight_value = payload.get("default_emotion_weight", default_emotion_weight_value)
+
+        # Handle SRT subtitle file uploads
+        # If SRT files are provided, parse and convert to segments_json format
+        srt_segments_from_upload: Optional[str] = None
+        if original_srt_file is not None or translated_srt_file is not None:
+            print("[translate_segments] Processing SRT subtitle files...")
+            srt_parse_start = time.perf_counter()
+            try:
+                original_srt_content: Optional[str] = None
+                translated_srt_content: Optional[str] = None
+                
+                if original_srt_file is not None:
+                    print(f"[translate_segments] Reading original SRT: {original_srt_file.filename}")
+                    original_srt_bytes = await original_srt_file.read()
+                    if original_srt_bytes:
+                        try:
+                            original_srt_content = original_srt_bytes.decode("utf-8")
+                        except UnicodeDecodeError:
+                            original_srt_content = original_srt_bytes.decode("latin-1")
+                        print(f"[translate_segments] Original SRT loaded: {len(original_srt_content)} bytes")
+                
+                if translated_srt_file is not None:
+                    print(f"[translate_segments] Reading translated SRT: {translated_srt_file.filename}")
+                    translated_srt_bytes = await translated_srt_file.read()
+                    if translated_srt_bytes:
+                        try:
+                            translated_srt_content = translated_srt_bytes.decode("utf-8")
+                        except UnicodeDecodeError:
+                            translated_srt_content = translated_srt_bytes.decode("latin-1")
+                        print(f"[translate_segments] Translated SRT loaded: {len(translated_srt_content)} bytes")
+                
+                print("[translate_segments] Parsing SRT files into segments...")
+                srt_result = _parse_srt_input_to_segments(original_srt_content, translated_srt_content)
+                if srt_result is not None:
+                    srt_segments, srt_speaker_profiles = srt_result
+                    srt_parse_elapsed = (time.perf_counter() - srt_parse_start) * 1000
+                    print(f"[translate_segments] SRT parsing complete: {len(srt_segments)} segments in {srt_parse_elapsed:.1f}ms")
+                    srt_segments_from_upload = json.dumps({
+                        "speakers": srt_speaker_profiles,
+                        "segments": srt_segments,
+                    }, ensure_ascii=False)
+            except Exception as srt_exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": f"Failed to parse SRT subtitle files: {str(srt_exc)}"},
+                )
+        
+        # SRT upload takes priority over segments_json form field
+        if srt_segments_from_upload:
+            segments_override_value = srt_segments_from_upload
 
         dest_language_value = (dest_language_value or "").strip()
         if not dest_language_value:
@@ -9884,6 +10282,9 @@ async def api_translate_audio(
     force_gemini_regenerate: Optional[bool] = Form(False),
     default_speaker_preset: Optional[str] = Form(None),
     default_emotion_weight: Optional[float] = Form(None),
+    # SRT subtitle upload support
+    original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
+    translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
 ):
     """API: Translate speech audio to a target language and return synthesized audio."""
     reuse_session_id_value: Optional[str] = reuse_session_id
@@ -10020,6 +10421,58 @@ async def api_translate_audio(
             default_emotion_weight_value,
             DEFAULT_EMOTION_WEIGHT,
         )
+
+        # Handle SRT subtitle file uploads
+        # If SRT files are provided, parse and convert to segments_json format
+        srt_segments_from_upload: Optional[str] = None
+        if original_srt_file is not None or translated_srt_file is not None:
+            print("[translate_audio] Processing SRT subtitle files...")
+            srt_parse_start = time.perf_counter()
+            try:
+                original_srt_content: Optional[str] = None
+                translated_srt_content: Optional[str] = None
+                
+                if original_srt_file is not None:
+                    print(f"[translate_audio] Reading original SRT: {original_srt_file.filename}")
+                    original_srt_bytes = await original_srt_file.read()
+                    if original_srt_bytes:
+                        # Try UTF-8 first, then fallback to latin-1
+                        try:
+                            original_srt_content = original_srt_bytes.decode("utf-8")
+                        except UnicodeDecodeError:
+                            original_srt_content = original_srt_bytes.decode("latin-1")
+                        print(f"[translate_audio] Original SRT loaded: {len(original_srt_content)} bytes")
+                
+                if translated_srt_file is not None:
+                    print(f"[translate_audio] Reading translated SRT: {translated_srt_file.filename}")
+                    translated_srt_bytes = await translated_srt_file.read()
+                    if translated_srt_bytes:
+                        try:
+                            translated_srt_content = translated_srt_bytes.decode("utf-8")
+                        except UnicodeDecodeError:
+                            translated_srt_content = translated_srt_bytes.decode("latin-1")
+                        print(f"[translate_audio] Translated SRT loaded: {len(translated_srt_content)} bytes")
+                
+                print("[translate_audio] Parsing SRT files into segments...")
+                srt_result = _parse_srt_input_to_segments(original_srt_content, translated_srt_content)
+                if srt_result is not None:
+                    srt_segments, srt_speaker_profiles = srt_result
+                    srt_parse_elapsed = (time.perf_counter() - srt_parse_start) * 1000
+                    print(f"[translate_audio] SRT parsing complete: {len(srt_segments)} segments in {srt_parse_elapsed:.1f}ms")
+                    # Convert to JSON format compatible with segments_json
+                    srt_segments_from_upload = json.dumps({
+                        "speakers": srt_speaker_profiles,
+                        "segments": srt_segments,
+                    }, ensure_ascii=False)
+            except Exception as srt_exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": f"Failed to parse SRT subtitle files: {str(srt_exc)}"},
+                )
+        
+        # SRT upload takes priority over segments_json form field
+        if srt_segments_from_upload:
+            segments_override_value = srt_segments_from_upload
 
         reuse_source_session: Optional[TranslateSessionData] = None
         reuse_session_id_value = (reuse_session_id_value or "").strip()
@@ -10193,12 +10646,25 @@ async def api_translate_audio(
             async def run_pipeline():
                 heartbeat = asyncio.create_task(heartbeat_task())
                 try:
-                    await emit_status(stage="start", message="Translate request accepted.", summary=request_summary)
+                    # Detect if using SRT subtitles
+                    srt_mode_active = bool(srt_segments_from_upload)
+                    start_message = "Translate request accepted."
+                    if srt_mode_active:
+                        # Count segments from SRT
+                        try:
+                            srt_parsed = json.loads(srt_segments_from_upload) if srt_segments_from_upload else {}
+                            srt_seg_count = len(srt_parsed.get("segments", []))
+                            start_message = f"Using SRT subtitles ({srt_seg_count} segments) - skipping Gemini inference."
+                        except:
+                            start_message = "Using SRT subtitles - skipping Gemini inference."
+                    
+                    await emit_status(stage="start", message=start_message, summary=request_summary)
                     print(
-                        "[translate_audio] pipeline start reuse_session=%s chunk_id=%s"
+                        "[translate_audio] pipeline start reuse_session=%s chunk_id=%s srt_mode=%s"
                         % (
                             reuse_session_for_translate.session_id if reuse_session_for_translate else None,
                             getattr(reuse_session_for_translate, "chunk_index", None),
+                            srt_mode_active,
                         )
                     )
 

@@ -1657,6 +1657,40 @@
                                                 </small>
                                             </div>
                                         </div>
+                                        <div class="form-group">
+                                            <label style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+                                                <input type="checkbox" id="translateSrtSubtitleToggle">
+                                                <span>Use SRT subtitle files (skip Gemini inference)</span>
+                                            </label>
+                                            <div id="translateSrtSubtitlePanel" style="display: none;">
+                                                <div style="background: rgba(16, 185, 129, 0.08); padding: 16px; border-radius: 12px; border: 1px dashed rgba(16, 185, 129, 0.3);">
+                                                    <small style="color: var(--text-muted); display: block; margin-bottom: 12px;">
+                                                        Upload SRT subtitle files from YouTube or other platforms. When using subtitles, all segments will be assigned to a single speaker since SRT files don't contain speaker information.
+                                                    </small>
+                                                    <div class="form-row-2" style="gap: 16px;">
+                                                        <div class="form-group" style="margin-bottom: 0;">
+                                                            <label for="translateOriginalSrtFile">Original Language SRT:</label>
+                                                            <div style="display: flex; gap: 8px; align-items: center;">
+                                                                <input type="file" id="translateOriginalSrtFile" name="original_srt_file" accept=".srt,.vtt" style="flex: 1;">
+                                                                <button type="button" class="btn btn-secondary" id="translateOriginalSrtClear" style="padding: 8px 12px; font-size: 0.8rem;">✕</button>
+                                                            </div>
+                                                            <small style="color: var(--text-muted); display: block; margin-top: 4px;">Source language transcript (optional if translated provided)</small>
+                                                        </div>
+                                                        <div class="form-group" style="margin-bottom: 0;">
+                                                            <label for="translateTranslatedSrtFile">Translated SRT:</label>
+                                                            <div style="display: flex; gap: 8px; align-items: center;">
+                                                                <input type="file" id="translateTranslatedSrtFile" name="translated_srt_file" accept=".srt,.vtt" style="flex: 1;">
+                                                                <button type="button" class="btn btn-secondary" id="translateTranslatedSrtClear" style="padding: 8px 12px; font-size: 0.8rem;">✕</button>
+                                                            </div>
+                                                            <small style="color: var(--text-muted); display: block; margin-top: 4px;">Target language subtitles (required for TTS generation)</small>
+                                                        </div>
+                                                    </div>
+                                                    <div id="translateSrtSummary" style="margin-top: 12px; padding: 10px; background: rgba(102, 126, 234, 0.1); border-radius: 8px; display: none;">
+                                                        <span style="font-size: 0.85rem; color: var(--brand-indigo);"></span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
                                         <div class="form-group" id="translatePromptTemplates" style="display: none; background: rgba(102,126,234,0.08); padding: 16px; border-radius: 12px;">
                                             <label>Gemini Prompt Templates</label>
                                             <div style="display: flex; flex-wrap: wrap; gap: 16px;">
@@ -2867,6 +2901,14 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
             const translatePromptTranslation = document.getElementById('translatePromptTranslation');
             const translatePromptTranscription = document.getElementById('translatePromptTranscription');
             const translatePromptTemplates = document.getElementById('translatePromptTemplates');
+            // SRT subtitle upload elements
+            const translateSrtSubtitleToggle = document.getElementById('translateSrtSubtitleToggle');
+            const translateSrtSubtitlePanel = document.getElementById('translateSrtSubtitlePanel');
+            const translateOriginalSrtFile = document.getElementById('translateOriginalSrtFile');
+            const translateTranslatedSrtFile = document.getElementById('translateTranslatedSrtFile');
+            const translateOriginalSrtClear = document.getElementById('translateOriginalSrtClear');
+            const translateTranslatedSrtClear = document.getElementById('translateTranslatedSrtClear');
+            const translateSrtSummary = document.getElementById('translateSrtSummary');
             const DEFAULT_EMOTION_WEIGHT = 0.6;
             const DEFAULT_VOLUME_PERCENT = 100;
             const MIN_VOLUME_PERCENT = 10;
@@ -4467,6 +4509,33 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                 }
             }
 
+            function appendSrtSubtitleFiles(formData) {
+                // If SRT mode is not enabled, do nothing
+                if (
+                    !formData ||
+                    !translateSrtSubtitleToggle ||
+                    !translateSrtSubtitleToggle.checked
+                ) {
+                    return false;
+                }
+                
+                let hasFiles = false;
+                
+                // Append original SRT file if present
+                if (translateOriginalSrtFile && translateOriginalSrtFile.files && translateOriginalSrtFile.files[0]) {
+                    formData.append('original_srt_file', translateOriginalSrtFile.files[0]);
+                    hasFiles = true;
+                }
+                
+                // Append translated SRT file if present
+                if (translateTranslatedSrtFile && translateTranslatedSrtFile.files && translateTranslatedSrtFile.files[0]) {
+                    formData.append('translated_srt_file', translateTranslatedSrtFile.files[0]);
+                    hasFiles = true;
+                }
+                
+                return hasFiles;
+            }
+
             function refreshPromptTemplates() {
                 const destLang = translateDestLanguageSelect ? (translateDestLanguageSelect.value || '').trim() : '';
                 const replacement = destLang || '{dest_language}';
@@ -4504,9 +4573,79 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                     if (translatePromptTemplates) {
                         translatePromptTemplates.style.display = enabled ? 'block' : 'none';
                     }
+                    // Disable SRT toggle when manual segments is enabled (mutually exclusive)
+                    if (enabled && translateSrtSubtitleToggle) {
+                        translateSrtSubtitleToggle.checked = false;
+                        if (typeof updateSrtSubtitleVisibility === 'function') {
+                            updateSrtSubtitleVisibility();
+                        }
+                    }
                 };
                 translateManualSegmentsToggle.addEventListener('change', updateManualSegmentsVisibility);
                 updateManualSegmentsVisibility();
+            }
+
+            // SRT Subtitle toggle and file handlers
+            let updateSrtSubtitleVisibility = () => {};
+            function updateSrtSummary() {
+                if (!translateSrtSummary) return;
+                const origFile = translateOriginalSrtFile?.files?.[0];
+                const transFile = translateTranslatedSrtFile?.files?.[0];
+                if (!origFile && !transFile) {
+                    translateSrtSummary.style.display = 'none';
+                    return;
+                }
+                const parts = [];
+                if (origFile) {
+                    parts.push(`📄 Original: ${origFile.name}`);
+                }
+                if (transFile) {
+                    parts.push(`📄 Translated: ${transFile.name}`);
+                }
+                translateSrtSummary.querySelector('span').textContent = parts.join(' • ');
+                translateSrtSummary.style.display = 'block';
+            }
+
+            if (translateSrtSubtitleToggle && translateSrtSubtitlePanel) {
+                updateSrtSubtitleVisibility = () => {
+                    const enabled = translateSrtSubtitleToggle.checked;
+                    translateSrtSubtitlePanel.style.display = enabled ? 'block' : 'none';
+                    // Disable manual segments when SRT is enabled (mutually exclusive)
+                    if (enabled && translateManualSegmentsToggle) {
+                        translateManualSegmentsToggle.checked = false;
+                        if (typeof updateManualSegmentsVisibility === 'function') {
+                            updateManualSegmentsVisibility();
+                        }
+                    }
+                };
+                translateSrtSubtitleToggle.addEventListener('change', updateSrtSubtitleVisibility);
+                updateSrtSubtitleVisibility();
+            }
+
+            // SRT file change handlers
+            if (translateOriginalSrtFile) {
+                translateOriginalSrtFile.addEventListener('change', updateSrtSummary);
+            }
+            if (translateTranslatedSrtFile) {
+                translateTranslatedSrtFile.addEventListener('change', updateSrtSummary);
+            }
+
+            // SRT clear buttons
+            if (translateOriginalSrtClear) {
+                translateOriginalSrtClear.addEventListener('click', () => {
+                    if (translateOriginalSrtFile) {
+                        translateOriginalSrtFile.value = '';
+                    }
+                    updateSrtSummary();
+                });
+            }
+            if (translateTranslatedSrtClear) {
+                translateTranslatedSrtClear.addEventListener('click', () => {
+                    if (translateTranslatedSrtFile) {
+                        translateTranslatedSrtFile.value = '';
+                    }
+                    updateSrtSummary();
+                });
             }
 
             async function loadPromptTemplates() {
@@ -5758,6 +5897,7 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                         }
                         appendSegmentParameters(formData);
                         appendManualSegments(formData);
+                        appendSrtSubtitleFiles(formData);
 
                         try {
                             if (translateBtn) {
@@ -5819,6 +5959,7 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                     }
                     appendSegmentParameters(formData);
                     appendManualSegments(formData);
+                    appendSrtSubtitleFiles(formData);
 
                     try {
                         if (translateBtn) {
