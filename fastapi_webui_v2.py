@@ -342,7 +342,7 @@ CHUNK_SPLIT_DEFAULT_MIN_MINUTES = 10.0
 CHUNK_SPLIT_DEFAULT_MAX_MINUTES = 15.0
 CHUNK_SPLIT_MIN_MINUTES = 1.0
 CHUNK_SPLIT_MAX_MINUTES = 45.0
-CHUNK_SPLIT_MIN_SILENCE_MS = 1500
+CHUNK_SPLIT_MIN_SILENCE_MS = 500
 CHUNK_SPLIT_SILENCE_THRESHOLD_DB = -42.0
 CHUNK_SPLIT_MAX_CHUNKS = 64
 CHUNK_SPLIT_SILENCE_GRACE_MS = 45000
@@ -1670,29 +1670,52 @@ async def _prepare_clearvoice_for_split(
             upload_temp_path = _persist_audio_upload(audio_bytes, source_audio_filename)
             cleanup_paths.append(upload_temp_path)
             try:
-                audio_separator_vocals, audio_separator_instrumental, _ = await _run_audio_separator_pipeline(
+                # Skip loading full AudioSegments when no enhancement/super-resolution is requested
+                # to avoid re-decoding multi-hour files when cached stems are sufficient.
+                skip_separator_loading = not (apply_enhancement or apply_super_resolution)
+                separator_result = await _run_audio_separator_pipeline(
                     upload_temp_path,
                     model_key=audio_separator_model,
                     emit_status=emit_status,
                     cache_hash=source_hash,
+                    skip_audio_loading=skip_separator_loading,
                 )
-                # Export vocals to temp file for further processing
-                vocals_temp_path = await _export_audio_segment_to_tempfile(audio_separator_vocals)
-                cleanup_paths.append(vocals_temp_path)
-                audio_separator_vocals_path = vocals_temp_path
+                audio_separator_from_cache = separator_result.from_cache
+                audio_separator_vocals_path = separator_result.vocals_path
+                audio_separator_instrumental_path = separator_result.instrumental_path
+
+                if not skip_separator_loading:
+                    audio_separator_vocals = separator_result.vocals_audio
+                    audio_separator_instrumental = separator_result.instrumental_audio
+                    # Export vocals to temp file for further processing
+                    vocals_temp_path = await _export_audio_segment_to_tempfile(audio_separator_vocals)
+                    cleanup_paths.append(vocals_temp_path)
+                    audio_separator_vocals_path = vocals_temp_path
+                    # Use vocals for subsequent processing
+                    audio_for_processing = await _run_blocking(lambda: audio_separator_vocals.export(format="wav").read())
+                else:
+                    # We'll rely on cached file paths instead of re-decoding large AudioSegments
+                    audio_for_processing = None
                 # Export instrumental to backing cache
                 _update_cache_paths(source_hash)
                 instrumental_cache_path = os.path.join(cache_dir, f"audio_sep_{audio_separator_model}_instrumental.mp3")
                 if not os.path.exists(instrumental_cache_path):
-                    audio_separator_instrumental.export(instrumental_cache_path, format="mp3", bitrate="192k")
+                    # Fast path: copy the cached file instead of re-encoding when available
+                    src_instrumental_path = audio_separator_instrumental_path
+                    if src_instrumental_path and os.path.exists(src_instrumental_path):
+                        shutil.copy2(src_instrumental_path, instrumental_cache_path)
+                    elif audio_separator_instrumental is not None:
+                        audio_separator_instrumental.export(instrumental_cache_path, format="mp3", bitrate="192k")
                     print(f"💾 Cached audio-separator instrumental for {source_hash}.")
                 audio_separator_instrumental_path = instrumental_cache_path
-                # Use vocals for subsequent processing
-                audio_for_processing = await _run_blocking(lambda: audio_separator_vocals.export(format="wav").read())
                 if emit_status:
                     await emit_status(
                         stage="audio_separation",
-                        message=f"Vocals ({len(audio_separator_vocals) / 1000:.1f}s) and instrumentals ({len(audio_separator_instrumental) / 1000:.1f}s) separated.",
+                        message=(
+                            f"Vocals and instrumentals separated."
+                            if skip_separator_loading
+                            else f"Vocals ({len(audio_separator_vocals) / 1000:.1f}s) and instrumentals ({len(audio_separator_instrumental) / 1000:.1f}s) separated."
+                        ),
                     )
             except Exception as exc:
                 print(f"⚠️ Audio-separator failed: {exc}")
@@ -1709,7 +1732,12 @@ async def _prepare_clearvoice_for_split(
                 )
         
         # Use separated vocals hash if available, otherwise use source hash
-        processing_source_hash = _compute_bytes_md5(audio_for_processing) if audio_separator_vocals_path else source_hash
+        if audio_separator_vocals_path:
+            processing_source_hash = _compute_file_md5(audio_separator_vocals_path)
+        elif audio_for_processing is not None:
+            processing_source_hash = _compute_bytes_md5(audio_for_processing)
+        else:
+            processing_source_hash = source_hash
         
         manifest = _load_clearvoice_input_manifest(processing_source_hash)
         if manifest:
@@ -3433,9 +3461,9 @@ def _detect_silence_midpoints_in_window(
     offset_ms: int = 0,
     samples: Optional[np.ndarray] = None,
     sample_rate: Optional[int] = None,
-) -> List[int]:
+) -> List[Dict[str, int]]:
     """
-    Detect silence midpoints within a short audio window and return absolute millisecond offsets.
+    Detect silence intervals within a short audio window and return rich interval metadata.
     """
     if samples is None or sample_rate is None:
         if audio is None:
@@ -3449,11 +3477,22 @@ def _detect_silence_midpoints_in_window(
         min_silence_duration=silence_seconds,
         silence_threshold=silence_threshold_db,
     )
-    return [
-        offset_ms + int(((start + end) / 2) * 1000 / sample_rate)
-        for start, end in silence_intervals
-        if end > start
-    ]
+    intervals: List[Dict[str, int]] = []
+    for start, end in silence_intervals:
+        if end <= start:
+            continue
+        start_ms = offset_ms + int(start * 1000 / sample_rate)
+        end_ms = offset_ms + int(end * 1000 / sample_rate)
+        midpoint_ms = offset_ms + int(((start + end) / 2) * 1000 / sample_rate)
+        intervals.append(
+            {
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "midpoint_ms": midpoint_ms,
+                "duration_ms": max(0, end_ms - start_ms),
+            }
+        )
+    return intervals
 
 
 def _detect_silence_midpoints_parallel(
@@ -3468,7 +3507,7 @@ def _detect_silence_midpoints_parallel(
 ) -> Tuple[List[int], Dict[str, Any]]:
     """
     Split the audio into overlapping windows and detect silence midpoints in parallel.
-    Returns (sorted_midpoints, stats).
+    Returns (sorted_midpoints, stats). Full interval metadata is included in stats["silence_intervals_ms"].
     """
     total_duration_ms = _audio_source_duration_ms(audio)
     if total_duration_ms <= 0:
@@ -3511,7 +3550,7 @@ def _detect_silence_midpoints_parallel(
             break
         start_ms += step_ms
 
-    midpoints: List[int] = []
+    intervals: List[Dict[str, int]] = []
     stats: Dict[str, Any] = {
         "windows": len(tasks),
         "strategy": "single" if len(tasks) <= 1 else "parallel",
@@ -3528,7 +3567,7 @@ def _detect_silence_midpoints_parallel(
 
     if len(tasks) == 1:
         offset_ms, window_samples = tasks[0]
-        midpoints.extend(
+        intervals.extend(
             _detect_silence_midpoints_in_window(
                 min_silence_ms=min_silence_ms,
                 silence_threshold_db=silence_threshold_db,
@@ -3553,12 +3592,36 @@ def _detect_silence_midpoints_parallel(
 
         for future in futures:
             try:
-                midpoints.extend(future.result())
+                intervals.extend(future.result())
             except Exception as exc:
                 print(f"⚠️ Silence detection window failed: {exc}")
 
+    dedup: Dict[int, Dict[str, int]] = {}
+    for entry in intervals:
+        midpoint_ms = int(entry.get("midpoint_ms", 0) if isinstance(entry, dict) else int(entry))
+        if midpoint_ms <= 0:
+            continue
+        duration_ms = int(entry.get("duration_ms", 0)) if isinstance(entry, dict) else 0
+        existing = dedup.get(midpoint_ms)
+        if existing is None or duration_ms > existing.get("duration_ms", 0):
+            if isinstance(entry, dict):
+                dedup[midpoint_ms] = entry
+            else:
+                dedup[midpoint_ms] = {
+                    "midpoint_ms": midpoint_ms,
+                    "duration_ms": duration_ms,
+                    "start_ms": midpoint_ms,
+                    "end_ms": midpoint_ms,
+                }
+
+    interval_list = [dedup[key] for key in sorted(dedup.keys())]
+    midpoints_only = [entry.get("midpoint_ms", 0) for entry in interval_list]
+
+    stats["silence_intervals_ms"] = interval_list
+    stats["silence_count"] = len(midpoints_only)
+    stats["max_silence_ms"] = max((entry.get("duration_ms", 0) for entry in interval_list), default=0)
     stats["elapsed_ms"] = (time.perf_counter() - detection_start) * 1000
-    return sorted(set(midpoints)), stats
+    return midpoints_only, stats
 
 
 def _plan_chunk_ranges(
@@ -3620,6 +3683,18 @@ def _plan_chunk_ranges(
     chunk_ranges: List[Dict[str, Any]] = []
     current_start = 0
     pointer = 0
+    silence_entries = silence_profile.get("silence_intervals_ms") or [
+        {
+            "midpoint_ms": point,
+            "duration_ms": 0,
+            "start_ms": point,
+            "end_ms": point,
+        }
+        for point in silence_midpoints_ms
+    ]
+    silence_entries = sorted(silence_entries, key=lambda entry: entry.get("midpoint_ms", 0))
+    silence_midpoints_ms = [entry.get("midpoint_ms", 0) for entry in silence_entries if entry.get("midpoint_ms") is not None]
+    silence_profile["silence_count"] = len(silence_midpoints_ms)
     grace_window = min(CHUNK_SPLIT_SILENCE_GRACE_MS, max_chunk_ms // 2 or 15_000)
 
     range_selection_start = time.perf_counter()
@@ -3627,39 +3702,60 @@ def _plan_chunk_ranges(
         desired_min = current_start + min_chunk_ms
         desired_max = min(current_start + max_chunk_ms, total_duration_ms)
         candidate_cut: Optional[int] = None
-        candidate_after_window: Optional[int] = None
         cut_from_silence = False
+        candidate_silence_duration: Optional[int] = None
+        candidate_idx: Optional[int] = None
 
-        while pointer < len(silence_midpoints_ms) and silence_midpoints_ms[pointer] <= current_start:
+        while pointer < len(silence_entries) and silence_entries[pointer].get("midpoint_ms", 0) <= current_start:
             pointer += 1
 
+        best_within: Optional[Dict[str, Any]] = None
+        best_within_idx: Optional[int] = None
+        best_after: Optional[Dict[str, Any]] = None
+        best_after_idx: Optional[int] = None
+
         lookahead = pointer
-        while lookahead < len(silence_midpoints_ms):
-            point = silence_midpoints_ms[lookahead]
+        while lookahead < len(silence_entries):
+            entry = silence_entries[lookahead]
+            point = entry.get("midpoint_ms")
+            if point is None:
+                lookahead += 1
+                continue
             if point < desired_min:
                 lookahead += 1
                 continue
             if point <= desired_max:
-                candidate_cut = point
-                cut_from_silence = True
-                pointer = lookahead + 1
-                break
-            candidate_after_window = point
-            pointer = lookahead + 1
+                if best_within is None or entry.get("duration_ms", 0) > best_within.get("duration_ms", 0):
+                    best_within = entry
+                    best_within_idx = lookahead
+                lookahead += 1
+                continue
+            if point <= desired_max + grace_window:
+                if best_after is None or entry.get("duration_ms", 0) > best_after.get("duration_ms", 0):
+                    best_after = entry
+                    best_after_idx = lookahead
+                lookahead += 1
+                continue
             break
 
-        if candidate_cut is None and candidate_after_window is not None:
-            if candidate_after_window - desired_max <= grace_window:
-                candidate_cut = candidate_after_window
-                cut_from_silence = True
-
-        if candidate_cut is None:
+        if best_within is not None:
+            candidate_cut = min(int(best_within.get("midpoint_ms", desired_max)), total_duration_ms)
+            candidate_silence_duration = int(best_within.get("duration_ms", 0))
+            cut_from_silence = True
+            candidate_idx = best_within_idx
+        elif best_after is not None:
+            candidate_cut = min(int(best_after.get("midpoint_ms", desired_max)), total_duration_ms)
+            candidate_silence_duration = int(best_after.get("duration_ms", 0))
+            cut_from_silence = True
+            candidate_idx = best_after_idx
+        else:
             candidate_cut = desired_max
             cut_from_silence = False
 
         if candidate_cut <= current_start:
             candidate_cut = min(total_duration_ms, max(current_start + min_chunk_ms, current_start + 1000))
             cut_from_silence = False
+            candidate_silence_duration = None
 
         chunk_ranges.append(
             {
@@ -3667,9 +3763,14 @@ def _plan_chunk_ranges(
                 "end_ms": candidate_cut,
                 "cut_reason": "silence_center" if cut_from_silence else "hard_limit",
                 "silence_midpoint_ms": candidate_cut if cut_from_silence else None,
+                "silence_duration_ms": candidate_silence_duration if cut_from_silence else None,
             }
         )
         current_start = candidate_cut
+        if candidate_idx is not None:
+            pointer = max(pointer, candidate_idx + 1)
+        else:
+            pointer = lookahead
 
     timing_ms["range_selection"] = (time.perf_counter() - range_selection_start) * 1000
 
@@ -3690,6 +3791,7 @@ def _plan_chunk_ranges(
             merged_ranges[-1]["end_ms"] = end_ms
             merged_ranges[-1]["cut_reason"] = entry["cut_reason"]
             merged_ranges[-1]["silence_midpoint_ms"] = entry.get("silence_midpoint_ms")
+            merged_ranges[-1]["silence_duration_ms"] = entry.get("silence_duration_ms")
         else:
             merged_ranges.append(entry)
 
@@ -6513,7 +6615,22 @@ def _run_ffmpeg_command(cmd: List[str]) -> None:
     if process.returncode != 0:
         stderr = process.stderr.strip()
         stdout = process.stdout.strip()
-        raise RuntimeError(stderr or stdout or "ffmpeg command failed")
+        cmd_str = " ".join(cmd)
+        raise RuntimeError(
+            f"ffmpeg failed (code {process.returncode})\ncmd: {cmd_str}\n"
+            f"stderr: {stderr or '<empty>'}\nstdout: {stdout or '<empty>'}"
+        )
+
+
+async def _log_overlay_progress(label: str, start_time: float, interval_seconds: float = 30.0) -> None:
+    """Emit periodic overlay progress logs while ffmpeg runs."""
+    try:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            elapsed = time.perf_counter() - start_time
+            PERF_LOGGER.info("⏳ [%s] ffmpeg overlay running (%.1fs elapsed)", label, elapsed)
+    except asyncio.CancelledError:
+        return
 
 
 def _ffmpeg_extract_segment(
@@ -7003,6 +7120,7 @@ async def _synthesize_translated_audio(
 
     original_duration_ms = len(original_audio)
     audio_format = (response_format or TRANSLATE_DEFAULT_OUTPUT_FORMAT).lower()
+    final_duration_ms = 0
     
     # Use FFmpeg for fast concatenation and post-processing (much faster than pydub for large files)
     use_ffmpeg_concat = len(audio_chunks) > 100  # Use FFmpeg for larger files
@@ -7208,6 +7326,8 @@ async def _synthesize_translated_audio(
             export_elapsed = (time.perf_counter() - export_start) * 1000
             print(f"[synthesize] Export complete in {export_elapsed:.1f}ms ({len(audio_bytes) / 1024 / 1024:.1f} MB)")
             
+            final_duration_ms = len(combined_audio) if combined_audio is not None else concat_duration_ms
+            
         finally:
             # Cleanup temp directory
             try:
@@ -7304,6 +7424,7 @@ async def _synthesize_translated_audio(
         
         export_elapsed = (time.perf_counter() - export_start) * 1000
         print(f"[synthesize] Export complete in {export_elapsed:.1f}ms ({len(audio_bytes) / 1024 / 1024:.1f} MB)")
+        final_duration_ms = len(combined_audio)
 
     media_type_map = {
         "mp3": "audio/mpeg",
@@ -7322,7 +7443,7 @@ async def _synthesize_translated_audio(
         "speech_segment_count": sum(1 for s in segments if s["type"] == "speech"),
         "silence_segment_count": sum(1 for s in segments if s["type"] == "silence"),
         "original_duration_ms": original_duration_ms,
-        "generated_duration_ms": len(combined_audio),
+        "generated_duration_ms": final_duration_ms,
         "generation_log": generation_log,
         "padded_to_original": pad_to_original,
         "backing_volume_percent": backing_volume_percent,
@@ -8797,6 +8918,7 @@ async def api_translate_split_audio(
                                     "end_ms": end_ms,
                                     "cut_reason": entry.get("cut_reason"),
                                     "silence_midpoint_ms": entry.get("silence_midpoint_ms"),
+                                    "silence_duration_ms": entry.get("silence_duration_ms"),
                                 }
                             )
 
@@ -9017,6 +9139,7 @@ async def api_translate_split_audio(
                                 entry["existing_subtitle_url"] = subtitle_entry["url"]
                                 entry["existing_subtitle_filename"] = subtitle_entry["filename"]
                             manifest = manifest_by_index.get(idx)
+                            session_id = manifest.get("session_id") if manifest else entry.get("session_id")
                             already_generated = False
                             if manifest and subtitle_entry:
                                 already_generated = _srt_matches_manifest(manifest, subtitle_entry["path"])
@@ -9032,6 +9155,70 @@ async def api_translate_split_audio(
                                 if subtitle_entry:
                                     entry["subtitle_url"] = subtitle_entry["url"]
                                     entry["subtitle_file_name"] = subtitle_entry["filename"]
+                                # If we are reusing cached audio/SRT, hydrate the session/manifest so merge has segments.
+                                try:
+                                    audio_format = (
+                                        audio_entry.get("format")
+                                        or (os.path.splitext(audio_entry.get("filename", ""))[1].lstrip(".") or TRANSLATE_DEFAULT_OUTPUT_FORMAT)
+                                    )
+                                    if manifest is not None:
+                                        manifest["chunk_output_path"] = audio_entry["path"]
+                                        manifest["chunk_output_filename"] = audio_entry["filename"]
+                                        manifest["chunk_output_format"] = audio_format
+                                        manifest["chunk_generated"] = True
+                                    cached_session = await _get_translate_session(session_id) if session_id else None
+                                    if cached_session:
+                                        cached_session.chunk_generated = True
+                                        cached_session.chunk_output_path = audio_entry["path"]
+                                        cached_session.chunk_output_filename = audio_entry["filename"]
+                                        cached_session.chunk_output_format = audio_format
+                                        cached_session.chunk_generated_at = cached_session.chunk_generated_at or time.time()
+                                    have_segments = bool(
+                                        (manifest and manifest.get("base_segments"))
+                                        or (cached_session and getattr(cached_session, "base_segments", None))
+                                    )
+                                    if subtitle_entry and not have_segments:
+                                        translated_srt_content: Optional[str] = None
+                                        original_srt_content: Optional[str] = None
+                                        try:
+                                            with open(subtitle_entry["path"], "r", encoding="utf-8", errors="ignore") as srt_file:
+                                                translated_srt_content = srt_file.read()
+                                        except Exception as srt_exc:
+                                            print(f"⚠️ Failed to read cached subtitle for chunk {idx}: {srt_exc}")
+                                        original_candidate = next(
+                                            (item for item in artifact_bundle.get("subtitles", []) if str(item.get("suffix", "")).lower() == "original"),
+                                            None,
+                                        )
+                                        if original_candidate:
+                                            try:
+                                                with open(original_candidate["path"], "r", encoding="utf-8", errors="ignore") as orig_file:
+                                                    original_srt_content = orig_file.read()
+                                            except Exception as orig_exc:
+                                                print(f"⚠️ Failed to read cached original subtitle for chunk {idx}: {orig_exc}")
+                                        if translated_srt_content or original_srt_content:
+                                            srt_result = _parse_srt_input_to_segments(original_srt_content, translated_srt_content)
+                                            if srt_result:
+                                                segments_data, speaker_profiles = srt_result
+                                                if manifest is not None:
+                                                    manifest["base_segments"] = copy.deepcopy(segments_data)
+                                                if session_id:
+                                                    try:
+                                                        await _update_translate_session_segments(session_id, segments_data)
+                                                    except Exception as seg_exc:
+                                                        print(f"⚠️ Failed to update cached chunk segments for chunk {idx}: {seg_exc}")
+                                                    else:
+                                                        refreshed = await _get_translate_session(session_id)
+                                                        if refreshed:
+                                                            refreshed.chunk_generated = True
+                                                            refreshed.chunk_output_path = audio_entry["path"]
+                                                            refreshed.chunk_output_filename = audio_entry["filename"]
+                                                            refreshed.chunk_output_format = audio_format
+                                                            refreshed.chunk_generated_at = refreshed.chunk_generated_at or time.time()
+                                                            if speaker_profiles:
+                                                                refreshed.speaker_profiles = copy.deepcopy(speaker_profiles)
+                                                            _refresh_split_cache_for_session(refreshed)
+                                except Exception as hydrate_exc:
+                                    print(f"⚠️ Failed to hydrate cached chunk artifacts for chunk {idx}: {hydrate_exc}")
                                 reused_artifacts += 1
                     if reused_artifacts:
                         print(f"♻️ [{resolved_base_name}] Found {reused_artifacts} pre-generated chunk(s) matching existing artifacts.")
@@ -9044,6 +9231,7 @@ async def api_translate_split_audio(
                                 "end_ms": spec["end_ms"],
                                 "cut_reason": spec.get("cut_reason"),
                                 "silence_midpoint_ms": spec.get("silence_midpoint_ms"),
+                                "silence_duration_ms": spec.get("silence_duration_ms"),
                             }
                             for spec in chunk_specs
                         ]
@@ -9354,8 +9542,14 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
                     )
                     if final_audio_path and use_ffmpeg_merge:
                         overlay_start = time.perf_counter()
-                        try:
-                            overlay_temp = await _run_blocking(
+                        PERF_LOGGER.info(
+                            "⏳ [%s] ffmpeg overlay starting | backing=%s, format=%s",
+                            merge_profiler.label,
+                            os.path.basename(backing_path),
+                            response_format_value,
+                        )
+                        overlay_task = asyncio.create_task(
+                            _run_blocking(
                                 _ffmpeg_overlay_to_tempfile,
                                 final_audio_path,
                                 backing_path,
@@ -9364,6 +9558,10 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
                                 vocals_volume=1.0,
                                 backing_volume=1.0,
                             )
+                        )
+                        progress_task = asyncio.create_task(_log_overlay_progress(merge_profiler.label, overlay_start))
+                        try:
+                            overlay_temp = await overlay_task
                             temp_paths_to_cleanup.append(final_audio_path)
                             final_audio_path = overlay_temp
                             temp_paths_to_cleanup.append(overlay_temp)
@@ -9386,11 +9584,23 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
                                     final_audio_segment = await _load_audio_segment_from_path(final_audio_path)
                                 else:
                                     final_audio_segment = merged_audio_segment
+                        finally:
+                            progress_task.cancel()
+                            try:
+                                await progress_task
+                            except asyncio.CancelledError:
+                                pass
                     # Only run Python overlay if FFmpeg wasn't used (final_audio_segment is still set)
                     if final_audio_segment is not None:
                         overlay_python_start = time.perf_counter()
                         vocal_len = len(final_audio_segment)
                         print(f"[merge] Running Python overlay for {vocal_len / 1000:.1f}s audio...")
+                        PERF_LOGGER.info(
+                            "⏳ [%s] python overlay starting | vocals=%.1fs, backing=%s",
+                            merge_profiler.label,
+                            vocal_len / 1000,
+                            os.path.basename(backing_path),
+                        )
                         
                         # Run overlay in thread pool to avoid blocking event loop
                         def _do_python_overlay():
@@ -9418,6 +9628,12 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
                     print(f"⚠️ Full backing track not found at {backing_path}; exporting vocals only.")
         if final_audio_segment is not None:
             export_start = time.perf_counter()
+            PERF_LOGGER.info(
+                "⏳ [%s] exporting merged audio segment | duration=%.1fs, format=%s",
+                merge_profiler.label,
+                len(final_audio_segment) / 1000,
+                response_format_value,
+            )
             merged_bytes = await _export_audio_segment_bytes(
                 final_audio_segment,
                 fmt=response_format_value,
@@ -9430,6 +9646,11 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
             )
         elif final_audio_path:
             export_start = time.perf_counter()
+            PERF_LOGGER.info(
+                "⏳ [%s] loading merged audio file | path=%s",
+                merge_profiler.label,
+                os.path.basename(final_audio_path),
+            )
             merged_bytes = await async_read_file(final_audio_path)
             merge_profiler.mark(
                 "read_final_audio_file",
@@ -9452,6 +9673,11 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
         audio_stem = _compose_output_stem(resolved_base_name, extra=language_code)
         output_filename = f"{audio_stem}.{response_format_value}"
         output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
+        PERF_LOGGER.info(
+            "⏳ [%s] writing merged audio to %s",
+            merge_profiler.label,
+            output_path,
+        )
         with open(output_path, "wb") as outfile:
             outfile.write(merged_bytes)
         for temp_path in temp_paths_to_cleanup:
@@ -9459,6 +9685,11 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
 
         audio_url = f"/api/translate_outputs/{output_filename}"
         subtitle_export_start = time.perf_counter()
+        PERF_LOGGER.info(
+            "⏳ [%s] exporting subtitles | segments=%d",
+            merge_profiler.label,
+            len(merged_segments),
+        )
         subtitle_translated = _export_srt_from_segments(
             merged_segments,
             base_name=base_stem,

@@ -3814,16 +3814,18 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                 const baseM4a = `"${normalizedBase}.m4a"`;
                 const translatedMp3 = `"${normalizedBase}_${languageCode}.mp3"`;
                 const translatedMp4 = `"${normalizedBase}_${languageCode}.mp4"`;
-                const translatedSrt = `"${normalizedBase}_${languageCode}.srt"`;
+                const translatedSrtFilename = `${normalizedBase}_${languageCode}.srt`;
                 const srtBurnedMp4 = `"${normalizedBase}_${languageCode}_srt.mp4"`;
-                const originalSrt = `"${normalizedBase}_original.srt"`;
+                const originalSrtFilename = `${normalizedBase}_original.srt`;
                 const originalSrtBurned = `"${normalizedBase}_original_srt.mp4"`;
+                const translatedSubtitleFilter = `"subtitles='${translatedSrtFilename.replace(/'/g, "\\'")}'"`;
+                const originalSubtitleFilter = `"subtitles='${originalSrtFilename.replace(/'/g, "\\'")}'"`;
                 ffmpegPanel.style.display = 'block';
                 ffmpegExtractCmd.textContent = `ffmpeg -i ${baseMp4} -vn -acodec copy ${baseM4a}`;
                 ffmpegReplaceCmd.textContent = `ffmpeg -i ${baseMp4} -i ${translatedMp3} -c:v copy -c:a aac -map 0:v:0 -map 1:a:0 ${translatedMp4}`;
-                ffmpegSubtitleCmd.textContent = `ffmpeg -i ${translatedMp4} -vf subtitles=${translatedSrt} ${srtBurnedMp4}`;
+                ffmpegSubtitleCmd.textContent = `ffmpeg -i ${translatedMp4} -vf ${translatedSubtitleFilter} ${srtBurnedMp4}`;
                 if (ffmpegSubtitleOriginalCmd) {
-                    ffmpegSubtitleOriginalCmd.textContent = `ffmpeg -i ${baseMp4} -vf subtitles=${originalSrt} ${originalSrtBurned}`;
+                    ffmpegSubtitleOriginalCmd.textContent = `ffmpeg -i ${baseMp4} -vf ${originalSubtitleFilter} ${originalSrtBurned}`;
                 }
             }
 
