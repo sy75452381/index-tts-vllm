@@ -48,6 +48,7 @@ import shutil
 import subprocess
 import urllib.request
 import hashlib
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import copy
 from dataclasses import dataclass, field
@@ -8828,6 +8829,9 @@ async def api_translate_split_audio(
                                     restored_sessions = await asyncio.gather(
                                         *[_rehydrate_session_from_manifest(manifest) for manifest in cached_manifests]
                                     )
+                                    # Update chunk_parent_id to match new batch ID so upload/lookup works
+                                    for session in restored_sessions:
+                                        session.chunk_parent_id = chunk_batch_id
                                     chunk_entries = [_serialize_chunk_session(session) for session in restored_sessions]
                                     rehydrated_from_cache = True
                                     chunk_session_manifests = cached_manifests
@@ -11146,6 +11150,282 @@ async def api_translate_vocals(session_id: str):
         "Cache-Control": "no-store, no-cache",
     }
     return Response(content=audio_bytes, media_type="audio/mpeg", headers=headers)
+
+
+@app.get("/api/translate_download_chunks/{batch_id}")
+async def api_translate_download_chunks(batch_id: str):
+    """API: Download all chunk vocals as a ZIP file for manual transcription."""
+    if not batch_id or not batch_id.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "batch_id is required."},
+        )
+
+    sessions = await _list_chunk_sessions(batch_id.strip())
+    if not sessions:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": f"No chunks found for batch '{batch_id}'."},
+        )
+
+    # Sort sessions by chunk index
+    sessions.sort(key=lambda s: s.chunk_index or 0)
+
+    # Create ZIP file in memory
+    zip_buffer = BytesIO()
+    files_added = 0
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for session in sessions:
+            vocals_path = getattr(session, "original_audio_path", None)
+            if not vocals_path or not os.path.exists(vocals_path):
+                # Try to export from in-memory audio if path is missing
+                try:
+                    original_audio = _get_session_original_audio(session)
+                    audio_buffer = BytesIO()
+                    original_audio.export(audio_buffer, format="mp3", bitrate="128k")
+                    chunk_name = f"chunk{session.chunk_index or files_added + 1:03d}.mp3"
+                    zf.writestr(chunk_name, audio_buffer.getvalue())
+                    files_added += 1
+                except Exception:
+                    continue
+            else:
+                chunk_name = f"chunk{session.chunk_index or files_added + 1:03d}.mp3"
+                zf.write(vocals_path, chunk_name)
+                files_added += 1
+
+    if files_added == 0:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": "No audio files available to download."},
+        )
+
+    zip_buffer.seek(0)
+    filename = f"chunks_{batch_id}.zip"
+
+    return Response(
+        content=zip_buffer.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post("/api/translate_upload_transcriptions/{batch_id}")
+async def api_translate_upload_transcriptions(
+    batch_id: str,
+    transcriptions_zip: UploadFile = File(...),
+    dest_language: str = Form(...),
+    gemini_model: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    translate_enabled: Optional[bool] = Form(True),
+    ignore_non_speech: Optional[bool] = Form(False),
+):
+    """
+    API: Upload a ZIP file with transcription/translation .json files to create Gemini cache entries.
+    
+    The ZIP should contain files named chunk001.json, chunk002.json, etc.
+    Each .json file should contain the raw JSON response from Gemini (or compatible JSON format).
+    This creates cache entries so subsequent generation will skip Gemini API calls.
+    
+    IMPORTANT: The cache key depends on dest_language, gemini_model, translate_enabled, ignore_non_speech,
+    and custom prompt. These must match the settings used when generating translated audio.
+    """
+    if not batch_id or not batch_id.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "batch_id is required."},
+        )
+
+    if not dest_language or not dest_language.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "dest_language is required."},
+        )
+
+    sessions = await _list_chunk_sessions(batch_id.strip())
+    if not sessions:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": f"No chunks found for batch '{batch_id}'."},
+        )
+
+    # Sort sessions by chunk index
+    sessions.sort(key=lambda s: s.chunk_index or 0)
+    sessions_by_index: Dict[int, TranslateSessionData] = {
+        s.chunk_index: s for s in sessions if s.chunk_index is not None
+    }
+
+    # Read the ZIP file
+    try:
+        zip_bytes = await transcriptions_zip.read()
+        zip_buffer = BytesIO(zip_bytes)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": f"Failed to read uploaded file: {str(exc)}"},
+        )
+
+    # Normalize model name
+    model_name = _normalize_gemini_model_name(gemini_model) if gemini_model else _get_gemini_model_name()
+    
+    # Resolve the prompt the same way it's done when analyzing segments
+    # This ensures the cache key matches when analyzing segments later
+    translate_enabled_flag = translate_enabled if translate_enabled is not None else True
+    ignore_non_speech_flag = ignore_non_speech if ignore_non_speech is not None else False
+    prompt_text = _resolve_final_prompt(
+        prompt_override=(prompt or "").strip(),
+        dest_language=dest_language.strip(),
+        translate_enabled=translate_enabled_flag,
+        ignore_non_speech_flag=ignore_non_speech_flag,
+    )
+
+    created_caches = []
+    errors = []
+
+    try:
+        with zipfile.ZipFile(zip_buffer, "r") as zf:
+            for name in zf.namelist():
+                # Skip directories and non-json files
+                if name.endswith("/") or not name.lower().endswith(".json"):
+                    continue
+
+                # Extract chunk index from filename (chunk001.txt, chunk1.txt, etc.)
+                base_name = os.path.splitext(os.path.basename(name))[0].lower()
+                match = re.search(r"chunk[_-]?(\d+)", base_name)
+                if not match:
+                    # Try just extracting any number
+                    match = re.search(r"(\d+)", base_name)
+
+                if not match:
+                    errors.append(f"Could not determine chunk index from filename: {name}")
+                    continue
+
+                chunk_idx = int(match.group(1))
+                session = sessions_by_index.get(chunk_idx)
+
+                if session is None:
+                    errors.append(f"No session found for chunk index {chunk_idx} (file: {name})")
+                    continue
+
+                # Read the transcription text
+                try:
+                    raw_text = zf.read(name).decode("utf-8")
+                except Exception as exc:
+                    errors.append(f"Failed to read {name}: {str(exc)}")
+                    continue
+
+                if not raw_text.strip():
+                    errors.append(f"Empty transcription file: {name}")
+                    continue
+
+                # Parse the Gemini JSON to validate and extract segments/speaker profiles
+                try:
+                    segments, speaker_profiles = _parse_gemini_json(raw_text)
+                except Exception as exc:
+                    errors.append(f"Failed to parse Gemini JSON in {name}: {str(exc)}")
+                    continue
+
+                # Get the audio bytes for this chunk to compute the cache key
+                vocals_path = getattr(session, "original_audio_path", None)
+                audio_bytes: Optional[bytes] = None
+
+                if vocals_path and os.path.exists(vocals_path):
+                    audio_bytes = _read_file_bytes(vocals_path)
+                else:
+                    try:
+                        original_audio = _get_session_original_audio(session)
+                        audio_buffer = BytesIO()
+                        original_audio.export(audio_buffer, format="mp3", bitrate="128k")
+                        audio_bytes = audio_buffer.getvalue()
+                    except Exception:
+                        pass
+
+                if audio_bytes is None:
+                    errors.append(f"Could not get audio bytes for chunk {chunk_idx} to compute cache key")
+                    continue
+
+                # Compute the cache key matching how Gemini cache would be created
+                audio_hash, cache_key = _gemini_cache_key(
+                    audio_bytes,
+                    dest_language=dest_language.strip(),
+                    prompt_text=prompt_text,
+                    model_name=model_name,
+                )
+                print(f"📦 Chunk {chunk_idx}: audio_md5={audio_hash}, cache_key={cache_key}, model={model_name}")
+
+                # Create the cache record
+                cache_record = {
+                    "version": GEMINI_CACHE_VERSION,
+                    "created_at": time.time(),
+                    "audio_md5": audio_hash,
+                    "dest_language": dest_language.strip(),
+                    "model": model_name,
+                    "prompt_hash": hashlib.md5(prompt_text.encode("utf-8")).hexdigest(),
+                    "segments": segments,
+                    "speaker_profiles": speaker_profiles,
+                    "raw_text": raw_text,
+                    "imported_from": name,
+                }
+
+                # Check if cache already exists (will be overwritten)
+                existing_cache = _load_gemini_cache_entry(cache_key)
+                was_overwritten = existing_cache is not None
+
+                cache_path = _write_gemini_cache_entry(cache_key, cache_record)
+                if cache_path:
+                    created_caches.append({
+                        "chunk_index": chunk_idx,
+                        "session_id": session.session_id,
+                        "cache_file": os.path.basename(cache_path),
+                        "segments_count": len(segments),
+                        "overwritten": was_overwritten,
+                    })
+                    action = "Updated" if was_overwritten else "Imported"
+                    print(f"💾 {action} Gemini cache for chunk {chunk_idx}: {os.path.basename(cache_path)}")
+                else:
+                    errors.append(f"Failed to write cache entry for chunk {chunk_idx}")
+
+    except zipfile.BadZipFile:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "Invalid ZIP file."},
+        )
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Failed to process ZIP file: {str(exc)}"},
+        )
+
+    # Count new vs updated caches
+    new_count = sum(1 for c in created_caches if not c.get("overwritten", False))
+    updated_count = sum(1 for c in created_caches if c.get("overwritten", False))
+    
+    if updated_count > 0 and new_count > 0:
+        message = f"Imported {new_count} new + updated {updated_count} existing cache entries."
+    elif updated_count > 0:
+        message = f"Updated {updated_count} existing cache entries."
+    else:
+        message = f"Created {new_count} cache entries from uploaded transcriptions."
+
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "message": message,
+            "created_caches": created_caches,
+            "new_count": new_count,
+            "updated_count": updated_count,
+            "errors": errors,
+            "batch_id": batch_id,
+            "dest_language": dest_language.strip(),
+            "gemini_model": model_name,
+            "translate_enabled": translate_enabled_flag,
+            "ignore_non_speech": ignore_non_speech_flag,
+            "prompt_preview": prompt_text[:200] + "..." if len(prompt_text) > 200 else prompt_text,
+        },
+    )
 
 
 @app.get("/api/translate_outputs/{filename}")

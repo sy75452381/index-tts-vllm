@@ -1599,8 +1599,12 @@
                                                         <span>Select all pending chunks</span>
                                                     </label>
                                                     <button type="button" class="btn btn-secondary" id="translateGenerateChunksBtn" style="display: none;">⚡ Generate Selected Chunks</button>
+                                                    <button type="button" class="btn btn-secondary" id="translateDownloadChunksBtn" style="display: none;" title="Download all chunk audio files as ZIP for manual transcription">⬇️ Download All Chunks</button>
+                                                    <button type="button" class="btn btn-secondary" id="translateUploadTranscriptionsBtn" style="display: none;" title="Upload ZIP with transcription .json files to import Gemini cache">⬆️ Upload Transcriptions</button>
+                                                    <input type="file" id="translateTranscriptionsZipInput" accept=".zip" style="display: none;">
                                                 </div>
                                                 <div id="translateChunkBatchStatus" class="status"></div>
+                                                <div id="translateTranscriptionUploadStatus" class="status"></div>
                                                 <div id="translateSplitStatus" class="status"></div>
                                                 <div style="margin-top: 12px;">
                                                     <button type="button" class="btn btn-secondary" id="translateMergeChunksBtn" style="display: none;">🔗 Merge All Chunks</button>
@@ -2941,6 +2945,10 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
             const translateChunkBatchControls = document.getElementById('translateChunkBatchControls');
             const translateChunkSelectPending = document.getElementById('translateChunkSelectPending');
             const translateGenerateChunksBtn = document.getElementById('translateGenerateChunksBtn');
+            const translateDownloadChunksBtn = document.getElementById('translateDownloadChunksBtn');
+            const translateUploadTranscriptionsBtn = document.getElementById('translateUploadTranscriptionsBtn');
+            const translateTranscriptionsZipInput = document.getElementById('translateTranscriptionsZipInput');
+            const translateTranscriptionUploadStatus = document.getElementById('translateTranscriptionUploadStatus');
             const translateMergeStatus = document.getElementById('translateMergeStatus');
             const translateChunkBatchStatus = document.getElementById('translateChunkBatchStatus');
             const translateAudioInput = document.getElementById('translateAudioFile');
@@ -3299,6 +3307,13 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                 translateGenerateChunksBtn.textContent = translateChunkSelections.size
                     ? `⚡ Generate Selected Chunks (${translateChunkSelections.size})`
                     : '⚡ Generate Selected Chunks';
+                // Show download/upload buttons when chunks are available
+                if (translateDownloadChunksBtn) {
+                    translateDownloadChunksBtn.style.display = shouldShow && translateChunkBatchId ? 'inline-flex' : 'none';
+                }
+                if (translateUploadTranscriptionsBtn) {
+                    translateUploadTranscriptionsBtn.style.display = shouldShow && translateChunkBatchId ? 'inline-flex' : 'none';
+                }
                 syncPendingSelectToggle();
             }
 
@@ -4131,6 +4146,114 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
 
             if (translateGenerateChunksBtn) {
                 translateGenerateChunksBtn.addEventListener('click', handleGenerateSelectedChunks);
+            }
+
+            // Download all chunks as ZIP
+            if (translateDownloadChunksBtn) {
+                translateDownloadChunksBtn.addEventListener('click', async () => {
+                    if (!translateChunkBatchId) {
+                        showStatus('No chunk batch available to download.', 'error', 'translateChunkBatchStatus');
+                        return;
+                    }
+                    const statusId = 'translateChunkBatchStatus';
+                    try {
+                        translateDownloadChunksBtn.disabled = true;
+                        showStatus('Preparing chunks for download...', 'info', statusId);
+                        const response = await fetch(`/api/translate_download_chunks/${encodeURIComponent(translateChunkBatchId)}`);
+                        if (!response.ok) {
+                            const error = await response.json().catch(() => ({ message: 'Download failed' }));
+                            throw new Error(error.message || 'Download failed');
+                        }
+                        const blob = await response.blob();
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `chunks_${translateChunkBatchId}.zip`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                        showStatus(`Downloaded ${translateChunkSessions.length} chunk(s) as ZIP.`, 'success', statusId);
+                    } catch (error) {
+                        console.error('Download chunks error:', error);
+                        showStatus(`Failed to download chunks: ${error.message}`, 'error', statusId);
+                    } finally {
+                        translateDownloadChunksBtn.disabled = false;
+                    }
+                });
+            }
+
+            // Upload transcriptions ZIP
+            if (translateUploadTranscriptionsBtn && translateTranscriptionsZipInput) {
+                translateUploadTranscriptionsBtn.addEventListener('click', () => {
+                    translateTranscriptionsZipInput.click();
+                });
+
+                translateTranscriptionsZipInput.addEventListener('change', async (event) => {
+                    const file = event.target.files[0];
+                    if (!file) return;
+                    
+                    const statusId = 'translateTranscriptionUploadStatus';
+                    
+                    if (!translateChunkBatchId) {
+                        showStatus('No chunk batch available. Please split audio first.', 'error', statusId);
+                        translateTranscriptionsZipInput.value = '';
+                        return;
+                    }
+
+                    // Get current Gemini settings
+                    const destLanguage = translateDestLanguageSelect ? translateDestLanguageSelect.value : '';
+                    if (!destLanguage) {
+                        showStatus('Please select a destination language first.', 'error', statusId);
+                        translateTranscriptionsZipInput.value = '';
+                        return;
+                    }
+
+                    const geminiModel = translateGeminiModel ? translateGeminiModel.value : '';
+                    const prompt = translateCustomPrompt ? translateCustomPrompt.value.trim() : '';
+
+                    try {
+                        translateUploadTranscriptionsBtn.disabled = true;
+                        showStatus('Uploading and processing transcriptions...', 'info', statusId);
+
+                        const formData = new FormData();
+                        formData.append('transcriptions_zip', file);
+                        formData.append('dest_language', destLanguage);
+                        if (geminiModel) formData.append('gemini_model', geminiModel);
+                        if (prompt) formData.append('prompt', prompt);
+                        // Include translate_enabled and ignore_non_speech to match cache key generation
+                        const translateEnabled = translateDebugTranslate ? translateDebugTranslate.checked : true;
+                        formData.append('translate_enabled', translateEnabled ? 'true' : 'false');
+                        const ignoreNonSpeech = translateIgnoreNonSpeechEl ? translateIgnoreNonSpeechEl.checked : false;
+                        formData.append('ignore_non_speech', ignoreNonSpeech ? 'true' : 'false');
+
+                        const response = await fetch(`/api/translate_upload_transcriptions/${encodeURIComponent(translateChunkBatchId)}`, {
+                            method: 'POST',
+                            body: formData,
+                        });
+
+                        const result = await response.json();
+
+                        if (!response.ok || result.status === 'error') {
+                            throw new Error(result.message || 'Upload failed');
+                        }
+
+                        let successMsg = `✅ ${result.message || 'Cache entries created.'}`;
+                        if (result.errors && result.errors.length > 0) {
+                            successMsg += ` ⚠️ ${result.errors.length} warning(s)`;
+                            console.warn('Transcription upload warnings:', result.errors);
+                        }
+                        console.log('Cache import result:', result);
+                        showStatus(successMsg, 'success', statusId);
+
+                    } catch (error) {
+                        console.error('Upload transcriptions error:', error);
+                        showStatus(`Failed to upload transcriptions: ${error.message}`, 'error', statusId);
+                    } finally {
+                        translateUploadTranscriptionsBtn.disabled = false;
+                        translateTranscriptionsZipInput.value = '';
+                    }
+                });
             }
 
             if (translateAudioInput) {
