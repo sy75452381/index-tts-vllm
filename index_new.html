@@ -2053,6 +2053,11 @@
                                     <span class="path">/server_info</span>
                                     <span class="desc">Server status</span>
                                 </div>
+                                <div class="api-quick-ref-item">
+                                    <span class="method post">POST</span>
+                                    <span class="path">/api/design-voice</span>
+                                    <span class="desc">Voice design</span>
+                                </div>
                             </div>
                         </div>
 
@@ -2471,6 +2476,103 @@ Content-Type: audio/mpeg</div>
                             </div>
                         </div>
 
+                        <!-- Voice Design Section -->
+                        <div class="api-section">
+                            <div class="api-section-header">
+                                <span class="icon">🎨</span>
+                                <h4>Voice Design</h4>
+                                <span class="badge purple">Qwen3-TTS</span>
+                            </div>
+                            <div class="api-section-content">
+                                <!-- /api/design-voice -->
+                                <div class="api-endpoint">
+                                    <div class="api-endpoint-header">
+                                        <span class="api-method post">POST</span>
+                                        <span class="api-path">/api/design-voice</span>
+                                    </div>
+                                    <div class="api-endpoint-body">
+                                        <p class="api-desc">Generate speech with Qwen3-TTS Voice Design. Describe the desired voice in natural language.</p>
+                                        <div class="api-params">
+                                            <div class="api-param-group">
+                                                <div class="api-param-group-title">Required Parameters</div>
+                                                <div class="api-param"><span class="api-param-name">text</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Text to synthesize</span></div>
+                                                <div class="api-param"><span class="api-param-name">voice_description</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Natural language description of desired voice (e.g., "A warm female voice with a British accent")</span></div>
+                                            </div>
+                                            <div class="api-param-group">
+                                                <div class="api-param-group-title">Optional Parameters</div>
+                                                <div class="api-param"><span class="api-param-name">language</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Target language (default: "Auto")</span></div>
+                                                <div class="api-param"><span class="api-param-name">output_format</span> <span class="api-param-type">string</span> <span class="api-param-desc">— "wav" or "mp3" (default: "mp3")</span></div>
+                                            </div>
+                                        </div>
+                                        <div class="api-response">
+                                            <div class="api-response-title">Response</div>
+                                            <div class="api-code">Content-Type: audio/mpeg (or audio/wav)
+Binary audio data
+
+Headers:
+  X-Voice-Design-Cached: true</div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- /api/design-voice/save-preset -->
+                                <div class="api-endpoint">
+                                    <div class="api-endpoint-header">
+                                        <span class="api-method post">POST</span>
+                                        <span class="api-path">/api/design-voice/save-preset</span>
+                                    </div>
+                                    <div class="api-endpoint-body">
+                                        <p class="api-desc">Save the last generated voice design directly to Speaker Presets without downloading and re-uploading.</p>
+                                        <div class="api-params">
+                                            <div class="api-param-group">
+                                                <div class="api-param-group-title">Required Parameters</div>
+                                                <div class="api-param"><span class="api-param-name">preset_name</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Name for the speaker preset</span></div>
+                                            </div>
+                                            <div class="api-param-group">
+                                                <div class="api-param-group-title">Optional Parameters</div>
+                                                <div class="api-param"><span class="api-param-name">description</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Optional description override</span></div>
+                                            </div>
+                                        </div>
+                                        <div class="api-response">
+                                            <div class="api-response-title">Response</div>
+                                            <div class="api-code">{"success": true, "preset_name": "my_voice", "message": "..."}</div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- /api/design-voice/languages -->
+                                <div class="api-endpoint">
+                                    <div class="api-endpoint-header">
+                                        <span class="api-method get">GET</span>
+                                        <span class="api-path">/api/design-voice/languages</span>
+                                    </div>
+                                    <div class="api-endpoint-body">
+                                        <p class="api-desc">Get list of supported languages for Voice Design.</p>
+                                        <div class="api-response">
+                                            <div class="api-response-title">Response</div>
+                                            <div class="api-code">{"languages": ["Auto", "Chinese", "English", "Japanese", "Korean", ...]}</div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- /api/design-voice/status -->
+                                <div class="api-endpoint">
+                                    <div class="api-endpoint-header">
+                                        <span class="api-method get">GET</span>
+                                        <span class="api-path">/api/design-voice/status</span>
+                                    </div>
+                                    <div class="api-endpoint-body">
+                                        <p class="api-desc">Check Voice Design model status and availability.</p>
+                                        <div class="api-response">
+                                            <div class="api-response-title">Response</div>
+                                            <div class="api-code">{"enabled": true, "model_loaded": true, 
+ "has_cached_result": false, "preset_save_available": true}</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
                         <!-- Utility Section -->
                         <div class="api-section">
                             <div class="api-section-header">
@@ -2571,7 +2673,7 @@ with open("translated.mp3", "wb") as f:
     f.write(response.content)</div>
 
                             <h4 style="margin-bottom: 12px; color: var(--text-primary);">Advanced Translation Workflow</h4>
-                            <div class="api-code"># 1. Prepare segments
+                            <div class="api-code" style="margin-bottom: 20px;"># 1. Prepare segments
 response = requests.post("http://localhost:8080/api/translate_segments",
     files={"audio_file": open("source.mp3", "rb")},
     data={"dest_language": "Chinese", "enhance_voice": "true"}
@@ -2583,6 +2685,25 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
     json={"session_id": "...", "segments": edited_segments}
 )
 # Parse SSE stream for audio_url...</div>
+
+                            <h4 style="margin-bottom: 12px; color: var(--text-primary);">Voice Design (Qwen3-TTS)</h4>
+                            <div class="api-code"># Python - Generate with voice description
+import requests
+
+response = requests.post("http://localhost:8080/api/design-voice", json={
+    "text": "Welcome to our platform!",
+    "voice_description": "A warm, friendly female voice with a British accent",
+    "language": "English"
+})
+
+with open("designed_voice.mp3", "wb") as f:
+    f.write(response.content)
+
+# Save to presets for reuse
+requests.post("http://localhost:8080/api/design-voice/save-preset", json={
+    "preset_name": "british_female",
+    "description": "Warm British female voice"
+})</div>
                         </div>
                     </div>
                 </div>
