@@ -15,11 +15,12 @@ pip install -r requirements.txt
 pip install pydub
 pip install flashinfer-python
 pip install flash-attn --no-build-isolation --no-cache-dir
-pip install audio-separator[gpu]
+pip install audio-separator
 pip install clearvoice
 pip install google-genai
 sudo apt install ffmpeg
-hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
+huggingface-cli download garyswansrs/index_tts_2_vllm --local-dir checkpoints
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign --local-dir ./models/Qwen3-TTS-12Hz-1.7B-VoiceDesign
 python fastapi_webui_v2.py --use_torch_compile
 ```
 
