@@ -110,7 +110,7 @@
             .hero-highlights {
                 flex: 1 1 100%;
                 display: grid;
-                grid-template-columns: repeat(4, 1fr);
+                grid-template-columns: repeat(5, 1fr);
                 gap: 12px;
                 z-index: 1;
             }
@@ -165,7 +165,12 @@
                 border-color: rgba(16, 185, 129, 0.3);
                 color: var(--brand-emerald);
             }
-            @media (max-width: 1100px) {
+            @media (max-width: 1200px) {
+                .hero-highlights {
+                    grid-template-columns: repeat(3, 1fr);
+                }
+            }
+            @media (max-width: 900px) {
                 .hero-highlights {
                     grid-template-columns: repeat(2, 1fr);
                 }
@@ -1292,7 +1297,7 @@
                 body { padding: 16px 12px 28px; }
                 .hero { padding: 20px; }
                 .hero-highlights {
-                    grid-template-columns: repeat(2, 1fr);
+                    grid-template-columns: repeat(3, 1fr);
                 }
                 .form-section {
                     padding: 18px;
@@ -1350,6 +1355,18 @@
                             <span class="hero-card-feature">🔊 ClearVoice</span>
                             <span class="hero-card-feature">🎧 Audio Preview</span>
                             <span class="hero-card-feature">📈 48kHz Upscale</span>
+                        </div>
+                    </div>
+                    <div class="hero-card" onclick="switchTab('voice-design')" style="cursor: pointer;">
+                        <div class="hero-card-header">
+                            <span class="icon">🎨</span>
+                            <strong>Voice Design</strong>
+                        </div>
+                        <div class="hero-card-features">
+                            <span class="hero-card-feature highlight">🗣️ Qwen3-TTS</span>
+                            <span class="hero-card-feature">✨ Natural Language</span>
+                            <span class="hero-card-feature">🌍 10 Languages</span>
+                            <span class="hero-card-feature">💾 Save Preset</span>
                         </div>
                     </div>
                     <div class="hero-card" onclick="switchTab('api')" style="cursor: pointer;">
@@ -1920,6 +1937,91 @@
                         <h3>🎭 Manage Speakers</h3>
                         <button class="btn" onclick="loadSpeakerList()">🔄 Refresh Speaker List</button>
                         <div id="speakerList" class="speaker-list"></div>
+                    </div>
+                </div>
+
+                <!-- Voice Design Tab (Qwen3-TTS) -->
+                <div id="voice-design" class="tab-content">
+                    <div class="form-section">
+                        <h3>🎨 Voice Design with Qwen3-TTS</h3>
+                        <p style="color: var(--text-secondary); margin-bottom: 16px;">
+                            Describe your desired voice in natural language and generate speech. Save voices you like directly to Speaker Presets!
+                        </p>
+                        
+                        <!-- Voice Description Presets -->
+                        <div style="margin-bottom: 16px;">
+                            <label style="display: block; margin-bottom: 6px; font-weight: 500;">📋 Voice Description Presets:</label>
+                            <select id="voiceDesignPreset" onchange="applyVoiceDesignPreset()" style="width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-muted); color: var(--text-primary);">
+                                <option value="">-- Select a preset or write your own --</option>
+                                <option value="young_female">Young Female (Energetic)</option>
+                                <option value="young_male">Young Male (Professional)</option>
+                                <option value="elderly_wise">Elderly (Wise)</option>
+                                <option value="narrator">Audiobook Narrator</option>
+                                <option value="news_anchor">News Anchor</option>
+                                <option value="excited">Emotional (Excited)</option>
+                                <option value="calm">Calm & Soothing</option>
+                                <option value="child">Child (Playful)</option>
+                            </select>
+                        </div>
+                        
+                        <!-- Voice Description -->
+                        <div style="margin-bottom: 16px;">
+                            <label style="display: block; margin-bottom: 6px; font-weight: 500;">🗣️ Voice Description:</label>
+                            <textarea id="voiceDesignDescription" rows="3" style="width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-muted); color: var(--text-primary); resize: vertical;" placeholder="Describe the voice you want, e.g., 'A warm, friendly female voice with clear articulation, speaking at a moderate pace with enthusiasm...'"></textarea>
+                        </div>
+                        
+                        <!-- Text to Synthesize -->
+                        <div style="margin-bottom: 16px;">
+                            <label style="display: block; margin-bottom: 6px; font-weight: 500;">📝 Text to Synthesize:</label>
+                            <textarea id="voiceDesignText" rows="4" style="width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-muted); color: var(--text-primary); resize: vertical;" placeholder="Enter the text you want to synthesize with the designed voice..."></textarea>
+                        </div>
+                        
+                        <!-- Language Selection -->
+                        <div style="margin-bottom: 16px;">
+                            <label style="display: block; margin-bottom: 6px; font-weight: 500;">🌍 Language:</label>
+                            <select id="voiceDesignLanguage" style="width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-muted); color: var(--text-primary);">
+                                <option value="Auto">Auto Detect</option>
+                                <option value="Chinese">Chinese 中文</option>
+                                <option value="English">English</option>
+                                <option value="Japanese">Japanese 日本語</option>
+                                <option value="Korean">Korean 한국어</option>
+                                <option value="German">German Deutsch</option>
+                                <option value="French">French Français</option>
+                                <option value="Russian">Russian Русский</option>
+                                <option value="Portuguese">Portuguese Português</option>
+                                <option value="Spanish">Spanish Español</option>
+                                <option value="Italian">Italian Italiano</option>
+                            </select>
+                        </div>
+                        
+                        <!-- Generate Button -->
+                        <button id="voiceDesignGenerateBtn" class="btn btn-primary" onclick="generateVoiceDesign()" style="width: 100%; padding: 12px; font-size: 1rem;">
+                            🎵 Generate Voice
+                        </button>
+                        
+                        <!-- Audio Player (hidden until generation) -->
+                        <div id="voiceDesignResultSection" style="display: none; margin-top: 20px; padding: 16px; background: var(--surface-muted); border-radius: 12px; border: 1px solid var(--border);">
+                            <h4 style="margin-bottom: 12px;">🎧 Generated Audio:</h4>
+                            <audio id="voiceDesignAudio" controls style="width: 100%; margin-bottom: 12px;"></audio>
+                            
+                            <!-- Save to Preset Section -->
+                            <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border);">
+                                <h4 style="margin-bottom: 8px;">💾 Save to Speaker Presets</h4>
+                                <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 12px;">
+                                    Like this voice? Save it directly to your Speaker Presets to use with any text!
+                                </p>
+                                <div style="display: flex; gap: 8px; align-items: center;">
+                                    <input type="text" id="voiceDesignPresetName" placeholder="Enter preset name..." style="flex: 1; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-muted); color: var(--text-primary);">
+                                    <button id="voiceDesignSaveBtn" class="btn btn-secondary" onclick="saveVoiceDesignToPreset()">
+                                        💾 Save Preset
+                                    </button>
+                                </div>
+                                <div id="voiceDesignSaveStatus" style="margin-top: 8px; font-size: 0.85rem;"></div>
+                            </div>
+                        </div>
+                        
+                        <!-- Status Message -->
+                        <div id="voiceDesignStatus" style="margin-top: 12px; font-size: 0.9rem; color: var(--text-secondary);"></div>
                     </div>
                 </div>
 
@@ -2714,6 +2816,160 @@ response = requests.post("http://localhost:8080/api/translate_generate_segments"
                     }
                 } catch (error) {
                     showStatus(`Error deleting speaker: ${error.message}`, 'error', 'speakerStatus');
+                }
+            }
+
+            // ============================================================================
+            // Voice Design (Qwen3-TTS) Functions
+            // ============================================================================
+            
+            const VOICE_DESIGN_PRESETS = {
+                "young_female": "A bright, energetic young female voice with a clear tone, speaking with enthusiasm and warmth.",
+                "young_male": "A confident young male voice with clear articulation, professional and authoritative tone.",
+                "elderly_wise": "A seasoned, wise voice with a low, mellow timbre, speaking slowly and thoughtfully.",
+                "narrator": "A warm, engaging audiobook narrator voice with perfect pacing, clear pronunciation, and emotional depth.",
+                "news_anchor": "A clear, authoritative news anchor voice with neutral accent, steady pace, and professional delivery.",
+                "excited": "An excited, upbeat voice with high energy, fast pace, and enthusiastic delivery.",
+                "calm": "A calm, soothing voice like a meditation guide, speaking slowly with gentle intonation.",
+                "child": "A playful, high-pitched child's voice with innocent enthusiasm and natural variation."
+            };
+            
+            function applyVoiceDesignPreset() {
+                const select = document.getElementById('voiceDesignPreset');
+                const descriptionTextarea = document.getElementById('voiceDesignDescription');
+                const presetValue = select.value;
+                
+                if (presetValue && VOICE_DESIGN_PRESETS[presetValue]) {
+                    descriptionTextarea.value = VOICE_DESIGN_PRESETS[presetValue];
+                }
+            }
+            
+            function showVoiceDesignStatus(message, type = 'info') {
+                const statusDiv = document.getElementById('voiceDesignStatus');
+                statusDiv.textContent = message;
+                statusDiv.style.color = type === 'error' ? '#ef4444' : type === 'success' ? '#10b981' : 'var(--text-secondary)';
+            }
+            
+            async function generateVoiceDesign() {
+                const text = document.getElementById('voiceDesignText').value.trim();
+                const voiceDescription = document.getElementById('voiceDesignDescription').value.trim();
+                const language = document.getElementById('voiceDesignLanguage').value;
+                const generateBtn = document.getElementById('voiceDesignGenerateBtn');
+                
+                // Validation
+                if (!text) {
+                    showVoiceDesignStatus('Please enter text to synthesize.', 'error');
+                    return;
+                }
+                if (!voiceDescription) {
+                    showVoiceDesignStatus('Please enter a voice description.', 'error');
+                    return;
+                }
+                
+                // Show loading state
+                generateBtn.disabled = true;
+                generateBtn.innerHTML = '⏳ Generating...';
+                showVoiceDesignStatus('Generating voice with Qwen3-TTS... This may take a moment.');
+                
+                try {
+                    const response = await fetch('/api/design-voice', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            text: text,
+                            voice_description: voiceDescription,
+                            language: language,
+                            output_format: 'mp3'
+                        })
+                    });
+                    
+                    if (!response.ok) {
+                        const errorData = await response.json().catch(() => ({}));
+                        throw new Error(errorData.detail || `Generation failed (${response.status})`);
+                    }
+                    
+                    const blob = await response.blob();
+                    const url = URL.createObjectURL(blob);
+                    
+                    // Show audio player
+                    const audioElement = document.getElementById('voiceDesignAudio');
+                    audioElement.src = url;
+                    document.getElementById('voiceDesignResultSection').style.display = 'block';
+                    
+                    // Clear preset name input
+                    document.getElementById('voiceDesignPresetName').value = '';
+                    
+                    // Check if preset saving is available
+                    try {
+                        const statusResp = await fetch('/api/design-voice/status');
+                        const statusData = await statusResp.json();
+                        const saveStatusDiv = document.getElementById('voiceDesignSaveStatus');
+                        const saveBtn = document.getElementById('voiceDesignSaveBtn');
+                        
+                        if (statusData.preset_save_available) {
+                            saveStatusDiv.textContent = '';
+                            saveBtn.disabled = false;
+                            showVoiceDesignStatus('✅ Voice generated successfully! You can save it to Speaker Presets.', 'success');
+                        } else {
+                            saveStatusDiv.innerHTML = '<span style="color: #f59e0b;">⚠️ IndexTTS is still initializing. Preset saving will be available shortly.</span>';
+                            saveBtn.disabled = true;
+                            showVoiceDesignStatus('✅ Voice generated successfully! Preset saving will be available once IndexTTS is ready.', 'success');
+                        }
+                    } catch (e) {
+                        document.getElementById('voiceDesignSaveStatus').textContent = '';
+                        showVoiceDesignStatus('✅ Voice generated successfully! You can save it to Speaker Presets.', 'success');
+                    }
+                    
+                } catch (error) {
+                    console.error('Voice Design error:', error);
+                    showVoiceDesignStatus(`❌ Error: ${error.message}`, 'error');
+                } finally {
+                    generateBtn.disabled = false;
+                    generateBtn.innerHTML = '🎵 Generate Voice';
+                }
+            }
+            
+            async function saveVoiceDesignToPreset() {
+                const presetName = document.getElementById('voiceDesignPresetName').value.trim();
+                const saveBtn = document.getElementById('voiceDesignSaveBtn');
+                const saveStatusDiv = document.getElementById('voiceDesignSaveStatus');
+                
+                if (!presetName) {
+                    saveStatusDiv.innerHTML = '<span style="color: #ef4444;">Please enter a preset name.</span>';
+                    return;
+                }
+                
+                // Show loading state
+                saveBtn.disabled = true;
+                saveBtn.innerHTML = '⏳ Saving...';
+                saveStatusDiv.innerHTML = '<span style="color: var(--text-secondary);">Saving to Speaker Presets...</span>';
+                
+                try {
+                    const response = await fetch('/api/design-voice/save-preset', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            preset_name: presetName
+                        })
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (response.ok && result.success) {
+                        saveStatusDiv.innerHTML = `<span style="color: #10b981;">✅ Saved as "${presetName}" in Speaker Presets!</span>`;
+                        // Refresh speaker list
+                        loadSpeakerList();
+                        loadSpeakers();
+                    } else {
+                        const errorMsg = result.detail || result.error || 'Failed to save preset';
+                        saveStatusDiv.innerHTML = `<span style="color: #ef4444;">❌ ${errorMsg}</span>`;
+                    }
+                } catch (error) {
+                    console.error('Save preset error:', error);
+                    saveStatusDiv.innerHTML = `<span style="color: #ef4444;">❌ Error: ${error.message}</span>`;
+                } finally {
+                    saveBtn.disabled = false;
+                    saveBtn.innerHTML = '💾 Save Preset';
                 }
             }
 

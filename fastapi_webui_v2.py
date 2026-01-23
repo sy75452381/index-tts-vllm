@@ -91,6 +91,7 @@ sys.path.insert(0, os.path.join(current_dir, "indextts"))
 
 from indextts.infer_vllm_v2 import IndexTTS2
 from speaker_preset_manager import SpeakerPresetManager, initialize_preset_manager
+from qwen3_tts_manager import Qwen3VoiceDesignManager, Qwen3TTSConfig, DesignedVoiceResult
 
 # Configuration
 import argparse
@@ -127,6 +128,9 @@ executor = ThreadPoolExecutor(max_workers=_executor_workers, thread_name_prefix=
 _enhancement_model: Optional[Any] = None
 _super_res_model: Optional[Any] = None
 _current_enhancement_model_name: Optional[str] = None
+
+# Global Qwen3-TTS Voice Design manager (initialized lazily)
+_voice_design_manager: Optional[Qwen3VoiceDesignManager] = None
 
 # Available ClearVoice speech enhancement models
 # MossFormerGAN_SE_16K is the default (smaller and faster)
@@ -12416,6 +12420,149 @@ async def api_speaker_preview(speaker_name: str):
         filename=f"{speaker_name}_preview.mp3",
         headers={"Cache-Control": "public, max-age=86400"},
     )
+
+
+# ============================================================================
+# Qwen3-TTS Voice Design API Endpoints
+# ============================================================================
+
+def get_voice_design_manager() -> Qwen3VoiceDesignManager:
+    """Get or initialize Voice Design manager with preset manager integration."""
+    global _voice_design_manager
+    if _voice_design_manager is None:
+        config = Qwen3TTSConfig(
+            voice_design_model_path=os.environ.get(
+                "QWEN3_VOICE_DESIGN_MODEL",
+                "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+            ),
+            device=os.environ.get("QWEN3_TTS_DEVICE", "cuda:0"),
+        )
+        # Get the speaker manager from TTSManager instance
+        tts_instance = TTSManager.get_instance()
+        preset_manager = tts_instance.speaker_manager if tts_instance and tts_instance.is_ready() else None
+        _voice_design_manager = Qwen3VoiceDesignManager(
+            config=config,
+            preset_manager=preset_manager
+        )
+    
+    # Check if preset_manager was None during init but is now available
+    # This handles the case where Voice Design was used before IndexTTS was fully initialized
+    if _voice_design_manager.preset_manager is None:
+        tts_instance = TTSManager.get_instance()
+        if tts_instance and tts_instance.is_ready() and tts_instance.speaker_manager:
+            _voice_design_manager.preset_manager = tts_instance.speaker_manager
+            print("[Qwen3-TTS] Updated Voice Design manager with speaker preset manager")
+    
+    return _voice_design_manager
+
+
+class VoiceDesignRequest(BaseModel):
+    """Request to generate speech with voice design."""
+    text: str = Field(..., description="Text to synthesize")
+    voice_description: str = Field(..., description="Natural language description of desired voice")
+    language: str = Field(default="Auto", description="Target language")
+    output_format: Literal["wav", "mp3"] = Field(default="mp3")
+
+
+class SaveDesignedVoiceRequest(BaseModel):
+    """Request to save last generated voice design as a speaker preset."""
+    preset_name: str = Field(..., description="Name for the speaker preset")
+    description: Optional[str] = Field(None, description="Optional description override")
+
+
+@app.post("/api/design-voice")
+async def design_voice(request: VoiceDesignRequest):
+    """
+    Generate speech with Qwen3-TTS Voice Design.
+    
+    Describe the desired voice in natural language and generate speech.
+    The result is cached and can be saved to speaker presets.
+    """
+    try:
+        manager = get_voice_design_manager()
+        
+        # Generate in thread pool to avoid blocking
+        result: DesignedVoiceResult = await asyncio.get_event_loop().run_in_executor(
+            executor,
+            lambda: manager.generate_voice_design(
+                text=request.text,
+                voice_description=request.voice_description,
+                language=request.language,
+            )
+        )
+        
+        # Use existing convert_audio_to_format function for MP3 conversion
+        audio_bytes, media_type, _ = await convert_audio_to_format(
+            result.audio_waveform,
+            result.sample_rate,
+            output_format=request.output_format,
+            bitrate="128k"
+        )
+        
+        return Response(
+            content=audio_bytes,
+            media_type=media_type,
+            headers={"X-Voice-Design-Cached": "true"}
+        )
+    except Exception as e:
+        print(f"❌ Voice Design error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/design-voice/save-preset")
+async def save_designed_voice_to_preset(request: SaveDesignedVoiceRequest):
+    """
+    Save the last generated voice design directly to Speaker Presets.
+    
+    This allows users to save a voice they like without downloading
+    and re-uploading the audio file.
+    """
+    try:
+        manager = get_voice_design_manager()
+        
+        result = await asyncio.get_event_loop().run_in_executor(
+            executor,
+            lambda: manager.save_to_preset(
+                preset_name=request.preset_name,
+                description=request.description,
+            )
+        )
+        
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"❌ Save preset error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/design-voice/languages")
+async def get_design_voice_languages():
+    """Get list of supported languages for Voice Design."""
+    return {"languages": Qwen3VoiceDesignManager.SUPPORTED_LANGUAGES}
+
+
+@app.get("/api/design-voice/status")
+async def get_design_voice_status():
+    """Check Voice Design model status."""
+    try:
+        manager = get_voice_design_manager()
+        return {
+            "enabled": True,
+            "model_loaded": manager.is_model_loaded(),
+            "has_cached_result": manager.get_last_generated() is not None,
+            "preset_save_available": manager.preset_manager is not None,
+        }
+    except Exception as e:
+        return {
+            "enabled": False,
+            "error": str(e),
+            "preset_save_available": False,
+        }
 
 
 @app.get("/api/segment_preview/{session_id}/{segment_index}")
