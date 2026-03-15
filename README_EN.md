@@ -24,6 +24,12 @@ huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign --local-dir ./mode
 python fastapi_webui_v2.py --use_torch_compile
 ```
 
+
+for rtx pro 6000
+```bash
+pip install https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.6/flashinfer_jit_cache-0.6.6+cu128-cp39-abi3-manylinux_2_28_x86_64.whl#sha256=973d2ffadf8dc606a0df335e53f6f82587788d251fe532633f028995bbba10cc
+```
+
 ## Project Introduction
 This project reimplements the inference of the GPT model using the vllm library, based on [index-tts](https://github.com/index-tts/index-tts), to accelerate the inference process of index-tts.
 
