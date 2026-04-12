@@ -19,8 +19,8 @@ pip install audio-separator
 pip install clearvoice
 pip install google-genai
 sudo apt install ffmpeg
-huggingface-cli download garyswansrs/index_tts_2_vllm --local-dir checkpoints
-huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign --local-dir ./models/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
+hf download Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign --local-dir ./models/Qwen3-TTS-12Hz-1.7B-VoiceDesign
 python fastapi_webui_v2.py --use_torch_compile
 ```
 
