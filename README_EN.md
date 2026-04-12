@@ -27,6 +27,17 @@ python fastapi_webui_v2.py --use_torch_compile
 
 for rtx pro 6000
 ```bash
+# Set for Blackwell RTX 6000 (Compute Capability 12.0)
+export TORCH_CUDA_ARCH_LIST="12.0"
+
+# Optional: If 12.0 is not yet fully recognized by your specific PyTorch version, 
+# you can try 10.0 or use "native" to auto-detect
+# export TORCH_CUDA_ARCH_LIST="native"
+
+# Clean previous failed build attempts
+rm -rf ~/.cache/torch_extensions/anti_alias_activation_cuda
+```
+```bash
 pip install https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.6/flashinfer_jit_cache-0.6.6+cu128-cp39-abi3-manylinux_2_28_x86_64.whl#sha256=973d2ffadf8dc606a0df335e53f6f82587788d251fe532633f028995bbba10cc
 ```
 
