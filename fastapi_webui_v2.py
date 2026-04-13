@@ -267,7 +267,7 @@ class PerfLogger:
 GEMINI_API_KEY_ENV_VAR = "GEMINI_API_KEY"
 GOOGLE_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
 GEMINI_MODEL_ENV_VAR = "GEMINI_MODEL_NAME"
-DEFAULT_GEMINI_MODEL_NAME = "gemini-2.5-pro"
+DEFAULT_GEMINI_MODEL_NAME = "gemini-3.1-flash-lite-preview"
 JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 COERCE_SPEAKER_SEGMENTS_PATTERN = re.compile(
     r'^\s*(\[[\s\S]*?\])\s*,\s*"segments"\s*:\s*(\[[\s\S]*\])\s*$',
@@ -338,7 +338,11 @@ MIN_GENERATED_VOLUME_PERCENT = 10.0
 MAX_GENERATED_VOLUME_PERCENT = 300.0
 DEFAULT_SILENCE_VOLUME_PERCENT = DEFAULT_GENERATED_VOLUME_PERCENT
 DEFAULT_EMOTION_WEIGHT = 0.6
-ALLOWED_GEMINI_MODELS = {"gemini-3-flash-preview", "gemini-2.5-pro"}
+ALLOWED_GEMINI_MODELS = {
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+}
 GEMINI_AUDIO_EXPORT_BITRATE = "128k"
 GEMINI_CACHE_VERSION = 1
 SPEAKER_PREVIEW_DIR = Path("speaker_presets") / "previews"
