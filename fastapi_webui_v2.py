@@ -5768,7 +5768,9 @@ def _parse_manual_segments_input(
 ) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
     """
     Parse user-supplied Gemini segment JSON.
-    Accepts either a JSON array or an object with "segments" and optional "speakers".
+    Accepts either a JSON array of segment objects, an object with "segments" and
+    optional "speakers", or a list of such objects (common transcript export shape:
+    [{ "speakers": [...], "segments": [...] }]).
     """
     if raw is None:
         return None
@@ -5784,6 +5786,21 @@ def _parse_manual_segments_input(
     if isinstance(parsed, dict):
         speaker_profiles = _normalize_speaker_profiles(parsed.get("speakers"))
         parsed = parsed.get("segments")
+    elif isinstance(parsed, list) and parsed:
+        # Unwrap [{ "speakers": [...], "segments": [...] }, ...] — not a flat segment list
+        if all(
+            isinstance(item, dict) and isinstance(item.get("segments"), list)
+            for item in parsed
+        ):
+            merged_speakers_raw: List[Any] = []
+            merged_segments: List[Dict[str, Any]] = []
+            for item in parsed:
+                sp = item.get("speakers")
+                if isinstance(sp, list):
+                    merged_speakers_raw.extend(sp)
+                merged_segments.extend(item["segments"])
+            speaker_profiles = _normalize_speaker_profiles(merged_speakers_raw)
+            parsed = merged_segments
 
     if not isinstance(parsed, list):
         raise ValueError("segments_json must be a JSON array of segment objects.")
