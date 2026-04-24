@@ -4678,6 +4678,27 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 return div.innerHTML;
             }
 
+            // Sync compact row text from the expanded textareas
+            function syncCompactText(card) {
+                if (!card) return;
+                const compactRow = card.querySelector('.segment-compact-row');
+                if (!compactRow) return;
+                const sourceTextarea = card.querySelector('.segment-source');
+                const translationTextarea = card.querySelector('.segment-translation');
+                const compactSource = compactRow.querySelector('.compact-source');
+                const compactTranslation = compactRow.querySelector('.compact-translation');
+                if (compactSource && sourceTextarea) {
+                    const fullText = sourceTextarea.value || '';
+                    compactSource.textContent = truncateText(fullText, 40) || (card.dataset.type === 'silence' ? 'Silence' : '—');
+                    compactSource.title = fullText;
+                }
+                if (compactTranslation && translationTextarea) {
+                    const fullText = translationTextarea.value || '';
+                    compactTranslation.textContent = truncateText(fullText, 40) || (card.dataset.type === 'silence' ? '' : '—');
+                    compactTranslation.title = fullText;
+                }
+            }
+
             // Toggle segment card expand/collapse
             function toggleSegmentExpand(card) {
                 if (!card) return;
@@ -4687,6 +4708,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     const allCards = translateSegmentsList.querySelectorAll('.segment-card');
                     allCards.forEach(c => {
                         if (c !== card) {
+                            syncCompactText(c);
                             c.classList.add('compact');
                             c.classList.remove('expanded');
                         }
@@ -4694,7 +4716,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     card.classList.remove('compact');
                     card.classList.add('expanded');
                 } else {
-                    // Collapse this card
+                    // Collapse this card - sync edited text to compact view
+                    syncCompactText(card);
                     card.classList.add('compact');
                     card.classList.remove('expanded');
                 }
