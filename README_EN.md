@@ -24,6 +24,12 @@ hf download Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign --local-dir ./models/Qwen3-TTS-
 python fastapi_webui_v2.py --use_torch_compile
 ```
 
+```bash
+npx localtunnel --port 8000
+ssh -p 443 -R0:localhost:8000 a.pinggy.io
+ssh -R 80:localhost:8000 serveo.net
+```
+
 ## Project Introduction
 This project reimplements the inference of the GPT model using the vllm library, based on [index-tts](https://github.com/index-tts/index-tts), to accelerate the inference process of index-tts.
 
