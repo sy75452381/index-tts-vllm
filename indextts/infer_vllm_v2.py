@@ -271,6 +271,16 @@ class IndexTTS2:
         
         # Enable torch.compile optimization if requested
         if self.use_torch_compile:
+            # Setup persistent cache for torch.compile artifacts so they survive restarts.
+            # Without this, the inductor recompiles from scratch every startup (unlike BigVGAN's
+            # CUDA kernel which ninja caches to a build directory automatically).
+            compile_cache_dir = os.path.join(self.model_dir, "torch_compile_cache")
+            os.makedirs(compile_cache_dir, exist_ok=True)
+            os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", compile_cache_dir)
+            os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+            os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
+            print(f">> torch.compile cache dir: {os.environ['TORCHINDUCTOR_CACHE_DIR']}")
+            print(f">> FX graph cache: {os.environ['TORCHINDUCTOR_FX_GRAPH_CACHE']}, Autograd cache: {os.environ['TORCHINDUCTOR_AUTOGRAD_CACHE']}")
             print(">> Enabling torch.compile optimization for s2mel...")
             self.s2mel.enable_torch_compile()
         
