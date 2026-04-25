@@ -2978,6 +2978,16 @@ except SystemExit:
         gpu_memory_utilization=0.25
     )
 
+# Setup persistent torch.compile cache early (before any model imports trigger compilation)
+if cmd_args.use_torch_compile:
+    import os as _os
+    _compile_cache_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), cmd_args.model_dir, "torch_compile_cache")
+    _os.makedirs(_compile_cache_dir, exist_ok=True)
+    _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", _compile_cache_dir)
+    _os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+    _os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
+    print(f"🔥 torch.compile persistent cache: {_os.environ['TORCHINDUCTOR_CACHE_DIR']}")
+
 # Create directories
 APP_DIR = Path(__file__).resolve().parent
 _OUTPUT_SUBDIRS = (
