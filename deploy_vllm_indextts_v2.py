@@ -12,7 +12,7 @@ tag = f"{cuda_version}-{flavor}-{operating_sys}"
 # Create Modal image for IndexTTS v2 with vLLM optimization
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
-    .apt_install("ffmpeg", "git", "wget", "build-essential", "gcc", "g++", "cmake")
+    .apt_install("ffmpeg", "git", "wget", "build-essential", "gcc", "g++", "cmake", "sox", "libsox-fmt-all")
     .env({
         "CUDA_HOME": "/usr/local/cuda",
         "CUDA_PATH": "/usr/local/cuda", 
@@ -50,10 +50,8 @@ image = (
         "flashinfer-python"
     )
     .run_commands("pip install flash-attn --no-build-isolation")
+    .run_commands("pip install audio-separator")
     .run_commands("pip install clearvoice google-genai")
-    .pip_install(
-        "pynvml"
-    )
 )
 
 app = modal.App("vllm-indextts-v2", image=image)
@@ -80,7 +78,9 @@ def prepare_model():
     """
     CPU function to:
     1. Copy the entire /app/index-tts-vllm to persistent storage
-    2. Download the IndexTTS v2 model into the persistent checkpoints folder
+    2. Update the application with latest code from git (git pull origin)
+    3. Download the IndexTTS v2 model into the persistent checkpoints folder
+       (includes Qwen3-TTS Voice Design model)
     
     This is a one-time setup that creates a fully self-contained persistent app.
     """
@@ -114,7 +114,72 @@ def prepare_model():
     else:
         print("✅ Application already exists in persistent storage")
     
-    # Step 2: Download model directly into persistent checkpoints folder
+    # Step 2: Update the application with latest code from git (force override local changes)
+    print("\n📥 Step 2: Updating application from git repository (force override)...")
+    repo_update_status = {
+        "success": False,
+        "message": "",
+        "output": ""
+    }
+    try:
+        # Change to persistent app directory
+        os.chdir(str(persistent_app_path))
+        print(f"   📁 Changed to directory: {persistent_app_path}")
+        
+        # Step 2a: Fetch latest from all remotes
+        print("   📥 Fetching latest from all remotes...")
+        fetch_result = subprocess.run(
+            ["git", "fetch", "--all"],
+            capture_output=True,
+            text=True,
+            cwd=str(persistent_app_path)
+        )
+        
+        if fetch_result.returncode != 0:
+            print(f"⚠️ Git fetch failed: {fetch_result.stderr.strip()}")
+            repo_update_status["message"] = f"Git fetch failed: {fetch_result.stderr.strip()}"
+            repo_update_status["output"] = fetch_result.stderr.strip()
+        else:
+            print("   ✅ Fetch completed")
+            
+            # Step 2b: Get the default branch name
+            branch_result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                cwd=str(persistent_app_path)
+            )
+            current_branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "main"
+            print(f"   📌 Current branch: {current_branch}")
+            
+            # Step 2c: Hard reset to origin/branch (force override local changes)
+            print(f"   🔄 Resetting to origin/{current_branch} (force override local changes)...")
+            reset_result = subprocess.run(
+                ["git", "reset", "--hard", f"origin/{current_branch}"],
+                capture_output=True,
+                text=True,
+                cwd=str(persistent_app_path)
+            )
+            
+            if reset_result.returncode == 0:
+                print(f"✅ Git reset successful!")
+                repo_update_status["success"] = True
+                repo_update_status["message"] = f"Repository updated to origin/{current_branch}"
+                repo_update_status["output"] = reset_result.stdout.strip()
+                if reset_result.stdout.strip():
+                    print(f"   📋 Output: {reset_result.stdout.strip()}")
+            else:
+                print(f"⚠️ Git reset failed with exit code: {reset_result.returncode}")
+                repo_update_status["message"] = f"Git reset failed with exit code {reset_result.returncode}"
+                repo_update_status["output"] = reset_result.stderr.strip() or reset_result.stdout.strip()
+                if reset_result.stderr.strip():
+                    print(f"   ⚠️ Stderr: {reset_result.stderr.strip()}")
+    except Exception as e:
+        print(f"⚠️ Git update failed (non-fatal): {str(e)}")
+        print("   Continuing with existing code...")
+        repo_update_status["message"] = f"Git update exception: {str(e)}"
+    
+    # Step 3: Download model directly into persistent checkpoints folder
     checkpoints_dir = persistent_app_path / "checkpoints"
     checkpoints_dir.mkdir(exist_ok=True)
     
@@ -138,9 +203,12 @@ print("Model download completed!")
 """
         ], check=True, capture_output=True, text=True, cwd=str(persistent_app_path))
         
-        print("✅ Model download completed successfully!")
+        print("✅ IndexTTS model download completed successfully!")
         
-        # Step 3: List downloaded files for verification
+        # Step 3b: Voice Design model is now included in the checkpoints directory
+        voice_design_dir = checkpoints_dir / "Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+        
+        # Step 4: List downloaded files for verification
         print("🔍 Listing downloaded model files...")
         for file_path in checkpoints_dir.rglob("*"):
             if file_path.is_file():
@@ -157,7 +225,7 @@ print("Model download completed!")
         else:
             print(f"   ⚠️ vLLM directory not found: {vllm_dir}")
         
-        # Step 4: List complete application structure for verification
+        # Step 5: List complete application structure for verification
         print("\n📋 Persistent application structure:")
         def show_tree(path, prefix="", max_depth=3, current_depth=0):
             if current_depth >= max_depth:
@@ -173,17 +241,21 @@ print("Model download completed!")
         
         show_tree(persistent_app_path)
         
-        print(f"\n✅ IndexTTS v2 application and model preparation completed!")
+        print(f"\n✅ IndexTTS v2 application and models preparation completed!")
         print(f"📁 Persistent app location: {persistent_app_path}")
-        print(f"📁 Model location: {checkpoints_dir}")
+        print(f"📁 IndexTTS model location: {checkpoints_dir}")
+        print(f"📁 Voice Design model location: {voice_design_dir}")
         print("🚀 Ready for inference deployment!")
         
         return {
             "status": "success",
-            "message": "IndexTTS v2 application and model prepared successfully",
+            "message": "IndexTTS v2 application and models prepared successfully",
             "app_dir": str(persistent_app_path),
             "model_dir": str(checkpoints_dir),
-            "vllm_ready": vllm_dir.exists()
+            "voice_design_dir": str(voice_design_dir),
+            "vllm_ready": vllm_dir.exists(),
+            "voice_design_ready": voice_design_dir.exists(),
+            "repo_update": repo_update_status
         }
         
     except subprocess.CalledProcessError as e:
@@ -193,14 +265,16 @@ print("Model download completed!")
             "status": "error", 
             "message": error_msg,
             "stdout": e.stdout,
-            "stderr": e.stderr
+            "stderr": e.stderr,
+            "repo_update": repo_update_status
         }
     except Exception as e:
         error_msg = f"Model preparation failed: {str(e)}"
         print(f"❌ {error_msg}")
         return {
             "status": "error",
-            "message": error_msg
+            "message": error_msg,
+            "repo_update": repo_update_status
         }
 
 
@@ -483,6 +557,14 @@ def serve():
     os.environ["PYTHONPATH"] = str(persistent_app_path)
     print(f"   🐍 PYTHONPATH: {os.environ['PYTHONPATH']}")
     
+    # 3.3: Setup Qwen3-TTS Voice Design model path (use local pre-downloaded model)
+    voice_design_model_path = persistent_app_path / "checkpoints" / "Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    if voice_design_model_path.exists():
+        os.environ["QWEN3_VOICE_DESIGN_MODEL"] = str(voice_design_model_path)
+        print(f"   🎤 QWEN3_VOICE_DESIGN_MODEL: {voice_design_model_path}")
+    else:
+        print(f"   ⚠️ Voice Design model not found at {voice_design_model_path}, will use HuggingFace download")
+    
     # ========================================================================
     # STEP 4: Start FastAPI Server
     # ========================================================================
@@ -490,10 +572,7 @@ def serve():
     
     # Build the command
     cmd = [
-        "python", "fastapi_webui_v2.py",
-        "--use_torch_compile",
-        "--host", "0.0.0.0",
-        "--port", "8000"
+        "python", "fastapi_webui_v2.py"
     ]
     
     print(f"   Command: {' '.join(cmd)}")
