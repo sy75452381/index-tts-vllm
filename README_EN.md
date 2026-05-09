@@ -10,6 +10,7 @@ quick start
 ```bash
 conda update -n base -c defaults conda
 conda install -c conda-forge libstdcxx-ng
+conda install -c conda-forge sox
 git clone https://github.com/garyswansrs/index-tts-vllm.git
 cd index-tts-vllm
 pip install -r requirements.txt
