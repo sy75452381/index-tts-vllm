@@ -12464,7 +12464,7 @@ def get_voice_design_manager() -> Qwen3VoiceDesignManager:
         config = Qwen3TTSConfig(
             voice_design_model_path=os.environ.get(
                 "QWEN3_VOICE_DESIGN_MODEL",
-                "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+                "./checkpoints/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
             ),
             device=os.environ.get("QWEN3_TTS_DEVICE", "cuda:0"),
         )
