@@ -16,7 +16,7 @@ import torch
 @dataclass
 class Qwen3TTSConfig:
     """Configuration for Qwen3-TTS Voice Design model."""
-    voice_design_model_path: str = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    voice_design_model_path: str = "./checkpoints/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
     device: str = "cuda:0"
     dtype: torch.dtype = torch.bfloat16
     use_flash_attention: bool = True
@@ -69,7 +69,7 @@ class Qwen3VoiceDesignManager:
                 self.config.voice_design_model_path,
                 device_map=self.config.device,
                 dtype=self.config.dtype,
-                attn_implementation=attn_impl,
+                attn_implementation=attn_impl
             )
             print(f"[Qwen3-TTS] VoiceDesign model loaded successfully.")
         return self._voice_design_model
