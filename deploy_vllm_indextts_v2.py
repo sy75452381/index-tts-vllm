@@ -42,6 +42,7 @@ image = (
     .pip_install(
         "litai",
         "whisperx"
+        "json-repair"
     )
     .run_commands(
         "git clone https://github.com/garyswansrs/index-tts-vllm.git /app/index-tts-vllm"
