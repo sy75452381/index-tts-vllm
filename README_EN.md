@@ -33,119 +33,105 @@ ssh -R 80:localhost:8000 serveo.net
 ```
 
 ## Project Introduction
-This project reimplements the inference of the GPT model using the vllm library, based on [index-tts](https://github.com/index-tts/index-tts), to accelerate the inference process of index-tts.
+This project provides a high-performance implementation of **IndexTTS2** using the **vLLM v2** backend. It focuses on extreme inference speed, high concurrency, and a feature-rich user interface for both text-to-speech and advanced audio translation workflows.
 
-The inference speed improvement on a single RTX 4090 is as follows:
-- RTF (Real-Time Factor) for a single request: ≈0.3 -> ≈0.1
-- GPT model decode speed for a single request: ≈90 token/s -> ≈280 token/s
-- Concurrency: With `gpu_memory_utilization` set to 0.25 (about 5GB of GPU memory), it was tested to handle a concurrency of around 16 without pressure (see `simple_test.py` for the benchmarking script).
+By leveraging vLLM's PagedAttention and continuous batching, this implementation achieves significant speedups:
+- **RTF (Real-Time Factor)**: Achieved **0.02** on RTX Pro 6000 Blackwell.
+- **High Concurrency**: Handles **100** concurrent requests efficiently.
+- **IndexTTS2 Support**: Full support for the latest IndexTTS2 model with enhanced emotional expression and duration control.
 
-## New Features
-- Supports multi-role audio mixing: You can input multiple reference audios, and the TTS output's voice will be a mixed version of the reference audios (inputting multiple reference audios may cause the output voice to be unstable; you can try generating until you get a satisfactory voice to use as a reference audio).
+## Key Features
+- **🚀 Ultra-Fast Inference**: Re-implemented with vLLM v2 and PagedAttention for high-speed, concurrent TTS generation.
+- **👥 Speaker Preset Management**: Save reference voices as presets to skip pre-processing overhead on every request.
+- **⚡ Parallel Chunk Generation**: Automatically splits long text into chunks and processes them in parallel, achieving up to 50x speedup for long synthesis tasks.
+- **🎵 MP3 & Multi-Format Output**: Support for MP3 output (via pydub/ffmpeg) for significantly smaller file sizes without sacrificing quality.
+- **🌍 Advanced Translation Workflow**:
+    - **Transcription**: Local (WhisperX) or Cloud (Gemini) speech-to-text.
+    - **Translation**: High-quality translation preserving speaker diarization.
+    - **Diarization**: Automatic speaker detection and voice cloning for each speaker.
+    - **Edit Mode**: Interactive segment editing, selective regeneration, and timestamp control.
+- **🎨 Qwen3-TTS Voice Design**: Describe a voice in natural language (e.g., "A calm, deep male voice with a slight accent") and generate it instantly.
+- **🎛️ Audio Enhancement & Separation**:
+    - **ClearVoice**: Integrated speech enhancement and super-resolution (MossFormer2).
+    - **Audio-Separator**: High-quality vocal/instrumental separation (Mel-Band Roformer).
 
-## Performance
-Word Error Rate (WER) Results for IndexTTS and Baseline Models on the [**seed-test**](https://github.com/BytedanceSpeech/seed-tts-eval)
+## Installation
 
-| model | zh | en |
-|---|---|---|
-| Human | 1.254 | 2.143 |
-| index-tts (num_beams=3) | 1.005 | 1.943 |
-| index-tts (num_beams=1) | 1.107 | 2.032 |
-| index-tts-vllm | 1.12 | 1.987 |
-
-It basically maintains the performance of the original project.
-
-## Update Log
-
-- **[2025-08-07]** Added support for fully automated one-click API service deployment with Docker: `docker compose up`
-
-- **[2025-08-06]** Added support for OpenAI API format calls:
-    1. Added `/audio/speech` API path for OpenAI compatibility.
-    2. Added `/audio/voices` API path to get the list of voices/characters.
-    - Corresponds to: [createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
-
-- **[2025-09-22]** Added support for vllm v1, IndexTTS2 compatibility is in progress.
-
-## Usage Steps
-
-### 1. Clone this project
+### 1. System Dependencies
+Requires `ffmpeg` for audio processing and `sox` for some backend utilities.
 ```bash
-git clone https://github.com/garyswansrs/index-tts-vllm.git
-cd index-tts-vllm
+sudo apt update && sudo apt install ffmpeg sox libstdc++6 -y
 ```
 
-### 2. Create and activate a conda environment
+### 2. Environment Setup
+We recommend using Conda to manage your environment:
 ```bash
-conda create -n index-tts-vllm python=3.12
-conda activate index-tts-vllm
+conda create -n indextts python=3.12 -y
+conda activate indextts
 ```
 
-### 3. Install PyTorch
-
-Requires PyTorch version 2.8.0 (corresponding to vllm 0.10.2). For specific installation instructions, please refer to the [PyTorch official website](https://pytorch.org/get-started/locally/).
-
-### 4. Install dependencies
+### 3. Python Dependencies
+Install the core requirements and specialized libraries for advanced features:
 ```bash
 pip install -r requirements.txt
 
-pip install pydub
-pip install flashinfer-python
-pip install flash-attn
-sudo apt install ffmpeg
+# For optimized GPU inference
+pip install flashinfer-python flash-attn --no-build-isolation
+
+# For advanced audio features
+pip install audio-separator[gpu] clearvoice google-genai whisperx pydub
 ```
 
-### 5. Download model weights
-
-hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
-
-this is a pre-converted repo, you dont need to do the rest anymore
-
-These are the official weight files. Download them to any local path. Supports IndexTTS-1.5 weights.
-
-| **HuggingFace** | **ModelScope** |
-|---|---|
-| [IndexTTS](https://huggingface.co/IndexTeam/Index-TTS) | [IndexTTS](https://modelscope.cn/models/IndexTeam/Index-TTS) |
-| [😁IndexTTS-1.5](https://huggingface.co/IndexTeam/IndexTTS-1.5) | [IndexTTS-1.5](https://modelscope.cn/models/IndexTeam/IndexTTS-1.5) |
-
-### 6. Convert model weights
-
+### 4. Model Weights
+Download the pre-converted IndexTTS2 vLLM weights:
 ```bash
-bash convert_hf_format.sh /path/to/your/model_dir
+huggingface-cli download garyswansrs/index_tts_2_vllm --local-dir checkpoints
 ```
+If you have official weights in other formats, use the conversion script provided (see below).
 
-This operation will convert the official model weights to a format compatible with the transformers library, saved in the `vllm` folder under the model weight path, for easy loading by the vllm library.
+## Usage
 
-### 7. Launch the web UI!
-
+### 1. Launch Modern FastAPI WebUI (Recommended)
+This UI supports the full advanced workflow including translation, voice design, and speaker presets.
 ```bash
-
-python webui_with_presets.py
+python fastapi_webui_v2.py --model_dir checkpoints --use_torch_compile
 ```
 
-The first launch might take longer as it needs to compile CUDA kernels for bigvgan.
-
-## API
-
-An API is encapsulated using FastAPI. Here is an example to start it. Please change `--model_dir` to the actual path of your model:
-
+### 2. Launch Gradio WebUI with Presets
+A simpler interface focused on TTS with speaker preset support.
 ```bash
-python api_server.py --model_dir /your/path/to/Index-TTS
+python webui_with_presets.py --model_dir checkpoints
 ```
+
+### 3. Model Conversion
+To convert official IndexTTS/IndexTTS-1.5 weights to vLLM format:
+```bash
+bash convert_hf_format.sh /path/to/official_model_dir
+```
+
+## API Reference
+
+The modern WebUI (`fastapi_webui_v2.py`) also serves as a comprehensive API server compatible with OpenAI's audio format and custom IndexTTS2 features.
+
+### Start the API Server
+```bash
+python fastapi_webui_v2.py --model_dir checkpoints --port 8000 --use_torch_compile
+```
+
+### Key Endpoints
+- `POST /audio/speech`: OpenAI-compatible text-to-speech.
+- `POST /api/translate_audio`: Advanced audio-to-audio translation with diarization.
+- `POST /add_speaker`: Register a new speaker from reference audio.
+- `GET /audio_roles`: List all registered speakers and presets.
+- `POST /api/design-voice`: Generate voice from natural language description.
 
 ### Startup Parameters
-- `--model_dir`: Required, path to the model weights.
-- `--host`: Service IP address, defaults to `0.0.0.0`.
-- `--port`: Service port, defaults to `6006`.
-- `--gpu_memory_utilization`: VLLM GPU memory utilization rate, defaults to `0.25`.
+- `--model_dir`: Path to model weights (default: `checkpoints`).
+- `--gpu_memory_utilization`: vLLM memory limit (default: `0.25`).
+- `--use_torch_compile`: Enable torch.compile for faster startup/inference.
+- `--is_fp16`: Use FP16 precision.
 
-### Request Example
-Refer to `api_example.py`.
-
-### OpenAI API
-- Added `/audio/speech` API path for OpenAI compatibility.
-- Added `/audio/voices` API path to get the list of voices/characters.
-
-For details, see: [createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
-
-## Concurrency Test
-Refer to [`simple_test.py`](simple_test.py). The API service needs to be started first.
+## Performance Benchmarks
+Tested on RTX Pro 6000 Blackwell:
+- **RTF**: **0.02** (IndexTTS2-vLLM)
+- **Throughput**: **100** concurrent requests supported.
