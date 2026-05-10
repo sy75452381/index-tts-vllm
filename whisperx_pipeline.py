@@ -49,6 +49,11 @@ try:
 except ImportError:
     LitaiLLM = None
 
+try:
+    import json_repair  # type: ignore[import]
+except ImportError:
+    json_repair = None  # type: ignore[assignment]
+
 
 # ---------------------------------------------------------------------------
 # Configuration defaults (can be overridden via environment variables)
@@ -66,12 +71,35 @@ WHISPERX_TRANSLATION_LLM = os.getenv(
     "lightning-ai/DeepSeek-V3.1",
 )
 WHISPERX_TRANSLATION_BATCH_SIZE = int(
-    os.getenv("WHISPERX_TRANSLATION_BATCH_SIZE", "100")
+    os.getenv("WHISPERX_TRANSLATION_BATCH_SIZE", "30")
 )
+
+# ---------------------------------------------------------------------------
+# Model storage — redirect all downloads into checkpoints/whisperx/
+# ---------------------------------------------------------------------------
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+WHISPERX_MODEL_DIR = os.path.join(_SCRIPT_DIR, "checkpoints", "whisperx")
+WHISPERX_ASR_DOWNLOAD_ROOT = os.path.join(WHISPERX_MODEL_DIR, "faster-whisper")
+WHISPERX_ALIGN_MODEL_DIR = os.path.join(WHISPERX_MODEL_DIR, "align")
+WHISPERX_PYANNOTE_CACHE = os.path.join(WHISPERX_MODEL_DIR, "pyannote")
+
+# Ensure directories exist
+for _d in (WHISPERX_MODEL_DIR, WHISPERX_ASR_DOWNLOAD_ROOT,
+           WHISPERX_ALIGN_MODEL_DIR, WHISPERX_PYANNOTE_CACHE):
+    os.makedirs(_d, exist_ok=True)
+
+# Set env vars *before* any model loading as a fallback for any
+# sub-library that doesn't accept an explicit cache_dir parameter.
+os.environ.setdefault("HF_HOME", WHISPERX_MODEL_DIR)
+os.environ.setdefault("HF_HUB_CACHE", os.path.join(WHISPERX_MODEL_DIR, "hub"))
+os.environ.setdefault("TRANSFORMERS_CACHE", WHISPERX_MODEL_DIR)
+os.environ.setdefault("PYANNOTE_CACHE", WHISPERX_PYANNOTE_CACHE)
+
+print(f"📂 WhisperX model cache directory: {WHISPERX_MODEL_DIR}")
 
 # Cache directory for WhisperX results
 WHISPERX_CACHE_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
+    _SCRIPT_DIR,
     "whisperx_cache",
 )
 WHISPERX_CACHE_VERSION = 1
@@ -96,8 +124,10 @@ def _format_timestamp(seconds: float) -> str:
 
 
 def _clean_json_response(response_text: str) -> str:
-    """Strip markdown fences and normalise CJK quotes used as JSON delimiters."""
+    """Strip markdown fences, normalise CJK quotes, and fix common LLM artefacts."""
     cleaned = response_text.strip()
+
+    # Remove markdown code fences
     if cleaned.startswith("```json"):
         cleaned = cleaned[7:]
     elif cleaned.startswith("```"):
@@ -112,7 +142,84 @@ def _clean_json_response(response_text: str) -> str:
     cleaned = re.sub(r'(?<=[\[,])\s*『', ' "', cleaned)
     cleaned = re.sub(r'』\s*(?=[,\]])', '"', cleaned)
 
+    # Replace any remaining CJK quotes inside the string
+    cleaned = cleaned.replace('「', '"').replace('」', '"')
+    cleaned = cleaned.replace('『', '"').replace('』', '"')
+
     return cleaned
+
+
+def _parse_llm_json_array(
+    raw_response: str,
+    expected_count: int,
+    batch_label: str = "",
+) -> Optional[List[str]]:
+    """Parse an LLM response as a JSON array of strings, with robust fallbacks.
+
+    Returns the parsed list on success, or None on failure.
+    Logs full diagnostics on every failure.
+    """
+    prefix = f"  [{batch_label}] " if batch_label else "  "
+
+    if not raw_response or raw_response.strip() == "":
+        print(f"{prefix}⚠️ LLM returned an empty response.")
+        return None
+
+    cleaned = _clean_json_response(raw_response)
+
+    # --- Attempt 1: standard json.loads ---
+    try:
+        result = json.loads(cleaned)
+        if isinstance(result, list):
+            print(f"{prefix}✅ Parsed with json.loads (len={len(result)})")
+            return result
+    except json.JSONDecodeError:
+        pass  # fall through to repair
+
+    # --- Attempt 2: try closing truncated arrays ---
+    # LLMs often truncate mid-string; try closing the last string + array
+    for suffix in ['"]', '"]', '"]', '"]\n']:
+        try:
+            result = json.loads(cleaned + suffix)
+            if isinstance(result, list):
+                print(
+                    f"{prefix}✅ Parsed after closing truncated array "
+                    f"(len={len(result)})"
+                )
+                return result
+        except json.JSONDecodeError:
+            continue
+
+    # --- Attempt 3: json_repair ---
+    if json_repair is not None:
+        try:
+            result = json_repair.loads(cleaned)
+            if isinstance(result, list):
+                print(
+                    f"{prefix}✅ Parsed with json_repair (len={len(result)})"
+                )
+                return result
+            else:
+                print(
+                    f"{prefix}⚠️ json_repair returned type "
+                    f"{type(result).__name__}, expected list"
+                )
+        except Exception as e:
+            print(f"{prefix}⚠️ json_repair also failed: {e}")
+    else:
+        print(f"{prefix}⚠️ json_repair not installed, cannot attempt repair")
+
+    # --- All attempts failed — log full details ---
+    print(f"{prefix}❌ All JSON parse attempts failed.")
+    print(f"{prefix}   Expected {expected_count} items.")
+    print(f"{prefix}   Raw response length: {len(raw_response)} chars")
+    print(f"{prefix}   Cleaned length: {len(cleaned)} chars")
+    print(f"{prefix}   --- BEGIN RAW RESPONSE ---")
+    # Print full response for debugging (split into lines to avoid terminal issues)
+    for line in raw_response.splitlines():
+        print(f"{prefix}   {line}")
+    print(f"{prefix}   --- END RAW RESPONSE ---")
+    return None
 
 
 def _convert_to_output_format(
@@ -150,6 +257,54 @@ def _convert_to_output_format(
         })
 
     return segments, speaker_profiles
+
+
+def _translate_batch_with_retry(
+    llm: Any,
+    source_texts: List[str],
+    dest_language: str,
+    batch_label: str,
+    max_retries: int = 10,
+) -> Optional[List[str]]:
+    """Translate a batch of strings with retries."""
+    prompt = (
+        f"You are a precise professional translator. "
+        f"Translate the following JSON array of strings into "
+        f"{dest_language}. "
+        f"CRITICAL RULES:\n"
+        f"1. Maintain the exact same number of items and order.\n"
+        f"2. Return ONLY a valid JSON array of strings.\n"
+        f"3. Do not include any explanations, markdown code "
+        f"blocks, or conversational filler.\n\n"
+        f"Input Array:\n"
+        f"{json.dumps(source_texts, ensure_ascii=False)}"
+    )
+
+    expected_count = len(source_texts)
+    
+    for attempt in range(1, max_retries + 1):
+        if attempt > 1:
+            print(f"  [{batch_label}] 🔄 Retry attempt {attempt}/{max_retries}...")
+        
+        try:
+            response = llm.chat(prompt, max_tokens=50000)
+            if not response or str(response).strip() == "":
+                print(f"  [{batch_label}] ⚠️ LLM returned an empty response.")
+                continue
+                
+            parsed = _parse_llm_json_array(str(response), expected_count, batch_label)
+            if parsed is not None:
+                if len(parsed) == expected_count:
+                    return parsed
+                else:
+                    print(
+                        f"  [{batch_label}] ⚠️ Length mismatch: got {len(parsed)}, "
+                        f"expected {expected_count}"
+                    )
+        except Exception as e:
+            print(f"  [{batch_label}] ⚠️ API Error: {e}")
+            
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +372,8 @@ def _detect_source_language(audio: np.ndarray, device: str, compute_type: str) -
     """Detect the real language of the audio using Whisper's built-in detector."""
     print("🔍 WhisperX: Auto-detecting source language from audio...")
     det_model = whisperx.load_model(
-        WHISPERX_MODEL_SIZE, device, compute_type=compute_type
+        WHISPERX_MODEL_SIZE, device, compute_type=compute_type,
+        download_root=WHISPERX_ASR_DOWNLOAD_ROOT,
     )
     det_result = det_model.transcribe(audio, batch_size=1)
     detected = det_result.get("language", "en")
@@ -319,7 +475,8 @@ def _run_whisperx_pipeline_sync(
 
     print("Loading Whisper model (English proxy)...")
     model = whisperx.load_model(
-        WHISPERX_MODEL_SIZE, device, compute_type=compute_type, language="en"
+        WHISPERX_MODEL_SIZE, device, compute_type=compute_type, language="en",
+        download_root=WHISPERX_ASR_DOWNLOAD_ROOT,
     )
     proxy_result = model.transcribe(audio, batch_size=batch_size)
     del model
@@ -329,7 +486,8 @@ def _run_whisperx_pipeline_sync(
 
     print("Aligning (English)...")
     model_a, metadata = whisperx.load_align_model(
-        language_code=proxy_result["language"], device=device
+        language_code=proxy_result["language"], device=device,
+        model_dir=WHISPERX_ALIGN_MODEL_DIR,
     )
     proxy_result = whisperx.align(
         proxy_result["segments"],
@@ -345,7 +503,9 @@ def _run_whisperx_pipeline_sync(
         torch.cuda.empty_cache()
 
     print("Diarizing...")
-    diarize_model = DiarizationPipeline(token=hf_token, device=device)
+    diarize_model = DiarizationPipeline(
+        token=hf_token, device=device, cache_dir=WHISPERX_PYANNOTE_CACHE,
+    )
     diarize_segments = diarize_model(audio)
     proxy_result = whisperx.assign_word_speakers(diarize_segments, proxy_result)
     del diarize_model
@@ -386,6 +546,7 @@ def _run_whisperx_pipeline_sync(
             device,
             compute_type=compute_type,
             language=source_language,
+            download_root=WHISPERX_ASR_DOWNLOAD_ROOT,
         )
 
         total = len(proxy_result["segments"])
@@ -460,59 +621,28 @@ def _run_whisperx_pipeline_sync(
                     )
                     continue
 
+                batch_label = f"Batch {i // translation_batch_size + 1}"
                 print(
-                    f"\n  Translating batch "
-                    f"{i // translation_batch_size + 1} "
+                    f"\n  Translating {batch_label} "
                     f"(Segments {i + 1} to "
                     f"{min(i + translation_batch_size, total_segments)})..."
                 )
 
-                prompt = (
-                    f"You are a precise professional translator. "
-                    f"Translate the following JSON array of strings into "
-                    f"{dest_language}. "
-                    f"CRITICAL RULES:\n"
-                    f"1. Maintain the exact same number of items and order.\n"
-                    f"2. Return ONLY a valid JSON array of strings.\n"
-                    f"3. Do not include any explanations, markdown code "
-                    f"blocks, or conversational filler.\n\n"
-                    f"Input Array:\n"
-                    f"{json.dumps(source_texts, ensure_ascii=False)}"
+                translated_texts = _translate_batch_with_retry(
+                    llm=llm,
+                    source_texts=source_texts,
+                    dest_language=dest_language,
+                    batch_label=batch_label,
+                    max_retries=10,
                 )
 
-                response = None
-                cleaned_response = None
-
-                try:
-                    response = llm.chat(prompt, max_tokens=20000)
-
-                    if not response or str(response).strip() == "":
-                        print(
-                            "⚠️ Error: The LLM returned an empty response."
-                        )
-                        continue
-
-                    cleaned_response = _clean_json_response(str(response))
-                    translated_texts = json.loads(cleaned_response)
-
+                if translated_texts:
                     non_empty = [seg for seg in chunk if seg["source_text"]]
-                    if len(translated_texts) == len(non_empty):
-                        for seg_ref, trans in zip(non_empty, translated_texts):
-                            seg_ref["translated_text"] = trans
-                        print("  ✅ Batch translated successfully.")
-                    else:
-                        print(
-                            f"  ⚠️ Warning: LLM returned "
-                            f"{len(translated_texts)} items but expected "
-                            f"{len(non_empty)}. Skipping batch."
-                        )
-
-                except json.JSONDecodeError as e:
-                    print(f"  ⚠️ JSON Parse Error: {e}")
-                    if response is not None:
-                        print(f"  Debug - Raw: {repr(response)[:200]}")
-                except Exception as e:
-                    print(f"  ⚠️ Translation error: {e}")
+                    for seg_ref, trans in zip(non_empty, translated_texts):
+                        seg_ref["translated_text"] = trans
+                    print(f"  [{batch_label}] ✅ Batch translated successfully.")
+                else:
+                    print(f"  [{batch_label}] ❌ Batch failed after retries.")
 
     # Build raw text for session storage
     raw_output = {
