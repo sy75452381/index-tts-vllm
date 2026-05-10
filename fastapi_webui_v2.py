@@ -93,6 +93,17 @@ from indextts.infer_vllm_v2 import IndexTTS2
 from speaker_preset_manager import SpeakerPresetManager, initialize_preset_manager
 from qwen3_tts_manager import Qwen3VoiceDesignManager, Qwen3TTSConfig, DesignedVoiceResult
 
+# WhisperX local transcription pipeline (optional)
+try:
+    from whisperx_pipeline import (
+        is_whisperx_available,
+        _run_whisperx_pipeline_sync,
+    )
+except ImportError:
+    def is_whisperx_available() -> bool:
+        return False
+    _run_whisperx_pipeline_sync = None  # type: ignore[assignment]
+
 # Configuration
 import argparse
 
@@ -1950,6 +1961,7 @@ async def _build_translation_segments(
     # Cached source paths for fast session storage (avoids re-encoding)
     original_audio_source_path: Optional[str] = None,
     backing_track_source_path: Optional[str] = None,
+    transcription_pipeline: str = "gemini",
 ) -> SegmentBuildResult:
     manual_chunk_data = None
     manual_speaker_profiles: List[Dict[str, Any]] = []
@@ -1969,10 +1981,14 @@ async def _build_translation_segments(
                 {"status": "error", "message": str(exc)},
             ) from exc
 
+    # Resolve pipeline label
+    use_whisperx = transcription_pipeline == "whisperx"
+    pipeline_label = "WhisperX" if use_whisperx else f"Gemini model '{resolved_gemini_model}'"
+
     if emit_status:
         await emit_status(
-            stage="gemini",
-            message=f"Analyzing audio with Gemini model '{resolved_gemini_model}'...",
+            stage="transcription",
+            message=f"Analyzing audio with {pipeline_label}...",
         )
 
     speaker_profiles: List[Dict[str, Any]] = []
@@ -1980,13 +1996,38 @@ async def _build_translation_segments(
     if manual_chunk_data is not None:
         gemini_chunks = manual_chunk_data
         speaker_profiles = manual_speaker_profiles or []
-        print(f"[translate] Using {len(gemini_chunks)} manual segments (SRT/JSON), skipping Gemini inference")
+        print(f"[translate] Using {len(gemini_chunks)} manual segments (SRT/JSON), skipping inference")
         if emit_status:
             await emit_status(
                 stage="manual_segments",
                 message=f"Using {len(gemini_chunks)} manual segments from SRT/JSON input...",
             )
+    elif use_whisperx:
+        # --- WhisperX local pipeline ---
+        if _run_whisperx_pipeline_sync is None:
+            raise TranslateWorkflowHttpError(
+                500,
+                {"status": "error", "message": "WhisperX pipeline is not installed. Install whisperx, pyannote.audio, and litai."},
+            )
+        print(f"[translate] Using WhisperX local pipeline for transcription/translation")
+        loop = asyncio.get_event_loop()
+        (
+            gemini_chunks,
+            speaker_profiles,
+            raw_gemini_response_text,
+            gemini_cache_info,
+        ) = await loop.run_in_executor(
+            executor,
+            functools.partial(
+                _run_whisperx_pipeline_sync,
+                processed_audio_bytes,
+                dest_language=dest_language,
+                enable_translation=translate_enabled,
+                force_refresh=force_gemini_regenerate,
+            ),
+        )
     else:
+        # --- Gemini cloud pipeline (default) ---
         (
             gemini_chunks,
             speaker_profiles,
@@ -2977,16 +3018,6 @@ except SystemExit:
         use_torch_compile=False,
         gpu_memory_utilization=0.25
     )
-
-# Setup persistent torch.compile cache early (before any model imports trigger compilation)
-if cmd_args.use_torch_compile:
-    import os as _os
-    _compile_cache_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), cmd_args.model_dir, "torch_compile_cache")
-    _os.makedirs(_compile_cache_dir, exist_ok=True)
-    _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", _compile_cache_dir)
-    _os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
-    _os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
-    print(f"🔥 torch.compile persistent cache: {_os.environ['TORCHINDUCTOR_CACHE_DIR']}")
 
 # Create directories
 APP_DIR = Path(__file__).resolve().parent
@@ -8050,6 +8081,10 @@ class TranslateRequest(BaseModel):
         default=None,
         description="Emotion weight (0.0-1.0) when using the original emotion prompt for the default speaker.",
     )
+    transcription_pipeline: Optional[str] = Field(
+        default=None,
+        description="Transcription pipeline to use: 'gemini' (default, cloud-based) or 'whisperx' (local WhisperX + LLM).",
+    )
 
 
 class SpeakerOverrideInput(BaseModel):
@@ -10058,9 +10093,9 @@ async def api_translate_segments(
     force_gemini_regenerate: Optional[bool] = Form(False),
     default_speaker_preset: Optional[str] = Form(None),
     default_emotion_weight: Optional[float] = Form(None),
-    # SRT subtitle upload support
     original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
     translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
+    transcription_pipeline: Optional[str] = Form(None, description="Transcription pipeline: 'gemini' (default) or 'whisperx' (local)"),
 ):
     """API: Prepare translation segments for advanced translate/edit workflow."""
     reuse_session_id_value: Optional[str] = reuse_session_id
@@ -10099,6 +10134,7 @@ async def api_translate_segments(
         force_gemini_regen_value = force_gemini_regenerate
         default_speaker_value = default_speaker_preset
         default_emotion_weight_value = default_emotion_weight
+        transcription_pipeline_value = transcription_pipeline
 
         content_type = request.headers.get("content-type", "")
         if (
@@ -10169,6 +10205,8 @@ async def api_translate_segments(
                 default_speaker_value = payload.get("default_speaker_preset")
             if "default_emotion_weight" in payload:
                 default_emotion_weight_value = payload.get("default_emotion_weight", default_emotion_weight_value)
+            if payload.get("transcription_pipeline"):
+                transcription_pipeline_value = payload.get("transcription_pipeline")
 
         # Handle SRT subtitle file uploads
         # If SRT files are provided, parse and convert to segments_json format
@@ -10319,6 +10357,9 @@ async def api_translate_segments(
             default_emotion_weight_value,
             DEFAULT_EMOTION_WEIGHT,
         )
+        resolved_transcription_pipeline = (transcription_pipeline_value or "").strip().lower()
+        if resolved_transcription_pipeline not in ("gemini", "whisperx"):
+            resolved_transcription_pipeline = "gemini"
 
         reuse_session_for_segments = reuse_source_session
         session_source_filename = uploaded_filename or (
@@ -10469,6 +10510,7 @@ async def api_translate_segments(
                         # Pass cached paths for fast session storage
                         original_audio_source_path=cached_vocals_path,
                         backing_track_source_path=cached_backing_path,
+                        transcription_pipeline=resolved_transcription_pipeline,
                     )
 
                     metadata = segment_result.metadata
@@ -11526,9 +11568,9 @@ async def api_translate_audio(
     force_gemini_regenerate: Optional[bool] = Form(False),
     default_speaker_preset: Optional[str] = Form(None),
     default_emotion_weight: Optional[float] = Form(None),
-    # SRT subtitle upload support
     original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
     translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
+    transcription_pipeline: Optional[str] = Form(None, description="Transcription pipeline: 'gemini' (default) or 'whisperx' (local)"),
 ):
     """API: Translate speech audio to a target language and return synthesized audio."""
     reuse_session_id_value: Optional[str] = reuse_session_id
@@ -11565,6 +11607,7 @@ async def api_translate_audio(
         force_gemini_regen_value = force_gemini_regenerate
         default_speaker_value = default_speaker_preset
         default_emotion_weight_value = default_emotion_weight
+        transcription_pipeline_value = transcription_pipeline
 
         content_type = request.headers.get("content-type", "")
         if (
@@ -11657,6 +11700,8 @@ async def api_translate_audio(
                 default_speaker_value = translate_req.default_speaker_preset
             if translate_req.default_emotion_weight is not None:
                 default_emotion_weight_value = translate_req.default_emotion_weight
+            if translate_req.transcription_pipeline:
+                transcription_pipeline_value = translate_req.transcription_pipeline
 
         default_speaker_value = (default_speaker_value or "").strip()
         if not default_speaker_value:
@@ -11665,6 +11710,9 @@ async def api_translate_audio(
             default_emotion_weight_value,
             DEFAULT_EMOTION_WEIGHT,
         )
+        resolved_transcription_pipeline = (transcription_pipeline_value or "").strip().lower()
+        if resolved_transcription_pipeline not in ("gemini", "whisperx"):
+            resolved_transcription_pipeline = "gemini"
 
         # Handle SRT subtitle file uploads
         # If SRT files are provided, parse and convert to segments_json format
@@ -11988,6 +12036,7 @@ async def api_translate_audio(
                         # Pass cached paths for fast session storage
                         original_audio_source_path=cached_vocals_path,
                         backing_track_source_path=cached_backing_path,
+                        transcription_pipeline=resolved_transcription_pipeline,
                     )
                     session = segment_result.session
                     segments = segment_result.segments
@@ -12464,7 +12513,7 @@ def get_voice_design_manager() -> Qwen3VoiceDesignManager:
         config = Qwen3TTSConfig(
             voice_design_model_path=os.environ.get(
                 "QWEN3_VOICE_DESIGN_MODEL",
-                "./checkpoints/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+                "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
             ),
             device=os.environ.get("QWEN3_TTS_DEVICE", "cuda:0"),
         )
@@ -12947,7 +12996,8 @@ async def server_info():
                 "engine": "vLLM v2",
                 "chinese_support": True,
                 "speaker_presets": True,
-                "speaker_manager": "SpeakerPresetManager"
+                "speaker_manager": "SpeakerPresetManager",
+                "whisperx_available": is_whisperx_available(),
             }
         })
         

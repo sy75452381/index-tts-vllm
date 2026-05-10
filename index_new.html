@@ -1620,7 +1620,7 @@
                                                     <button type="button" class="btn btn-secondary" id="translateUploadTranscriptionsBtn" style="display: none;" title="Upload ZIP with transcription .json files to import Gemini cache">⬆️ Upload Transcriptions</button>
                                                     <input type="file" id="translateTranscriptionsZipInput" accept=".zip" style="display: none;">
                                                 </div>
-                                                <div id="translateChunkBatchStatus" class="status"></div>
+                            <div id="translateChunkBatchStatus" class="status"></div>
                                                 <div id="translateTranscriptionUploadStatus" class="status"></div>
                                                 <div id="translateSplitStatus" class="status"></div>
                                                 <div style="margin-top: 12px;">
@@ -1635,13 +1635,23 @@
                                     <div class="step-header">
                                         <span class="step-badge">🤖</span>
                                         <div class="step-meta">
-                                            <h4>AI & Gemini Configuration</h4>
-                                            <p class="step-description">Choose the target language, Gemini model, API overrides, and Gemini/manual controls.</p>
+                                            <h4>AI & Transcription Configuration</h4>
+                                            <p class="step-description">Choose the transcription pipeline, target language, and model settings.</p>
                                         </div>
                                         <button type="button" class="step-toggle" aria-expanded="false">Expand</button>
                                     </div>
                                     <div class="step-body">
-                                        <div class="form-row-3">
+                                        <div class="form-row-2" style="margin-bottom: 14px;">
+                                            <div class="form-group">
+                                                <label for="translateTranscriptionPipeline">Transcription Pipeline:</label>
+                                                <select id="translateTranscriptionPipeline" name="transcription_pipeline">
+                                                    <option value="gemini" selected>☁️ Gemini (Cloud)</option>
+                                                    <option value="whisperx">🖥️ WhisperX (Local)</option>
+                                                </select>
+                                                <small style="color: var(--text-muted); display: block; margin-top: 4px; font-size: 0.75rem;">
+                                                    Gemini uses Google's API for transcription. WhisperX runs locally with speaker diarization + LLM translation.
+                                                </small>
+                                            </div>
                                             <div class="form-group">
                                                 <label for="translateDestLanguage">Destination Language:</label>
                                                 <select id="translateDestLanguage" name="dest_language" required>
@@ -1650,6 +1660,8 @@
                                                     <option value="Chinese" selected>Chinese</option>
                                                 </select>
                                             </div>
+                                        </div>
+                                        <div id="translateGeminiSettings" class="form-row-3">
                                             <div class="form-group">
                                                 <label for="translateGeminiModel">Gemini Model:</label>
                                                 <select id="translateGeminiModel" name="gemini_model">
@@ -1661,6 +1673,9 @@
                                             <div class="form-group">
                                                 <label for="translateGeminiApiKey">API Key (optional):</label>
                                                 <input type="password" id="translateGeminiApiKey" name="gemini_api_key" placeholder="Override default..." autocomplete="off">
+                                            </div>
+                                            <div class="form-group" style="display: flex; align-items: flex-end;">
+                                                <small id="translatePipelineInfo" style="color: var(--brand-emerald); font-size: 0.8rem; padding: 6px 0;"></small>
                                             </div>
                                         </div>
                                         <div class="checkbox-group" style="margin-bottom: 14px;">
@@ -3292,7 +3307,28 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             const translateOriginalSrtClear = document.getElementById('translateOriginalSrtClear');
             const translateTranslatedSrtClear = document.getElementById('translateTranslatedSrtClear');
             const translateSrtSummary = document.getElementById('translateSrtSummary');
+            const translateTranscriptionPipeline = document.getElementById('translateTranscriptionPipeline');
+            const translateGeminiSettingsDiv = document.getElementById('translateGeminiSettings');
+            const translatePipelineInfo = document.getElementById('translatePipelineInfo');
             const DEFAULT_EMOTION_WEIGHT = 0.6;
+
+            // Pipeline selector toggle logic
+            function updatePipelineVisibility() {
+                const isWhisperX = translateTranscriptionPipeline && translateTranscriptionPipeline.value === 'whisperx';
+                if (translateGeminiSettingsDiv) {
+                    translateGeminiSettingsDiv.style.opacity = isWhisperX ? '0.4' : '1';
+                    translateGeminiSettingsDiv.style.pointerEvents = isWhisperX ? 'none' : 'auto';
+                }
+                if (translatePipelineInfo) {
+                    translatePipelineInfo.textContent = isWhisperX
+                        ? '🖥️ WhisperX local pipeline — Gemini settings do not apply'
+                        : '';
+                }
+            }
+            if (translateTranscriptionPipeline) {
+                translateTranscriptionPipeline.addEventListener('change', updatePipelineVisibility);
+                updatePipelineVisibility();
+            }
             const DEFAULT_VOLUME_PERCENT = 100;
             const MIN_VOLUME_PERCENT = 10;
             const MAX_VOLUME_PERCENT = 300;
@@ -3835,6 +3871,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 }
                 if (translateGeminiApiKey && translateGeminiApiKey.value.trim()) {
                     payload.gemini_api_key = translateGeminiApiKey.value.trim();
+                }
+                if (translateTranscriptionPipeline && translateTranscriptionPipeline.value) {
+                    payload.transcription_pipeline = translateTranscriptionPipeline.value;
                 }
                 payload.merge_backing_track = translateMergeBackEl && translateMergeBackEl.checked ? true : false;
                 payload.ignore_non_speech = translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? true : false;
@@ -4678,27 +4717,6 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 return div.innerHTML;
             }
 
-            // Sync compact row text from the expanded textareas
-            function syncCompactText(card) {
-                if (!card) return;
-                const compactRow = card.querySelector('.segment-compact-row');
-                if (!compactRow) return;
-                const sourceTextarea = card.querySelector('.segment-source');
-                const translationTextarea = card.querySelector('.segment-translation');
-                const compactSource = compactRow.querySelector('.compact-source');
-                const compactTranslation = compactRow.querySelector('.compact-translation');
-                if (compactSource && sourceTextarea) {
-                    const fullText = sourceTextarea.value || '';
-                    compactSource.textContent = truncateText(fullText, 40) || (card.dataset.type === 'silence' ? 'Silence' : '—');
-                    compactSource.title = fullText;
-                }
-                if (compactTranslation && translationTextarea) {
-                    const fullText = translationTextarea.value || '';
-                    compactTranslation.textContent = truncateText(fullText, 40) || (card.dataset.type === 'silence' ? '' : '—');
-                    compactTranslation.title = fullText;
-                }
-            }
-
             // Toggle segment card expand/collapse
             function toggleSegmentExpand(card) {
                 if (!card) return;
@@ -4708,7 +4726,6 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     const allCards = translateSegmentsList.querySelectorAll('.segment-card');
                     allCards.forEach(c => {
                         if (c !== card) {
-                            syncCompactText(c);
                             c.classList.add('compact');
                             c.classList.remove('expanded');
                         }
@@ -4716,8 +4733,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     card.classList.remove('compact');
                     card.classList.add('expanded');
                 } else {
-                    // Collapse this card - sync edited text to compact view
-                    syncCompactText(card);
+                    // Collapse this card
                     card.classList.add('compact');
                     card.classList.remove('expanded');
                 }
@@ -6442,6 +6458,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         if (translateGeminiApiKey && translateGeminiApiKey.value.trim()) {
                             formData.append('gemini_api_key', translateGeminiApiKey.value.trim());
                         }
+                        if (translateTranscriptionPipeline && translateTranscriptionPipeline.value) {
+                            formData.append('transcription_pipeline', translateTranscriptionPipeline.value);
+                        }
                         if (translateForceGeminiRefresh && translateForceGeminiRefresh.checked) {
                             formData.append('force_gemini_regenerate', 'true');
                         }
@@ -6510,6 +6529,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     }
                     if (translateGeminiApiKey && translateGeminiApiKey.value.trim()) {
                         formData.append('gemini_api_key', translateGeminiApiKey.value.trim());
+                    }
+                    if (translateTranscriptionPipeline && translateTranscriptionPipeline.value) {
+                        formData.append('transcription_pipeline', translateTranscriptionPipeline.value);
                     }
                     if (translateForceGeminiRefresh && translateForceGeminiRefresh.checked) {
                         formData.append('force_gemini_regenerate', 'true');
