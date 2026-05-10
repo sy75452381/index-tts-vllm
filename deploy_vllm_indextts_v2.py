@@ -39,6 +39,10 @@ image = (
         "torchaudio",
         extra_options="--index-url https://download.pytorch.org/whl/cu128"
     )
+    .pip_install(
+        "litai",
+        "whisperx"
+    )
     .run_commands(
         "git clone https://github.com/garyswansrs/index-tts-vllm.git /app/index-tts-vllm"
     )
