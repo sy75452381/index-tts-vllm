@@ -5,35 +5,39 @@
 # IndexTTS-vLLM
 </div>
 
-Quick start:
+quick start
 
 ```bash
-# Install system dependencies
-sudo apt update && sudo apt install ffmpeg sox libstdc++6 -y
-
-# Clone the repository
+conda update -n base -c defaults conda
+conda install -c conda-forge libstdcxx-ng
+conda install -c conda-forge sox
+pip install whisperx
 git clone https://github.com/garyswansrs/index-tts-vllm.git
 cd index-tts-vllm
-
-# Install Python dependencies
 pip install -r requirements.txt
-pip install flashinfer-python flash-attn --no-build-isolation
-pip install audio-separator[gpu] clearvoice google-genai whisperx
-
-# Download model weights
-huggingface-cli download garyswansrs/index_tts_2_vllm --local-dir checkpoints
-
-# Launch the modern WebUI
+pip install pydub
+pip install flashinfer-python
+pip install flash-attn --no-build-isolation --no-cache-dir
+pip install audio-separator
+pip install clearvoice
+pip install google-genai
+sudo apt install ffmpeg
+hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
 python fastapi_webui_v2.py --use_torch_compile
+```
+
+```bash
+npx localtunnel --port 8000
+ssh -p 443 -R0:localhost:8000 a.pinggy.io
+ssh -R 80:localhost:8000 serveo.net
 ```
 
 ## Project Introduction
 This project provides a high-performance implementation of **IndexTTS2** using the **vLLM v2** backend. It focuses on extreme inference speed, high concurrency, and a feature-rich user interface for both text-to-speech and advanced audio translation workflows.
 
 By leveraging vLLM's PagedAttention and continuous batching, this implementation achieves significant speedups:
-- **RTF (Real-Time Factor)**: Reduced from ≈0.3 to ≈0.1 on a single RTX 4090.
-- **Decoding Speed**: GPT model decoding improved from ≈90 tokens/s to ≈280 tokens/s.
-- **High Concurrency**: Handles 16+ simultaneous requests with minimal GPU memory usage (~5GB with `gpu_memory_utilization=0.25`).
+- **RTF (Real-Time Factor)**: Achieved **0.02** on RTX Pro 6000 Blackwell.
+- **High Concurrency**: Handles **100** concurrent requests efficiently.
 - **IndexTTS2 Support**: Full support for the latest IndexTTS2 model with enhanced emotional expression and duration control.
 
 ## Key Features
@@ -128,7 +132,6 @@ python fastapi_webui_v2.py --model_dir checkpoints --port 8000 --use_torch_compi
 - `--is_fp16`: Use FP16 precision.
 
 ## Performance Benchmarks
-Tested on RTX 4090 (Single Request):
-- **RTF**: ≈0.1 (IndexTTS2-vLLM)
-- **Decoding Speed**: ≈280 tokens/s
-- **Throughput**: 16+ concurrent requests within 5GB VRAM.
+Tested on RTX Pro 6000 Blackwell:
+- **RTF**: **0.02** (IndexTTS2-vLLM)
+- **Throughput**: **100** concurrent requests supported.
