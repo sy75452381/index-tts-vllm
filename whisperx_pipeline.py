@@ -5,9 +5,9 @@ A drop-in alternative to the Gemini-based pipeline that runs entirely locally
 using WhisperX for speech recognition + diarization and an external LLM for
 translation.
 
-The three-pass pipeline:
+The pipeline:
   Pass A — English proxy for timestamps & speaker segmentation
-  Pass B — Source-language re-transcription per segment
+  Pass B — Source-language re-transcription per proxy segment
   Pass C — LLM batch translation (source_text → dest_language)
 
 Returns data in the same (segments, speaker_profiles, raw_text, cache_info)
@@ -24,7 +24,6 @@ import os
 import re
 import tempfile
 import time
-from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -58,10 +57,31 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Configuration defaults (can be overridden via environment variables)
 # ---------------------------------------------------------------------------
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 WHISPERX_MODEL_SIZE = os.getenv("WHISPERX_MODEL_SIZE", "large-v3")
 WHISPERX_DEVICE = os.getenv("WHISPERX_DEVICE", "cuda")
 WHISPERX_COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "float16")
-WHISPERX_BATCH_SIZE = int(os.getenv("WHISPERX_BATCH_SIZE", "4"))
+WHISPERX_BATCH_SIZE = int(os.getenv("WHISPERX_BATCH_SIZE", "10"))
+WHISPERX_ASR_BEAM_SIZE = int(os.getenv("WHISPERX_ASR_BEAM_SIZE", "5"))
+WHISPERX_ASR_BEST_OF = int(os.getenv("WHISPERX_ASR_BEST_OF", "5"))
+WHISPERX_CONDITION_ON_PREVIOUS_TEXT = _env_flag(
+    "WHISPERX_CONDITION_ON_PREVIOUS_TEXT",
+    False,
+)
+WHISPERX_SEGMENT_PADDING_SECONDS = float(
+    os.getenv("WHISPERX_SEGMENT_PADDING_SECONDS", "0.15")
+)
+WHISPERX_MIN_SEGMENT_SECONDS = float(
+    os.getenv("WHISPERX_MIN_SEGMENT_SECONDS", "0.30")
+)
 WHISPERX_HF_TOKEN = os.getenv(
     "WHISPERX_HF_TOKEN",
     os.getenv("HF_TOKEN", ""),
@@ -72,6 +92,9 @@ WHISPERX_TRANSLATION_LLM = os.getenv(
 )
 WHISPERX_TRANSLATION_BATCH_SIZE = int(
     os.getenv("WHISPERX_TRANSLATION_BATCH_SIZE", "30")
+)
+WHISPERX_TRANSLATION_MAX_RETRIES = int(
+    os.getenv("WHISPERX_TRANSLATION_MAX_RETRIES", "4")
 )
 
 # ---------------------------------------------------------------------------
@@ -102,7 +125,7 @@ WHISPERX_CACHE_DIR = os.path.join(
     _SCRIPT_DIR,
     "whisperx_cache",
 )
-WHISPERX_CACHE_VERSION = 1
+WHISPERX_CACHE_VERSION = 2
 
 
 def is_whisperx_available() -> bool:
@@ -113,6 +136,82 @@ def is_whisperx_available() -> bool:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+_LANGUAGE_CODE_ALIASES = {
+    "english": "en",
+    "chinese": "zh",
+    "mandarin": "zh",
+    "simplified chinese": "zh",
+    "traditional chinese": "zh",
+    "japanese": "ja",
+    "korean": "ko",
+    "spanish": "es",
+    "french": "fr",
+    "german": "de",
+    "italian": "it",
+    "portuguese": "pt",
+    "russian": "ru",
+    "arabic": "ar",
+    "hindi": "hi",
+}
+
+
+def _normalize_source_language(language: Optional[str]) -> Optional[str]:
+    if language is None:
+        return None
+    normalized = language.strip().lower().replace("_", "-")
+    if normalized in {"", "auto", "detect", "unknown", "none"}:
+        return None
+    return _LANGUAGE_CODE_ALIASES.get(normalized, normalized)
+
+
+def _release_model_memory() -> None:
+    gc.collect()
+    if torch is not None and hasattr(torch, "cuda"):
+        torch.cuda.empty_cache()
+
+
+def _whisperx_asr_options() -> Dict[str, Any]:
+    """Conservative decode defaults tuned for accuracy over throughput."""
+    return {
+        "beam_size": max(1, WHISPERX_ASR_BEAM_SIZE),
+        "best_of": max(1, WHISPERX_ASR_BEST_OF),
+        "condition_on_previous_text": WHISPERX_CONDITION_ON_PREVIOUS_TEXT,
+    }
+
+
+def _load_whisperx_asr_model(
+    device: str,
+    compute_type: str,
+    *,
+    language: Optional[str] = None,
+) -> Any:
+    kwargs: Dict[str, Any] = {
+        "compute_type": compute_type,
+        "download_root": WHISPERX_ASR_DOWNLOAD_ROOT,
+    }
+    normalized_language = _normalize_source_language(language)
+    if normalized_language:
+        kwargs["language"] = normalized_language
+
+    asr_options = _whisperx_asr_options()
+    try:
+        return whisperx.load_model(
+            WHISPERX_MODEL_SIZE,
+            device,
+            asr_options=asr_options,
+            **kwargs,
+        )
+    except (TypeError, ValueError) as exc:
+        message = str(exc).lower()
+        if "asr_options" not in message and "transcriptionoptions" not in message:
+            raise
+        print(
+            "  Warning: WhisperX did not accept custom ASR options; "
+            "falling back to package defaults."
+        )
+        return whisperx.load_model(WHISPERX_MODEL_SIZE, device, **kwargs)
 
 
 def _format_timestamp(seconds: float) -> str:
@@ -149,6 +248,50 @@ def _clean_json_response(response_text: str) -> str:
     return cleaned
 
 
+def _extract_json_array_candidate(cleaned: str) -> str:
+    """Recover the JSON array when the model wrapped it in extra text."""
+    if cleaned.startswith("["):
+        return cleaned
+    start = cleaned.find("[")
+    end = cleaned.rfind("]")
+    if 0 <= start < end:
+        return cleaned[start: end + 1].strip()
+    return cleaned
+
+
+def _coerce_translation_payload(payload: Any) -> Optional[List[str]]:
+    """Accept common LLM JSON shapes and normalize them to a list of strings."""
+    if isinstance(payload, dict):
+        for key in ("translations", "translated_texts", "items", "results", "result"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                payload = value
+                break
+
+    if not isinstance(payload, list):
+        return None
+
+    translations: List[str] = []
+    for item in payload:
+        if isinstance(item, str):
+            translations.append(item)
+            continue
+        if item is None:
+            translations.append("")
+            continue
+        if isinstance(item, dict):
+            for key in ("translation", "translated_text", "text", "target", "value"):
+                value = item.get(key)
+                if value is not None:
+                    translations.append(str(value))
+                    break
+            else:
+                translations.append(json.dumps(item, ensure_ascii=False))
+            continue
+        translations.append(str(item))
+    return translations
+
+
 def _parse_llm_json_array(
     raw_response: str,
     expected_count: int,
@@ -165,28 +308,30 @@ def _parse_llm_json_array(
         print(f"{prefix}⚠️ LLM returned an empty response.")
         return None
 
-    cleaned = _clean_json_response(raw_response)
+    cleaned = _extract_json_array_candidate(_clean_json_response(raw_response))
 
     # --- Attempt 1: standard json.loads ---
     try:
         result = json.loads(cleaned)
-        if isinstance(result, list):
-            print(f"{prefix}✅ Parsed with json.loads (len={len(result)})")
-            return result
+        coerced = _coerce_translation_payload(result)
+        if coerced is not None:
+            print(f"{prefix}✅ Parsed with json.loads (len={len(coerced)})")
+            return coerced
     except json.JSONDecodeError:
         pass  # fall through to repair
 
     # --- Attempt 2: try closing truncated arrays ---
     # LLMs often truncate mid-string; try closing the last string + array
-    for suffix in ['"]', '"]', '"]', '"]\n']:
+    for suffix in ["]", '"]', "\n]", '"]\n']:
         try:
             result = json.loads(cleaned + suffix)
-            if isinstance(result, list):
+            coerced = _coerce_translation_payload(result)
+            if coerced is not None:
                 print(
                     f"{prefix}✅ Parsed after closing truncated array "
-                    f"(len={len(result)})"
+                    f"(len={len(coerced)})"
                 )
-                return result
+                return coerced
         except json.JSONDecodeError:
             continue
 
@@ -194,11 +339,12 @@ def _parse_llm_json_array(
     if json_repair is not None:
         try:
             result = json_repair.loads(cleaned)
-            if isinstance(result, list):
+            coerced = _coerce_translation_payload(result)
+            if coerced is not None:
                 print(
-                    f"{prefix}✅ Parsed with json_repair (len={len(result)})"
+                    f"{prefix}✅ Parsed with json_repair (len={len(coerced)})"
                 )
-                return result
+                return coerced
             else:
                 print(
                     f"{prefix}⚠️ json_repair returned type "
@@ -264,18 +410,26 @@ def _translate_batch_with_retry(
     source_texts: List[str],
     dest_language: str,
     batch_label: str,
-    max_retries: int = 10,
+    *,
+    source_language: Optional[str] = None,
+    max_retries: int = WHISPERX_TRANSLATION_MAX_RETRIES,
 ) -> Optional[List[str]]:
     """Translate a batch of strings with retries."""
+    source_hint = (
+        f" from {source_language}" if source_language and source_language != "auto" else ""
+    )
     prompt = (
         f"You are a precise professional translator. "
-        f"Translate the following JSON array of strings into "
+        f"Translate each string{source_hint} into "
         f"{dest_language}. "
         f"CRITICAL RULES:\n"
         f"1. Maintain the exact same number of items and order.\n"
         f"2. Return ONLY a valid JSON array of strings.\n"
         f"3. Do not include any explanations, markdown code "
-        f"blocks, or conversational filler.\n\n"
+        f"blocks, or conversational filler.\n"
+        f"4. Preserve names, numbers, punctuation intent, and line breaks.\n"
+        f"5. If an item is already in {dest_language}, polish it lightly "
+        f"without changing its meaning.\n\n"
         f"Input Array:\n"
         f"{json.dumps(source_texts, ensure_ascii=False)}"
     )
@@ -307,6 +461,62 @@ def _translate_batch_with_retry(
     return None
 
 
+def _translate_texts_adaptively(
+    llm: Any,
+    source_texts: List[str],
+    dest_language: str,
+    batch_label: str,
+    *,
+    source_language: Optional[str] = None,
+    depth: int = 0,
+) -> List[str]:
+    """Translate a batch, recursively shrinking it when the LLM response is unstable."""
+    if not source_texts:
+        return []
+
+    retries = WHISPERX_TRANSLATION_MAX_RETRIES
+    if depth > 0:
+        retries = max(1, WHISPERX_TRANSLATION_MAX_RETRIES // 2)
+
+    translated = _translate_batch_with_retry(
+        llm=llm,
+        source_texts=source_texts,
+        dest_language=dest_language,
+        batch_label=batch_label,
+        source_language=source_language,
+        max_retries=retries,
+    )
+    if translated is not None and len(translated) == len(source_texts):
+        return translated
+
+    if len(source_texts) == 1:
+        print(f"  [{batch_label}] Translation failed for one item; leaving it empty.")
+        return [""]
+
+    mid = max(1, len(source_texts) // 2)
+    print(
+        f"  [{batch_label}] Batch unstable; retrying as "
+        f"{len(source_texts[:mid])}+{len(source_texts[mid:])} smaller batches."
+    )
+    left = _translate_texts_adaptively(
+        llm,
+        source_texts[:mid],
+        dest_language,
+        f"{batch_label}.1",
+        source_language=source_language,
+        depth=depth + 1,
+    )
+    right = _translate_texts_adaptively(
+        llm,
+        source_texts[mid:],
+        dest_language,
+        f"{batch_label}.2",
+        source_language=source_language,
+        depth=depth + 1,
+    )
+    return left + right
+
+
 # ---------------------------------------------------------------------------
 # Cache helpers
 # ---------------------------------------------------------------------------
@@ -318,6 +528,7 @@ def _whisperx_cache_key(
     source_language: Optional[str],
     dest_language: str,
     enable_translation: bool,
+    translation_llm_model: Optional[str],
 ) -> str:
     """Build a deterministic cache key string."""
     parts = [
@@ -327,7 +538,14 @@ def _whisperx_cache_key(
         f"dst={dest_language}",
         f"translate={enable_translation}",
         f"model={WHISPERX_MODEL_SIZE}",
+        f"beam={WHISPERX_ASR_BEAM_SIZE}",
+        f"best_of={WHISPERX_ASR_BEST_OF}",
+        f"condition_prev={WHISPERX_CONDITION_ON_PREVIOUS_TEXT}",
+        f"segment_pad={WHISPERX_SEGMENT_PADDING_SECONDS}",
+        f"min_segment={WHISPERX_MIN_SEGMENT_SECONDS}",
     ]
+    if enable_translation:
+        parts.append(f"llm={translation_llm_model or 'default'}")
     raw = "|".join(parts)
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
@@ -369,20 +587,75 @@ def _compute_audio_hash(audio_bytes: bytes) -> str:
 
 
 def _detect_source_language(audio: np.ndarray, device: str, compute_type: str) -> str:
-    """Detect the real language of the audio using Whisper's built-in detector."""
+    """Detect the real language without using it for segmentation."""
     print("🔍 WhisperX: Auto-detecting source language from audio...")
-    det_model = whisperx.load_model(
-        WHISPERX_MODEL_SIZE, device, compute_type=compute_type,
-        download_root=WHISPERX_ASR_DOWNLOAD_ROOT,
-    )
+    det_model = _load_whisperx_asr_model(device, compute_type)
     det_result = det_model.transcribe(audio, batch_size=1)
-    detected = det_result.get("language", "en")
+    detected = _normalize_source_language(det_result.get("language")) or "en"
     del det_model
-    gc.collect()
-    if torch is not None:
-        torch.cuda.empty_cache()
+    _release_model_memory()
     print(f"  → Detected source language: {detected}")
     return detected
+
+
+def _transcribe_source_segments(
+    proxy_segments: List[Dict[str, Any]],
+    audio: np.ndarray,
+    source_language: str,
+    device: str,
+    compute_type: str,
+) -> None:
+    """Fill source_text by retranscribing English-proxy speaker windows."""
+    if not proxy_segments:
+        return
+
+    source_model = _load_whisperx_asr_model(
+        device,
+        compute_type,
+        language=source_language,
+    )
+
+    total = len(proxy_segments)
+    audio_duration = len(audio) / float(SAMPLE_RATE)
+    pad = max(0.0, WHISPERX_SEGMENT_PADDING_SECONDS)
+    min_segment_seconds = max(0.0, WHISPERX_MIN_SEGMENT_SECONDS)
+
+    try:
+        for idx, seg in enumerate(proxy_segments):
+            seg_start = float(seg.get("start", 0.0) or 0.0)
+            seg_end = float(seg.get("end", 0.0) or 0.0)
+            duration = max(0.0, seg_end - seg_start)
+
+            if duration < min_segment_seconds:
+                seg["source_text"] = ""
+                print(
+                    f"  [{idx+1}/{total}] Skipped "
+                    f"(too short: {duration:.2f}s)"
+                )
+                continue
+
+            clip_start = max(0.0, seg_start - pad)
+            clip_end = min(audio_duration, seg_end + pad)
+            f1 = int(clip_start * SAMPLE_RATE)
+            f2 = int(clip_end * SAMPLE_RATE)
+            clip = audio[f1:f2]
+
+            clip_result = source_model.transcribe(clip, batch_size=1)
+            source_text = " ".join(
+                s.get("text", "").strip()
+                for s in clip_result.get("segments", [])
+                if s.get("text", "").strip()
+            ).strip()
+            seg["source_text"] = source_text
+
+            print(
+                f"  [{idx+1}/{total}] {seg_start:.1f}s–{seg_end:.1f}s "
+                f"speaker={seg.get('speaker', '?')} → "
+                f"{source_text[:60]}{'…' if len(source_text) > 60 else ''}"
+            )
+    finally:
+        del source_model
+        _release_model_memory()
 
 
 def _run_whisperx_pipeline_sync(
@@ -416,7 +689,10 @@ def _run_whisperx_pipeline_sync(
 
     device = WHISPERX_DEVICE
     compute_type = WHISPERX_COMPUTE_TYPE
-    batch_size = WHISPERX_BATCH_SIZE
+    batch_size = max(1, WHISPERX_BATCH_SIZE)
+    translation_batch_size = max(1, int(translation_batch_size or 1))
+    source_language = _normalize_source_language(source_language)
+    llm_model = translation_llm_model or WHISPERX_TRANSLATION_LLM
 
     # Cache check
     audio_hash = _compute_audio_hash(audio_bytes)
@@ -425,6 +701,7 @@ def _run_whisperx_pipeline_sync(
         source_language=source_language,
         dest_language=dest_language,
         enable_translation=enable_translation,
+        translation_llm_model=llm_model,
     )
     cache_info: Dict[str, Any] = {
         "audio_md5": audio_hash,
@@ -443,6 +720,8 @@ def _run_whisperx_pipeline_sync(
                 _whisperx_cache_path(cache_key)
             )
             cache_info["created_at"] = cached.get("created_at")
+            cache_info["source_language"] = cached.get("source_language")
+            cache_info["translation_llm_model"] = cached.get("translation_llm_model")
             print(
                 f"♻️ WhisperX cache hit for audio md5={audio_hash}"
             )
@@ -467,55 +746,68 @@ def _run_whisperx_pipeline_sync(
             pass
 
     # ===================================================================
-    # PASS A: English Proxy — Segmentation Scaffold
+    # PASS A: English proxy — segmentation scaffold
     # ===================================================================
     print("=" * 60)
     print("PASS A [WhisperX]: English proxy for timestamps & speaker segmentation")
     print("=" * 60)
 
     print("Loading Whisper model (English proxy)...")
-    model = whisperx.load_model(
-        WHISPERX_MODEL_SIZE, device, compute_type=compute_type, language="en",
-        download_root=WHISPERX_ASR_DOWNLOAD_ROOT,
+    model = _load_whisperx_asr_model(
+        device,
+        compute_type,
+        language="en",
     )
     proxy_result = model.transcribe(audio, batch_size=batch_size)
+    proxy_result["language"] = "en"
     del model
-    gc.collect()
-    if torch is not None:
-        torch.cuda.empty_cache()
+    _release_model_memory()
 
     print("Aligning (English)...")
-    model_a, metadata = whisperx.load_align_model(
-        language_code=proxy_result["language"], device=device,
-        model_dir=WHISPERX_ALIGN_MODEL_DIR,
-    )
-    proxy_result = whisperx.align(
-        proxy_result["segments"],
-        model_a,
-        metadata,
-        audio,
-        device,
-        return_char_alignments=False,
-    )
-    del model_a
-    gc.collect()
-    if torch is not None:
-        torch.cuda.empty_cache()
+    model_a = None
+    try:
+        model_a, metadata = whisperx.load_align_model(
+            language_code="en",
+            device=device,
+            model_dir=WHISPERX_ALIGN_MODEL_DIR,
+        )
+        proxy_result = whisperx.align(
+            proxy_result["segments"],
+            model_a,
+            metadata,
+            audio,
+            device,
+            return_char_alignments=False,
+        )
+    except Exception as exc:
+        print(f"  Warning: English alignment failed: {exc}")
+        print("  Continuing with unaligned English proxy timestamps.")
+    finally:
+        if model_a is not None:
+            del model_a
+        _release_model_memory()
 
     print("Diarizing...")
-    diarize_model = DiarizationPipeline(
-        token=hf_token, device=device, cache_dir=WHISPERX_PYANNOTE_CACHE,
-    )
-    diarize_segments = diarize_model(audio)
-    proxy_result = whisperx.assign_word_speakers(diarize_segments, proxy_result)
-    del diarize_model
-    gc.collect()
-    if torch is not None:
-        torch.cuda.empty_cache()
+    diarize_model = None
+    try:
+        diarize_model = DiarizationPipeline(
+            token=hf_token,
+            device=device,
+            cache_dir=WHISPERX_PYANNOTE_CACHE,
+        )
+        diarize_segments = diarize_model(audio)
+        proxy_result = whisperx.assign_word_speakers(diarize_segments, proxy_result)
+    except Exception as exc:
+        print(f"  Warning: diarization failed: {exc}")
+        print("  Continuing with a single fallback speaker.")
+    finally:
+        if diarize_model is not None:
+            del diarize_model
+        _release_model_memory()
 
     print(
-        f"  → Pass A produced {len(proxy_result['segments'])} "
-        f"speaker-segmented segments."
+        f"  → Pass A produced {len(proxy_result.get('segments', []))} "
+        f"speaker-segmented proxy segments."
     )
 
     # ===================================================================
@@ -525,65 +817,33 @@ def _run_whisperx_pipeline_sync(
         source_language = _detect_source_language(audio, device, compute_type)
 
     # ===================================================================
-    # PASS B: Source-Language Re-transcription
+    # PASS B: Source-language re-transcription
     # ===================================================================
     if source_language == "en":
         print("=" * 60)
         print("PASS B [WhisperX]: Skipped (source language is English)")
         print("=" * 60)
-        for seg in proxy_result["segments"]:
+        for seg in proxy_result.get("segments", []):
             seg["source_text"] = seg.get("text", "").strip()
     else:
         print("=" * 60)
         print(
-            f"PASS B [WhisperX]: Re-transcribe each segment in "
-            f"source language ({source_language})"
+            f"PASS B [WhisperX]: Re-transcribe English-proxy segments "
+            f"in source language ({source_language})"
         )
         print("=" * 60)
-
-        source_model = whisperx.load_model(
-            WHISPERX_MODEL_SIZE,
+        _transcribe_source_segments(
+            proxy_result.get("segments", []),
+            audio,
+            source_language,
             device,
-            compute_type=compute_type,
-            language=source_language,
-            download_root=WHISPERX_ASR_DOWNLOAD_ROOT,
+            compute_type,
         )
-
-        total = len(proxy_result["segments"])
-        for idx, seg in enumerate(proxy_result["segments"]):
-            seg_start = seg.get("start", 0.0)
-            seg_end = seg.get("end", 0.0)
-
-            f1 = int(seg_start * SAMPLE_RATE)
-            f2 = int(seg_end * SAMPLE_RATE)
-            clip = audio[f1:f2]
-
-            if len(clip) < int(0.3 * SAMPLE_RATE):
-                seg["source_text"] = ""
-                print(
-                    f"  [{idx+1}/{total}] Skipped "
-                    f"(too short: {seg_end - seg_start:.2f}s)"
-                )
-                continue
-
-            clip_result = source_model.transcribe(clip, batch_size=1)
-            source_text = "".join(
-                s.get("text", "").strip()
-                for s in clip_result.get("segments", [])
-            )
-            seg["source_text"] = source_text
-
-            print(
-                f"  [{idx+1}/{total}] {seg_start:.1f}s–{seg_end:.1f}s "
-                f"speaker={seg.get('speaker', '?')} → "
-                f"{source_text[:60]}{'…' if len(source_text) > 60 else ''}"
-            )
-
-        del source_model
-        gc.collect()
-        if torch is not None:
-            torch.cuda.empty_cache()
         print("  → Pass B complete.")
+
+    cache_info["source_language"] = source_language
+    if enable_translation:
+        cache_info["translation_llm_model"] = llm_model
 
     # ===================================================================
     # Convert to target schema
@@ -598,7 +858,6 @@ def _run_whisperx_pipeline_sync(
         print(f"PASS C [WhisperX]: LLM translation → {dest_language}")
         print("=" * 60)
 
-        llm_model = translation_llm_model or WHISPERX_TRANSLATION_LLM
         if LitaiLLM is None:
             print(
                 "⚠️ litai package not installed — skipping LLM translation. "
@@ -628,19 +887,26 @@ def _run_whisperx_pipeline_sync(
                     f"{min(i + translation_batch_size, total_segments)})..."
                 )
 
-                translated_texts = _translate_batch_with_retry(
+                translated_texts = _translate_texts_adaptively(
                     llm=llm,
                     source_texts=source_texts,
                     dest_language=dest_language,
                     batch_label=batch_label,
-                    max_retries=10,
+                    source_language=source_language,
                 )
 
-                if translated_texts:
+                if translated_texts and len(translated_texts) == len(source_texts):
                     non_empty = [seg for seg in chunk if seg["source_text"]]
                     for seg_ref, trans in zip(non_empty, translated_texts):
                         seg_ref["translated_text"] = trans
-                    print(f"  [{batch_label}] ✅ Batch translated successfully.")
+                    blank_count = sum(1 for item in translated_texts if not item.strip())
+                    if blank_count:
+                        print(
+                            f"  [{batch_label}] ⚠️ Translated with "
+                            f"{blank_count} empty fallback item(s)."
+                        )
+                    else:
+                        print(f"  [{batch_label}] ✅ Batch translated successfully.")
                 else:
                     print(f"  [{batch_label}] ❌ Batch failed after retries.")
 
@@ -660,6 +926,12 @@ def _run_whisperx_pipeline_sync(
         "dest_language": dest_language,
         "enable_translation": enable_translation,
         "model": WHISPERX_MODEL_SIZE,
+        "asr_beam_size": WHISPERX_ASR_BEAM_SIZE,
+        "asr_best_of": WHISPERX_ASR_BEST_OF,
+        "condition_on_previous_text": WHISPERX_CONDITION_ON_PREVIOUS_TEXT,
+        "segment_padding_seconds": WHISPERX_SEGMENT_PADDING_SECONDS,
+        "min_segment_seconds": WHISPERX_MIN_SEGMENT_SECONDS,
+        "translation_llm_model": llm_model if enable_translation else None,
         "segments": segments,
         "speaker_profiles": speaker_profiles,
         "raw_text": raw_text,
