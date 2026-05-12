@@ -79,7 +79,7 @@ except ImportError:
 
 
 # FastAPI and web interface
-from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks, HTTPException, Depends, Query
+from fastapi import FastAPI, File, UploadFile, Form, Request, HTTPException, Depends, Query
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, validator
 from urllib.parse import quote
@@ -130,6 +130,29 @@ def _env_int(name: str, default: int, *, min_value: int = 1, max_value: Optional
         return max_value
     return parsed
 
+
+@dataclass(frozen=True)
+class AppSettings:
+    verbose: bool = False
+    port: int = 8000
+    host: str = "0.0.0.0"
+    model_dir: str = "checkpoints"
+    is_fp16: bool = False
+    use_torch_compile: bool = False
+    gpu_memory_utilization: float = 0.25
+
+    @classmethod
+    def from_namespace(cls, args: argparse.Namespace) -> "AppSettings":
+        return cls(
+            verbose=bool(args.verbose),
+            port=int(args.port),
+            host=str(args.host),
+            model_dir=str(args.model_dir),
+            is_fp16=bool(args.is_fp16),
+            use_torch_compile=bool(args.use_torch_compile),
+            gpu_memory_utilization=float(args.gpu_memory_utilization),
+        )
+
 # Global thread executor for blocking operations
 # Use CPU count for parallel audio processing, but cap at 8 to avoid excessive context switching
 _executor_workers = min(8, max(4, (os.cpu_count() or 4)))
@@ -161,6 +184,22 @@ DEFAULT_AUDIO_SEPARATOR_MODEL = "balance"
 # Global audio-separator instance (initialized lazily and reused)
 _audio_separator: Optional[Any] = None
 _audio_separator_model_name: Optional[str] = None
+
+AUDIO_MEDIA_TYPES = {
+    "mp3": "audio/mpeg",
+    "opus": "audio/opus",
+    "aac": "audio/aac",
+    "flac": "audio/flac",
+    "wav": "audio/wav",
+    "pcm": "audio/pcm",
+    "ogg": "audio/ogg",
+    "webm": "audio/webm",
+}
+
+
+def _audio_media_type(audio_format: Optional[str]) -> str:
+    normalized = (audio_format or "").strip().lower()
+    return AUDIO_MEDIA_TYPES.get(normalized, f"audio/{normalized or 'mpeg'}")
 
 
 @dataclass
@@ -405,6 +444,35 @@ class ClearVoiceParallelConfig:
             "parallel_chunk_seconds": int(self.chunk_seconds),
             "parallel_max_workers": int(self.max_workers),
         }
+
+
+@dataclass
+class AudioPreprocessOptions:
+    apply_enhancement: bool
+    apply_super_resolution: bool
+    enhancement_model_name: str
+    audio_separator_enabled: bool
+    audio_separator_model: str
+    parallel_config: ClearVoiceParallelConfig
+
+    def to_clearvoice_settings(self) -> Dict[str, Any]:
+        settings: Dict[str, Any] = {
+            "enhancement": self.apply_enhancement,
+            "enhancement_model": self.enhancement_model_name,
+            "super_resolution": self.apply_super_resolution,
+            "audio_separator_enabled": self.audio_separator_enabled,
+            "audio_separator_model": self.audio_separator_model,
+        }
+        if self.parallel_config.enabled:
+            settings.update(self.parallel_config.to_metadata())
+        return settings
+
+
+@dataclass
+class VolumeOptions:
+    generated: float
+    backing: float
+    silence: float
 
 
 @dataclass
@@ -3019,6 +3087,8 @@ except SystemExit:
         gpu_memory_utilization=0.25
     )
 
+SETTINGS = AppSettings.from_namespace(cmd_args)
+
 # Create directories
 APP_DIR = Path(__file__).resolve().parent
 _OUTPUT_SUBDIRS = (
@@ -3068,16 +3138,49 @@ os.makedirs(SPLIT_AUDIO_CACHE_DIR, exist_ok=True)
 def _guess_media_type_from_extension(filename: str) -> str:
     ext = os.path.splitext(filename)[1].lower().lstrip(".")
     mapping = {
-        "mp3": "audio/mpeg",
-        "wav": "audio/wav",
-        "flac": "audio/flac",
-        "aac": "audio/aac",
-        "opus": "audio/opus",
-        "ogg": "audio/ogg",
-        "webm": "audio/webm",
+        **AUDIO_MEDIA_TYPES,
         "srt": "application/x-subrip",
     }
     return mapping.get(ext, "application/octet-stream")
+
+
+def _status_error(message: str, status_code: int = 400, **extra: Any) -> JSONResponse:
+    payload = {"status": "error", "message": message}
+    payload.update(extra)
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+def _success_error(message: str, status_code: int = 500, **extra: Any) -> JSONResponse:
+    payload = {"success": False, "error": message}
+    payload.update(extra)
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+def _request_has_json_body(request: Request) -> bool:
+    return "application/json" in request.headers.get("content-type", "").lower()
+
+
+def _json_event_bytes(event: Dict[str, Any]) -> bytes:
+    return (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _json_stream_response(iterator: Any) -> StreamingResponse:
+    return StreamingResponse(iterator, media_type="application/json")
+
+
+async def _read_optional_json_payload(
+    request: Request,
+    should_read: bool,
+) -> Tuple[Optional[Dict[str, Any]], Optional[JSONResponse]]:
+    if not should_read:
+        return None, None
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        return None, _status_error(f"Invalid JSON payload: {str(exc)}")
+    if not isinstance(payload, dict):
+        return None, _status_error("Invalid JSON payload: expected a JSON object.")
+    return payload, None
 
 # Async wrapper functions for blocking operations
 async def async_write_file(file_path: str, data: bytes) -> None:
@@ -4822,6 +4925,75 @@ async def convert_audio_to_format(wav_data, sample_rate, output_format="mp3", bi
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, _convert_audio_to_format_sync, wav_data, sample_rate, output_format, bitrate)
 
+
+async def _read_generated_audio_bytes(
+    result_path: str,
+    response_format: str,
+    bitrate: str = "128k",
+) -> bytes:
+    """Read a generated WAV file and encode it for an API audio response."""
+    if response_format != "wav":
+        audio_data, sample_rate = await async_audio_read(result_path)
+        audio_bytes, _, _ = await convert_audio_to_format(
+            audio_data,
+            sample_rate,
+            response_format,
+            bitrate,
+        )
+        return audio_bytes
+    return await async_read_file(result_path)
+
+
+async def _generated_audio_attachment_response(
+    result_path: str,
+    response_format: str,
+    filename_stem: str = "speech",
+) -> Response:
+    try:
+        audio_bytes = await _read_generated_audio_bytes(result_path, response_format)
+    finally:
+        await async_remove_file(result_path)
+
+    return Response(
+        content=audio_bytes,
+        media_type=_audio_media_type(response_format),
+        headers={
+            "Content-Disposition": f"attachment; filename={filename_stem}.{response_format}",
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
+def _encode_streaming_audio_chunk(wav_cpu: Any, response_format: str) -> bytes:
+    wav_data = wav_cpu.numpy().astype(np.int16)
+    with BytesIO() as wav_buffer:
+        sf.write(wav_buffer, wav_data.T, 22050, format="WAV")
+        wav_bytes = wav_buffer.getvalue()
+
+    if response_format == "wav":
+        return wav_bytes
+
+    audio_segment = AudioSegment.from_wav(BytesIO(wav_bytes))
+    with BytesIO() as audio_buffer:
+        audio_segment.export(
+            audio_buffer,
+            format=response_format,
+            bitrate="128k" if response_format == "mp3" else None,
+        )
+        return audio_buffer.getvalue()
+
+
+def _streaming_audio_frame(chunk_idx: int, audio_bytes: bytes, is_last: bool) -> bytes:
+    state = "LAST" if is_last else "MORE"
+    header = f"CHUNK:{chunk_idx}:{len(audio_bytes)}:{state}\n".encode("utf-8")
+    return header + audio_bytes
+
+
+STREAMING_RESPONSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+}
+
 def _convert_audio_to_format_sync(wav_data, sample_rate, output_format="mp3", bitrate="128k"):
     """Synchronous audio format conversion"""
     try:
@@ -5444,6 +5616,70 @@ def _parse_srt_input_to_segments(
     return None
 
 
+async def _read_srt_upload_text(
+    upload_file: Optional[UploadFile],
+    *,
+    label: str,
+    log_prefix: str,
+) -> Optional[str]:
+    if upload_file is None:
+        return None
+
+    print(f"[{log_prefix}] Reading {label} SRT: {upload_file.filename}")
+    srt_bytes = await upload_file.read()
+    if not srt_bytes:
+        return None
+
+    try:
+        content = srt_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        content = srt_bytes.decode("latin-1")
+
+    print(f"[{log_prefix}] {label.capitalize()} SRT loaded: {len(content)} bytes")
+    return content
+
+
+async def _load_srt_segments_override(
+    original_srt_file: Optional[UploadFile],
+    translated_srt_file: Optional[UploadFile],
+    *,
+    log_prefix: str,
+) -> Tuple[Optional[str], Optional[JSONResponse]]:
+    if original_srt_file is None and translated_srt_file is None:
+        return None, None
+
+    print(f"[{log_prefix}] Processing SRT subtitle files...")
+    srt_parse_start = time.perf_counter()
+
+    try:
+        original_srt_content = await _read_srt_upload_text(
+            original_srt_file,
+            label="original",
+            log_prefix=log_prefix,
+        )
+        translated_srt_content = await _read_srt_upload_text(
+            translated_srt_file,
+            label="translated",
+            log_prefix=log_prefix,
+        )
+
+        print(f"[{log_prefix}] Parsing SRT files into segments...")
+        srt_result = _parse_srt_input_to_segments(original_srt_content, translated_srt_content)
+        if srt_result is None:
+            return None, None
+
+        srt_segments, srt_speaker_profiles = srt_result
+        srt_parse_elapsed = (time.perf_counter() - srt_parse_start) * 1000
+        print(f"[{log_prefix}] SRT parsing complete: {len(srt_segments)} segments in {srt_parse_elapsed:.1f}ms")
+
+        return json.dumps({
+            "speakers": srt_speaker_profiles,
+            "segments": srt_segments,
+        }, ensure_ascii=False), None
+    except Exception as srt_exc:
+        return None, _status_error(f"Failed to parse SRT subtitle files: {str(srt_exc)}")
+
+
 def _build_srt_entries_from_segments(
     segments: Optional[List[Dict[str, Any]]],
     text_kind: Literal["translated", "source"] = "translated",
@@ -5702,6 +5938,50 @@ def _coerce_clearvoice_parallel_config(
     )
 
 
+def _resolve_audio_preprocess_options(
+    *,
+    enhance_voice: Any,
+    super_resolution_voice: Any,
+    enhancement_model: Optional[str],
+    audio_separator_enabled: Any = False,
+    audio_separator_model: Optional[str] = None,
+    clearvoice_parallel_enabled: Any = False,
+    clearvoice_parallel_chunk_seconds: Any = None,
+    clearvoice_parallel_max_workers: Any = None,
+    force_enhancement_for_super_resolution: bool = False,
+) -> AudioPreprocessOptions:
+    apply_enhancement = _coerce_to_bool(enhance_voice)
+    apply_super_resolution = _coerce_to_bool(super_resolution_voice)
+    if force_enhancement_for_super_resolution and apply_super_resolution:
+        apply_enhancement = True
+
+    parallel_config = _coerce_clearvoice_parallel_config(
+        clearvoice_parallel_enabled,
+        clearvoice_parallel_chunk_seconds,
+        clearvoice_parallel_max_workers,
+    )
+    if not (apply_enhancement or apply_super_resolution):
+        parallel_config.enabled = False
+
+    audio_separator_enabled_flag = _coerce_to_bool(audio_separator_enabled or False)
+    audio_separator_model_key = (audio_separator_model or "").strip().lower()
+    if audio_separator_model_key not in AUDIO_SEPARATOR_MODELS:
+        audio_separator_model_key = DEFAULT_AUDIO_SEPARATOR_MODEL
+
+    enhancement_model_name = (
+        enhancement_model if enhancement_model in AVAILABLE_ENHANCEMENT_MODELS else DEFAULT_ENHANCEMENT_MODEL
+    )
+
+    return AudioPreprocessOptions(
+        apply_enhancement=apply_enhancement,
+        apply_super_resolution=apply_super_resolution,
+        enhancement_model_name=enhancement_model_name,
+        audio_separator_enabled=audio_separator_enabled_flag,
+        audio_separator_model=audio_separator_model_key,
+        parallel_config=parallel_config,
+    )
+
+
 def _parallel_config_from_settings(settings: Optional[Dict[str, Any]]) -> Optional[ClearVoiceParallelConfig]:
     if not settings:
         return None
@@ -5786,6 +6066,22 @@ def _coerce_volume_percent(
     if parsed > MAX_GENERATED_VOLUME_PERCENT:
         return MAX_GENERATED_VOLUME_PERCENT
     return parsed
+
+
+def _resolve_volume_options(
+    generated_value: Any,
+    backing_value: Any,
+    silence_value: Any,
+    *,
+    generated_default: float = DEFAULT_GENERATED_VOLUME_PERCENT,
+    backing_default: float = DEFAULT_GENERATED_VOLUME_PERCENT,
+    silence_default: float = DEFAULT_SILENCE_VOLUME_PERCENT,
+) -> VolumeOptions:
+    return VolumeOptions(
+        generated=_coerce_volume_percent(generated_value, generated_default),
+        backing=_coerce_volume_percent(backing_value, backing_default),
+        silence=_coerce_volume_percent(silence_value, silence_default),
+    )
 
 
 def _coerce_emotion_weight(value: Any, default: float = DEFAULT_EMOTION_WEIGHT) -> float:
@@ -6289,6 +6585,40 @@ async def _get_translate_session(session_id: str) -> Optional[TranslateSessionDa
         if session:
             session.created_at = time.time()
         return session
+
+
+async def _resolve_reuse_translate_session(
+    reuse_session_id: Optional[str],
+) -> Tuple[Optional[str], Optional[TranslateSessionData], Optional[JSONResponse]]:
+    normalized_session_id = (reuse_session_id or "").strip()
+    if not normalized_session_id:
+        return "", None, None
+
+    session = await _get_translate_session(normalized_session_id)
+    if session is None:
+        return normalized_session_id, None, _status_error(
+            "Reuse session not found or expired. Please re-upload the audio.",
+            status_code=404,
+        )
+    return normalized_session_id, session, None
+
+
+def _normalize_session_ids(raw_session_ids: Optional[List[Any]]) -> List[str]:
+    return [sid.strip() for sid in (raw_session_ids or []) if isinstance(sid, str) and sid.strip()]
+
+
+async def _resolve_chunk_sessions_by_ids(
+    session_ids: List[str],
+) -> Tuple[List[TranslateSessionData], Optional[JSONResponse]]:
+    sessions: List[TranslateSessionData] = []
+    for sid in session_ids:
+        session = await _get_translate_session(sid)
+        if session is None:
+            return [], _status_error(f"Chunk session '{sid}' not found or expired.", status_code=404)
+        if session.chunk_parent_id is None:
+            return [], _status_error(f"Session '{sid}' is not a chunk session.")
+        sessions.append(session)
+    return sessions, None
 
 
 async def _update_translate_session_segments(
@@ -7091,7 +7421,7 @@ async def _synthesize_translated_audio(
                     interval_silence=0,
                     speech_length=generation_target_ms,
                     diffusion_steps=10,
-                    verbose=cmd_args.verbose,
+                    verbose=SETTINGS.verbose,
                     speaker_preset=preset_name,
                     emo_audio_prompt=emo_prompt_value,
                     emo_alpha=resolved_emotion_weight,
@@ -7493,16 +7823,7 @@ async def _synthesize_translated_audio(
         print(f"[synthesize] Export complete in {export_elapsed:.1f}ms ({len(audio_bytes) / 1024 / 1024:.1f} MB)")
         final_duration_ms = len(combined_audio)
 
-    media_type_map = {
-        "mp3": "audio/mpeg",
-        "wav": "audio/wav",
-        "aac": "audio/aac",
-        "flac": "audio/flac",
-        "opus": "audio/opus",
-        "ogg": "audio/ogg",
-        "webm": "audio/webm",
-    }
-    media_type = media_type_map.get(audio_format, f"audio/{audio_format}")
+    media_type = _audio_media_type(audio_format)
 
     metadata = {
         "dest_language": dest_language,
@@ -7682,8 +8003,8 @@ class TTSManager:
                 print("🚀 Initializing IndexTTS2 vLLM v2...")
                 
                 # Check model directory
-                if not os.path.exists(cmd_args.model_dir):
-                    raise FileNotFoundError(f"Model directory {cmd_args.model_dir} does not exist")
+                if not os.path.exists(SETTINGS.model_dir):
+                    raise FileNotFoundError(f"Model directory {SETTINGS.model_dir} does not exist")
                 
                 # Check required files
                 required_files = [
@@ -7695,16 +8016,16 @@ class TTSManager:
                 ]
                 
                 for file in required_files:
-                    file_path = os.path.join(cmd_args.model_dir, file)
+                    file_path = os.path.join(SETTINGS.model_dir, file)
                     if not os.path.exists(file_path):
                         raise FileNotFoundError(f"Required file {file_path} does not exist")
                 
                 # Initialize IndexTTS2
                 self.tts = IndexTTS2(
-                    model_dir=cmd_args.model_dir,
-                    is_fp16=cmd_args.is_fp16,
-                    use_torch_compile=cmd_args.use_torch_compile,
-                    gpu_memory_utilization=cmd_args.gpu_memory_utilization
+                    model_dir=SETTINGS.model_dir,
+                    is_fp16=SETTINGS.is_fp16,
+                    use_torch_compile=SETTINGS.use_torch_compile,
+                    gpu_memory_utilization=SETTINGS.gpu_memory_utilization
                 )
                 
                 # Initialize speaker preset manager
@@ -8416,7 +8737,7 @@ async def warmup_model():
         print(f"⚠️ Warmup failed (non-critical): {e}")
         traceback.print_exc()
 
-# FastAPI lifespan
+# FastAPI application
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown"""
@@ -8426,7 +8747,7 @@ async def lifespan(app: FastAPI):
     
     # Only run warmup inference when torch_compile is enabled
     # torch_compile benefits from warmup to compile optimized CUDA graphs
-    if cmd_args.use_torch_compile:
+    if SETTINGS.use_torch_compile:
         print("🔥 Running warmup (--use_torch_compile enabled)...")
         await warmup_model()
     else:
@@ -8438,35 +8759,23 @@ async def lifespan(app: FastAPI):
     # Shutdown the thread executor
     executor.shutdown(wait=True)
 
-# Create FastAPI app
-app = FastAPI(
-    title="IndexTTS vLLM v2 FastAPI WebUI",
-    description="Ultra-fast TTS with vLLM backend, speaker presets, and advanced translate/edit mode with Gemini integration",
-    lifespan=lifespan
-)
+def create_app() -> FastAPI:
+    return FastAPI(
+        title="IndexTTS vLLM v2 FastAPI WebUI",
+        description="Ultra-fast TTS with vLLM backend, speaker presets, and advanced translate/edit mode with Gemini integration",
+        lifespan=lifespan,
+    )
 
-# Web Interface - HTML file paths for hot reload support
-_HTML_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
-_HTML_NEW_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index_new.html")
+
+app = create_app()
+
+# Web Interface - HTML file path for hot reload support
+_HTML_UI_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index_new.html")
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
     try:
-        with open(_HTML_NEW_FILE_PATH, "r", encoding="utf-8") as f:
-            html_content = f.read()
-        # Inject dynamic configuration values
-        html_content = html_content.replace("{{CHUNK_SPLIT_MIN_SILENCE_MS}}", str(CHUNK_SPLIT_MIN_SILENCE_MS))
-        return html_content
-    except FileNotFoundError:
-        return HTMLResponse(
-            content="<h1>Error: index.html not found</h1><p>Please ensure index.html exists in the same directory as fastapi_webui_v2.py</p>",
-            status_code=500
-        )
-
-@app.get("/old", response_class=HTMLResponse)
-async def home_old():
-    try:
-        with open(_HTML_FILE_PATH, "r", encoding="utf-8") as f:
+        with open(_HTML_UI_FILE_PATH, "r", encoding="utf-8") as f:
             html_content = f.read()
         # Inject dynamic configuration values
         html_content = html_content.replace("{{CHUNK_SPLIT_MIN_SILENCE_MS}}", str(CHUNK_SPLIT_MIN_SILENCE_MS))
@@ -8476,9 +8785,6 @@ async def home_old():
             content="<h1>Error: index_new.html not found</h1><p>Please ensure index_new.html exists in the same directory as fastapi_webui_v2.py</p>",
             status_code=500
         )
-
-# Health check endpoint
-# Health check removed - use /server_info endpoint instead
 
 # Utility endpoints
 @app.post("/api/estimate_duration")
@@ -8618,19 +8924,14 @@ async def api_translate_split_audio(
         clearvoice_parallel_enabled_value = clearvoice_parallel_enabled
         clearvoice_parallel_chunk_seconds_value = clearvoice_parallel_chunk_seconds
         clearvoice_parallel_max_workers_value = clearvoice_parallel_max_workers
-        content_type = request.headers.get("content-type", "")
-        if (
+        payload, payload_error = await _read_optional_json_payload(
+            request,
             audio_file is None
             and (audio is None or not audio.strip())
-            and "application/json" in content_type.lower()
-        ):
-            try:
-                payload = await request.json()
-            except Exception as exc:
-                return JSONResponse(
-                    status_code=400,
-                    content={"status": "error", "message": f"Invalid JSON payload: {str(exc)}"},
-                )
+            and _request_has_json_body(request),
+        )
+        if payload_error is not None:
+            return payload_error
 
         if payload is not None:
             dest_language = payload.get("dest_language", dest_language)
@@ -8656,30 +8957,27 @@ async def api_translate_split_audio(
                 "clearvoice_parallel_max_workers", clearvoice_parallel_max_workers_value
             )
 
-        enhancement_model_name_value = enhancement_model if enhancement_model in AVAILABLE_ENHANCEMENT_MODELS else DEFAULT_ENHANCEMENT_MODEL
-        # Audio-separator settings for split_audio
-        audio_separator_enabled_flag = _coerce_to_bool(audio_separator_enabled_value or False)
-        audio_separator_model_key = (audio_separator_model_value or "").strip().lower()
-        if audio_separator_model_key not in AUDIO_SEPARATOR_MODELS:
-            audio_separator_model_key = DEFAULT_AUDIO_SEPARATOR_MODEL
+        preprocess_options = _resolve_audio_preprocess_options(
+            enhance_voice=enhance_voice_value,
+            super_resolution_voice=super_resolution_voice,
+            enhancement_model=enhancement_model,
+            audio_separator_enabled=audio_separator_enabled_value,
+            audio_separator_model=audio_separator_model_value,
+            clearvoice_parallel_enabled=clearvoice_parallel_enabled_value,
+            clearvoice_parallel_chunk_seconds=clearvoice_parallel_chunk_seconds_value,
+            clearvoice_parallel_max_workers=clearvoice_parallel_max_workers_value,
+        )
+        enhancement_model_name_value = preprocess_options.enhancement_model_name
+        audio_separator_enabled_flag = preprocess_options.audio_separator_enabled
+        audio_separator_model_key = preprocess_options.audio_separator_model
         audio_reference_value = (audio or "").strip()
         if audio_file is None and not audio_reference_value:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "status": "error",
-                    "message": "Source audio is required for chunk splitting.",
-                },
-            )
+            return _status_error("Source audio is required for chunk splitting.")
 
         dest_language_value = (dest_language or "").strip() or "unspecified"
-        apply_super_resolution = _coerce_to_bool(super_resolution_voice)
-        apply_enhancement = _coerce_to_bool(enhance_voice_value)
-        parallel_config = _coerce_clearvoice_parallel_config(
-            clearvoice_parallel_enabled_value,
-            clearvoice_parallel_chunk_seconds_value,
-            clearvoice_parallel_max_workers_value,
-        )
+        apply_super_resolution = preprocess_options.apply_super_resolution
+        apply_enhancement = preprocess_options.apply_enhancement
+        parallel_config = preprocess_options.parallel_config
         min_minutes = _coerce_positive_float(
             chunk_min_minutes,
             CHUNK_SPLIT_DEFAULT_MIN_MINUTES,
@@ -8719,19 +9017,14 @@ async def api_translate_split_audio(
         base_filename_value = base_filename
 
         if audio_file is not None:
-            try:
-                audio_io = await load_audio_bytes_from_request(audio_file, None)
-            except HTTPException as exc:
-                return JSONResponse(
-                    status_code=exc.status_code,
-                    content={"status": "error", "message": exc.detail},
-                )
-            preloaded_audio_bytes = audio_io.read()
-            if not preloaded_audio_bytes:
-                return JSONResponse(
-                    status_code=400,
-                    content={"status": "error", "message": "Uploaded audio file is empty."},
-                )
+            preloaded_audio_bytes, audio_error = await _read_audio_request_bytes(
+                audio_file,
+                None,
+                missing_message="Source audio is required for chunk splitting.",
+                empty_message="Uploaded audio file is empty.",
+            )
+            if audio_error is not None:
+                return audio_error
             uploaded_filename = audio_file.filename
             audio_mime_type_value = audio_file.content_type or audio_mime_type_value
             audio_file_for_pipeline = None
@@ -9441,9 +9734,9 @@ async def api_translate_split_audio(
                 event = await queue.get()
                 if event is None:
                     break
-                yield (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+                yield _json_event_bytes(event)
 
-        return StreamingResponse(split_stream(), media_type="application/json")
+        return _json_stream_response(split_stream())
 
     except TranslateWorkflowHttpError as http_error:
         return JSONResponse(status_code=http_error.status_code, content=http_error.content)
@@ -9460,43 +9753,22 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
     """API: Merge multiple chunk sessions back into a single audio file."""
     try:
         merge_profiler = PerfLogger("merge:pending")
-        session_ids: List[str] = [
-            sid for sid in (payload.chunk_session_ids or []) if isinstance(sid, str) and sid.strip()
-        ]
+        session_ids = _normalize_session_ids(payload.chunk_session_ids)
         chunk_batch_id = (payload.chunk_batch_id or "").strip()
 
         sessions: List[TranslateSessionData] = []
         resolve_start = time.perf_counter()
         if session_ids:
-            for sid in session_ids:
-                session = await _get_translate_session(sid)
-                if session is None:
-                    return JSONResponse(
-                        status_code=404,
-                        content={"status": "error", "message": f"Chunk session '{sid}' not found or expired."},
-                    )
-                if session.chunk_parent_id is None:
-                    return JSONResponse(
-                        status_code=400,
-                        content={"status": "error", "message": f"Session '{sid}' is not a chunk session."},
-                    )
-                sessions.append(session)
+            sessions, session_error = await _resolve_chunk_sessions_by_ids(session_ids)
+            if session_error is not None:
+                return session_error
         elif chunk_batch_id:
             sessions = await _list_chunk_sessions(chunk_batch_id)
             if not sessions:
-                return JSONResponse(
-                    status_code=404,
-                    content={"status": "error", "message": "No chunk sessions found for this batch."},
-                )
+                return _status_error("No chunk sessions found for this batch.", status_code=404)
             sessions.sort(key=lambda s: (s.chunk_index or 0, s.chunk_start_ms or 0))
         else:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "status": "error",
-                    "message": "Provide chunk_session_ids (ordered list) or chunk_batch_id to merge.",
-                },
-            )
+            return _status_error("Provide chunk_session_ids (ordered list) or chunk_batch_id to merge.")
         merge_profiler.mark("resolve_chunk_sessions", resolve_start, extra=f"sessions={len(sessions)}")
         if not chunk_batch_id and sessions:
             chunk_batch_id = sessions[0].chunk_parent_id or ""
@@ -9812,45 +10084,25 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
         traceback.print_exc()
         if "merge_profiler" in locals():
             merge_profiler.summary()
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"Failed to merge chunks: {str(exc)}"},
-        )
+        return _status_error(f"Failed to merge chunks: {str(exc)}", status_code=500)
 
 
 @app.post("/api/translate_generate_chunks")
 async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
     """API: Generate translated audio for multiple chunk sessions in parallel."""
     try:
-        session_ids = [sid.strip() for sid in payload.chunk_session_ids if isinstance(sid, str) and sid.strip()]
+        session_ids = _normalize_session_ids(payload.chunk_session_ids)
         if not session_ids:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "Select at least one chunk session to generate."},
-            )
+            return _status_error("Select at least one chunk session to generate.")
 
-        sessions: List[TranslateSessionData] = []
-        for sid in session_ids:
-            session = await _get_translate_session(sid)
-            if session is None:
-                return JSONResponse(
-                    status_code=404,
-                    content={"status": "error", "message": f"Chunk session '{sid}' not found or expired."},
-                )
-            if session.chunk_parent_id is None:
-                return JSONResponse(
-                    status_code=400,
-                    content={"status": "error", "message": f"Session '{sid}' is not a chunk session."},
-                )
-            sessions.append(session)
+        sessions, session_error = await _resolve_chunk_sessions_by_ids(session_ids)
+        if session_error is not None:
+            return session_error
 
         config_template = sessions[0]
         dest_language_value = (payload.dest_language or config_template.dest_language or "").strip()
         if not dest_language_value:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "Destination language (dest_language) is required."},
-            )
+            return _status_error("Destination language (dest_language) is required.")
 
         response_format_value = (payload.response_format or config_template.response_format or TRANSLATE_DEFAULT_OUTPUT_FORMAT).lower()
         bitrate_value = payload.bitrate or config_template.bitrate or TRANSLATE_DEFAULT_BITRATE
@@ -9864,20 +10116,19 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
             if payload.preserve_silence_audio is not None
             else config_template.preserve_silence_audio
         )
-        generated_volume_percent_value = _coerce_volume_percent(
+        volume_options = _resolve_volume_options(
             payload.generated_volume_percent,
-            config_template.generated_volume_percent,
-        )
-        backing_volume_percent_value = _coerce_volume_percent(
             payload.backing_volume_percent,
-            config_template.backing_volume_percent,
-        )
-        silence_volume_percent_value = _coerce_volume_percent(
             payload.silence_volume_percent
             if payload.silence_volume_percent is not None
             else config_template.silence_volume_percent,
-            config_template.silence_volume_percent,
+            generated_default=config_template.generated_volume_percent,
+            backing_default=config_template.backing_volume_percent,
+            silence_default=config_template.silence_volume_percent,
         )
+        generated_volume_percent_value = volume_options.generated
+        backing_volume_percent_value = volume_options.backing
+        silence_volume_percent_value = volume_options.silence
         merge_backing_requested = _coerce_to_bool(
             payload.merge_backing_track
             if payload.merge_backing_track is not None
@@ -10042,17 +10293,14 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
                 event = await queue.get()
                 if event is None:
                     break
-                yield (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+                yield _json_event_bytes(event)
 
-        return StreamingResponse(chunk_generate_stream(), media_type="application/json")
+        return _json_stream_response(chunk_generate_stream())
     except TranslateWorkflowHttpError as http_error:
         return JSONResponse(status_code=http_error.status_code, content=http_error.content)
     except Exception as exc:
         traceback.print_exc()
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"Failed to generate chunk audios: {str(exc)}"},
-        )
+        return _status_error(f"Failed to generate chunk audios: {str(exc)}", status_code=500)
 
 
 @app.post("/api/translate_segments")
@@ -10136,20 +10384,15 @@ async def api_translate_segments(
         default_emotion_weight_value = default_emotion_weight
         transcription_pipeline_value = transcription_pipeline
 
-        content_type = request.headers.get("content-type", "")
-        if (
+        payload, payload_error = await _read_optional_json_payload(
+            request,
             dest_language is None
             and not audio_reference
             and audio_file is None
-            and "application/json" in content_type.lower()
-        ):
-            try:
-                payload = await request.json()
-            except Exception as exc:
-                return JSONResponse(
-                    status_code=400,
-                    content={"status": "error", "message": f"Invalid JSON payload: {str(exc)}"},
-                )
+            and _request_has_json_body(request),
+        )
+        if payload_error is not None:
+            return payload_error
 
         if payload is not None:
             dest_language_value = payload.get("dest_language", dest_language_value)
@@ -10208,81 +10451,39 @@ async def api_translate_segments(
             if payload.get("transcription_pipeline"):
                 transcription_pipeline_value = payload.get("transcription_pipeline")
 
-        # Handle SRT subtitle file uploads
-        # If SRT files are provided, parse and convert to segments_json format
-        srt_segments_from_upload: Optional[str] = None
-        if original_srt_file is not None or translated_srt_file is not None:
-            print("[translate_segments] Processing SRT subtitle files...")
-            srt_parse_start = time.perf_counter()
-            try:
-                original_srt_content: Optional[str] = None
-                translated_srt_content: Optional[str] = None
-                
-                if original_srt_file is not None:
-                    print(f"[translate_segments] Reading original SRT: {original_srt_file.filename}")
-                    original_srt_bytes = await original_srt_file.read()
-                    if original_srt_bytes:
-                        try:
-                            original_srt_content = original_srt_bytes.decode("utf-8")
-                        except UnicodeDecodeError:
-                            original_srt_content = original_srt_bytes.decode("latin-1")
-                        print(f"[translate_segments] Original SRT loaded: {len(original_srt_content)} bytes")
-                
-                if translated_srt_file is not None:
-                    print(f"[translate_segments] Reading translated SRT: {translated_srt_file.filename}")
-                    translated_srt_bytes = await translated_srt_file.read()
-                    if translated_srt_bytes:
-                        try:
-                            translated_srt_content = translated_srt_bytes.decode("utf-8")
-                        except UnicodeDecodeError:
-                            translated_srt_content = translated_srt_bytes.decode("latin-1")
-                        print(f"[translate_segments] Translated SRT loaded: {len(translated_srt_content)} bytes")
-                
-                print("[translate_segments] Parsing SRT files into segments...")
-                srt_result = _parse_srt_input_to_segments(original_srt_content, translated_srt_content)
-                if srt_result is not None:
-                    srt_segments, srt_speaker_profiles = srt_result
-                    srt_parse_elapsed = (time.perf_counter() - srt_parse_start) * 1000
-                    print(f"[translate_segments] SRT parsing complete: {len(srt_segments)} segments in {srt_parse_elapsed:.1f}ms")
-                    srt_segments_from_upload = json.dumps({
-                        "speakers": srt_speaker_profiles,
-                        "segments": srt_segments,
-                    }, ensure_ascii=False)
-            except Exception as srt_exc:
-                return JSONResponse(
-                    status_code=400,
-                    content={"status": "error", "message": f"Failed to parse SRT subtitle files: {str(srt_exc)}"},
-                )
-        
-        # SRT upload takes priority over segments_json form field
+        srt_segments_from_upload, srt_upload_error = await _load_srt_segments_override(
+            original_srt_file,
+            translated_srt_file,
+            log_prefix="translate_segments",
+        )
+        if srt_upload_error is not None:
+            return srt_upload_error
         if srt_segments_from_upload:
             segments_override_value = srt_segments_from_upload
 
         dest_language_value = (dest_language_value or "").strip()
         if not dest_language_value:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "Destination language (dest_language) is required."},
-            )
+            return _status_error("Destination language (dest_language) is required.")
 
         response_format_value = TRANSLATE_DEFAULT_OUTPUT_FORMAT
         bitrate_value = bitrate_value or TRANSLATE_DEFAULT_BITRATE
         translate_enabled = _coerce_to_bool(translate_flag_value if translate_flag_value is not None else True)
         ignore_non_speech_flag = _coerce_to_bool(ignore_non_speech_value)
         preserve_silence_audio_flag = _coerce_to_bool(preserve_silence_audio_value)
-        apply_enhancement = _coerce_to_bool(enhance_voice_value)
-        apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
-        parallel_config = _coerce_clearvoice_parallel_config(
-            clearvoice_parallel_enabled_value,
-            clearvoice_parallel_chunk_seconds_value,
-            clearvoice_parallel_max_workers_value,
+        preprocess_options = _resolve_audio_preprocess_options(
+            enhance_voice=enhance_voice_value,
+            super_resolution_voice=super_resolution_voice_value,
+            enhancement_model=enhancement_model_value,
+            audio_separator_enabled=audio_separator_enabled_value,
+            audio_separator_model=audio_separator_model_value,
+            clearvoice_parallel_enabled=clearvoice_parallel_enabled_value,
+            clearvoice_parallel_chunk_seconds=clearvoice_parallel_chunk_seconds_value,
+            clearvoice_parallel_max_workers=clearvoice_parallel_max_workers_value,
+            force_enhancement_for_super_resolution=True,
         )
-        if not (apply_enhancement or apply_super_resolution):
-            parallel_config.enabled = False
-        if apply_super_resolution and not apply_enhancement:
-            apply_enhancement = True
-        if apply_super_resolution and not apply_enhancement:
-            apply_enhancement = True
+        apply_enhancement = preprocess_options.apply_enhancement
+        apply_super_resolution = preprocess_options.apply_super_resolution
+        parallel_config = preprocess_options.parallel_config
         custom_backing_present = bool(custom_backing_audio_file) or bool((custom_backing_audio_value or "").strip())
         merge_backing_requested_raw = _coerce_to_bool(merge_backing_track_value)
         min_speech_duration = _coerce_positive_int(
@@ -10295,38 +10496,24 @@ async def api_translate_segments(
             MAX_MERGE_INTERVAL_MS,
             min_value=0,
         )
-        generated_volume_percent_value = _coerce_volume_percent(
+        volume_options = _resolve_volume_options(
             generated_volume_percent_value,
-            DEFAULT_GENERATED_VOLUME_PERCENT,
-        )
-        backing_volume_percent_value = _coerce_volume_percent(
             backing_volume_percent_value,
-            DEFAULT_GENERATED_VOLUME_PERCENT,
-        )
-        silence_volume_percent_value = _coerce_volume_percent(
             silence_volume_percent_value,
-            DEFAULT_SILENCE_VOLUME_PERCENT,
         )
+        generated_volume_percent_value = volume_options.generated
+        backing_volume_percent_value = volume_options.backing
+        silence_volume_percent_value = volume_options.silence
         force_gemini_regenerate_flag = _coerce_to_bool(force_gemini_regen_value or False)
         default_speaker_value = (default_speaker_value or "").strip()
-        reuse_source_session: Optional[TranslateSessionData] = None
-        reuse_session_id_value = (reuse_session_id_value or "").strip()
-        if reuse_session_id_value:
-            reuse_source_session = await _get_translate_session(reuse_session_id_value)
-            if reuse_source_session is None:
-                return JSONResponse(
-                    status_code=404,
-                    content={
-                        "status": "error",
-                        "message": "Reuse session not found or expired. Please re-upload the audio.",
-                    },
-                )
+        reuse_session_id_value, reuse_source_session, reuse_session_error = await _resolve_reuse_translate_session(
+            reuse_session_id_value
+        )
+        if reuse_session_error is not None:
+            return reuse_session_error
         reuse_backing_available = bool(reuse_source_session and _session_has_backing_audio(reuse_source_session))
-        # Audio-separator settings (parse early since merge_backing depends on it)
-        audio_separator_enabled_flag = _coerce_to_bool(audio_separator_enabled_value or False)
-        audio_separator_model_key = (audio_separator_model_value or "").strip().lower()
-        if audio_separator_model_key not in AUDIO_SEPARATOR_MODELS:
-            audio_separator_model_key = DEFAULT_AUDIO_SEPARATOR_MODEL
+        audio_separator_enabled_flag = preprocess_options.audio_separator_enabled
+        audio_separator_model_key = preprocess_options.audio_separator_model
         requested_merge_backing = _coerce_merge_backing_flag(
             merge_backing_requested_raw,
             apply_enhancement,
@@ -10335,16 +10522,8 @@ async def api_translate_segments(
         )
         if reuse_source_session is not None and reuse_source_session.chunk_parent_id:
             requested_merge_backing = False
-        enhancement_model_name_value = enhancement_model_value if enhancement_model_value in AVAILABLE_ENHANCEMENT_MODELS else DEFAULT_ENHANCEMENT_MODEL
-        clearvoice_settings: Dict[str, Any] = {
-            "enhancement": apply_enhancement,
-            "enhancement_model": enhancement_model_name_value,
-            "super_resolution": apply_super_resolution,
-            "audio_separator_enabled": audio_separator_enabled_flag,
-            "audio_separator_model": audio_separator_model_key,
-        }
-        if parallel_config.enabled:
-            clearvoice_settings.update(parallel_config.to_metadata())
+        enhancement_model_name_value = preprocess_options.enhancement_model_name
+        clearvoice_settings = preprocess_options.to_clearvoice_settings()
         resolved_gemini_model = _normalize_gemini_model_name(gemini_model_value)
         gemini_api_key_value = (gemini_api_key_value or "").strip()
         if not default_speaker_value and reuse_source_session:
@@ -10566,20 +10745,14 @@ async def api_translate_segments(
                 item = await queue.get()
                 if item is None:
                     break
-                yield (json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8")
+                yield _json_event_bytes(item)
 
-        return StreamingResponse(translate_stream(), media_type="application/json")
+        return _json_stream_response(translate_stream())
     except RuntimeError as runtime_error:
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(runtime_error)},
-        )
+        return _status_error(str(runtime_error), status_code=500)
     except Exception as exc:
         traceback.print_exc()
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"Failed to prepare translation segments: {str(exc)}"},
-        )
+        return _status_error(f"Failed to prepare translation segments: {str(exc)}", status_code=500)
 
 
 @app.post("/api/translate_generate_segments")
@@ -10972,9 +11145,9 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                 item = await queue.get()
                 if item is None:
                     break
-                yield (json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8")
+                yield _json_event_bytes(item)
 
-        return StreamingResponse(generate_stream(), media_type="application/json")
+        return _json_stream_response(generate_stream())
     except RuntimeError as runtime_error:
         return JSONResponse(
             status_code=500,
@@ -10994,17 +11167,11 @@ async def api_translate_segment_preview(payload: SegmentPreviewRequest):
     try:
         session = await _get_translate_session(payload.session_id)
         if session is None:
-            return JSONResponse(
-                status_code=404,
-                content={"status": "error", "message": "Translate session not found or expired."},
-            )
+            return _status_error("Translate session not found or expired.", status_code=404)
 
         seg_input = payload.segment
         if seg_input.type != "speech":
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "Only speech segments can be previewed."},
-            )
+            return _status_error("Only speech segments can be previewed.")
 
         max_duration = _session_audio_duration_ms(session)
         start_ms = max(0, int(seg_input.start_ms))
@@ -11609,29 +11776,21 @@ async def api_translate_audio(
         default_emotion_weight_value = default_emotion_weight
         transcription_pipeline_value = transcription_pipeline
 
-        content_type = request.headers.get("content-type", "")
-        if (
+        payload, payload_error = await _read_optional_json_payload(
+            request,
             dest_language is None
             and not audio_reference
             and audio_file is None
-            and "application/json" in content_type.lower()
-        ):
-            try:
-                payload = await request.json()
-            except Exception as exc:
-                return JSONResponse(
-                    status_code=400,
-                    content={"status": "error", "message": f"Invalid JSON payload: {str(exc)}"},
-                )
+            and _request_has_json_body(request),
+        )
+        if payload_error is not None:
+            return payload_error
 
         if payload is not None:
             try:
                 translate_req = TranslateRequest(**payload)
             except Exception as exc:
-                return JSONResponse(
-                    status_code=400,
-                    content={"status": "error", "message": f"Invalid translate request: {str(exc)}"},
-                )
+                return _status_error(f"Invalid translate request: {str(exc)}")
             dest_language_value = translate_req.dest_language
             audio_reference = translate_req.audio or audio_reference
             audio_mime_type_value = translate_req.audio_mime_type or audio_mime_type_value
@@ -11714,99 +11873,48 @@ async def api_translate_audio(
         if resolved_transcription_pipeline not in ("gemini", "whisperx"):
             resolved_transcription_pipeline = "gemini"
 
-        # Handle SRT subtitle file uploads
-        # If SRT files are provided, parse and convert to segments_json format
-        srt_segments_from_upload: Optional[str] = None
-        if original_srt_file is not None or translated_srt_file is not None:
-            print("[translate_audio] Processing SRT subtitle files...")
-            srt_parse_start = time.perf_counter()
-            try:
-                original_srt_content: Optional[str] = None
-                translated_srt_content: Optional[str] = None
-                
-                if original_srt_file is not None:
-                    print(f"[translate_audio] Reading original SRT: {original_srt_file.filename}")
-                    original_srt_bytes = await original_srt_file.read()
-                    if original_srt_bytes:
-                        # Try UTF-8 first, then fallback to latin-1
-                        try:
-                            original_srt_content = original_srt_bytes.decode("utf-8")
-                        except UnicodeDecodeError:
-                            original_srt_content = original_srt_bytes.decode("latin-1")
-                        print(f"[translate_audio] Original SRT loaded: {len(original_srt_content)} bytes")
-                
-                if translated_srt_file is not None:
-                    print(f"[translate_audio] Reading translated SRT: {translated_srt_file.filename}")
-                    translated_srt_bytes = await translated_srt_file.read()
-                    if translated_srt_bytes:
-                        try:
-                            translated_srt_content = translated_srt_bytes.decode("utf-8")
-                        except UnicodeDecodeError:
-                            translated_srt_content = translated_srt_bytes.decode("latin-1")
-                        print(f"[translate_audio] Translated SRT loaded: {len(translated_srt_content)} bytes")
-                
-                print("[translate_audio] Parsing SRT files into segments...")
-                srt_result = _parse_srt_input_to_segments(original_srt_content, translated_srt_content)
-                if srt_result is not None:
-                    srt_segments, srt_speaker_profiles = srt_result
-                    srt_parse_elapsed = (time.perf_counter() - srt_parse_start) * 1000
-                    print(f"[translate_audio] SRT parsing complete: {len(srt_segments)} segments in {srt_parse_elapsed:.1f}ms")
-                    # Convert to JSON format compatible with segments_json
-                    srt_segments_from_upload = json.dumps({
-                        "speakers": srt_speaker_profiles,
-                        "segments": srt_segments,
-                    }, ensure_ascii=False)
-            except Exception as srt_exc:
-                return JSONResponse(
-                    status_code=400,
-                    content={"status": "error", "message": f"Failed to parse SRT subtitle files: {str(srt_exc)}"},
-                )
-        
-        # SRT upload takes priority over segments_json form field
+        srt_segments_from_upload, srt_upload_error = await _load_srt_segments_override(
+            original_srt_file,
+            translated_srt_file,
+            log_prefix="translate_audio",
+        )
+        if srt_upload_error is not None:
+            return srt_upload_error
         if srt_segments_from_upload:
             segments_override_value = srt_segments_from_upload
 
-        reuse_source_session: Optional[TranslateSessionData] = None
-        reuse_session_id_value = (reuse_session_id_value or "").strip()
-        if reuse_session_id_value:
-            reuse_source_session = await _get_translate_session(reuse_session_id_value)
-            if reuse_source_session is None:
-                return JSONResponse(
-                    status_code=404,
-                    content={
-                        "status": "error",
-                        "message": "Reuse session not found or expired. Please re-upload the audio.",
-                    },
-                )
+        reuse_session_id_value, reuse_source_session, reuse_session_error = await _resolve_reuse_translate_session(
+            reuse_session_id_value
+        )
+        if reuse_session_error is not None:
+            return reuse_session_error
 
         dest_language_value = (dest_language_value or "").strip()
         if not dest_language_value:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "Destination language (dest_language) is required."},
-            )
+            return _status_error("Destination language (dest_language) is required.")
 
         response_format_value = TRANSLATE_DEFAULT_OUTPUT_FORMAT
         bitrate_value = bitrate_value or TRANSLATE_DEFAULT_BITRATE
         ignore_non_speech_flag = _coerce_to_bool(ignore_non_speech_value)
         preserve_silence_audio_flag = _coerce_to_bool(preserve_silence_audio_value)
-        apply_enhancement = _coerce_to_bool(enhance_voice_value)
-        apply_super_resolution = _coerce_to_bool(super_resolution_voice_value)
-        parallel_config = _coerce_clearvoice_parallel_config(
-            clearvoice_parallel_enabled_value,
-            clearvoice_parallel_chunk_seconds_value,
-            clearvoice_parallel_max_workers_value,
+        preprocess_options = _resolve_audio_preprocess_options(
+            enhance_voice=enhance_voice_value,
+            super_resolution_voice=super_resolution_voice_value,
+            enhancement_model=enhancement_model_value,
+            audio_separator_enabled=audio_separator_enabled_value,
+            audio_separator_model=audio_separator_model_value,
+            clearvoice_parallel_enabled=clearvoice_parallel_enabled_value,
+            clearvoice_parallel_chunk_seconds=clearvoice_parallel_chunk_seconds_value,
+            clearvoice_parallel_max_workers=clearvoice_parallel_max_workers_value,
         )
-        if not (apply_enhancement or apply_super_resolution):
-            parallel_config.enabled = False
+        apply_enhancement = preprocess_options.apply_enhancement
+        apply_super_resolution = preprocess_options.apply_super_resolution
+        parallel_config = preprocess_options.parallel_config
         custom_backing_present = bool(custom_backing_audio_file) or bool((custom_backing_audio_value or "").strip())
         merge_backing_requested_raw = _coerce_to_bool(merge_backing_track_value)
         reuse_backing_available = bool(reuse_source_session and _session_has_backing_audio(reuse_source_session))
-        # Audio-separator settings (parse early since merge_backing depends on it)
-        audio_separator_enabled_flag = _coerce_to_bool(audio_separator_enabled_value or False)
-        audio_separator_model_key = (audio_separator_model_value or "").strip().lower()
-        if audio_separator_model_key not in AUDIO_SEPARATOR_MODELS:
-            audio_separator_model_key = DEFAULT_AUDIO_SEPARATOR_MODEL
+        audio_separator_enabled_flag = preprocess_options.audio_separator_enabled
+        audio_separator_model_key = preprocess_options.audio_separator_model
         requested_merge_backing = _coerce_merge_backing_flag(
             merge_backing_requested_raw,
             apply_enhancement,
@@ -11815,16 +11923,8 @@ async def api_translate_audio(
         )
         if reuse_source_session is not None and reuse_source_session.chunk_parent_id:
             requested_merge_backing = False
-        enhancement_model_name_value = enhancement_model_value if enhancement_model_value in AVAILABLE_ENHANCEMENT_MODELS else DEFAULT_ENHANCEMENT_MODEL
-        clearvoice_settings: Dict[str, Any] = {
-            "enhancement": apply_enhancement,
-            "enhancement_model": enhancement_model_name_value,
-            "super_resolution": apply_super_resolution,
-            "audio_separator_enabled": audio_separator_enabled_flag,
-            "audio_separator_model": audio_separator_model_key,
-        }
-        if parallel_config.enabled:
-            clearvoice_settings.update(parallel_config.to_metadata())
+        enhancement_model_name_value = preprocess_options.enhancement_model_name
+        clearvoice_settings = preprocess_options.to_clearvoice_settings()
         min_speech_duration = _coerce_positive_int(
             min_speech_duration_value,
             MIN_SPEECH_DURATION_MS,
@@ -11835,18 +11935,14 @@ async def api_translate_audio(
             MAX_MERGE_INTERVAL_MS,
             min_value=0,
         )
-        generated_volume_percent_value = _coerce_volume_percent(
+        volume_options = _resolve_volume_options(
             generated_volume_percent_value,
-            DEFAULT_GENERATED_VOLUME_PERCENT,
-        )
-        backing_volume_percent_value = _coerce_volume_percent(
             backing_volume_percent_value,
-            DEFAULT_GENERATED_VOLUME_PERCENT,
-        )
-        silence_volume_percent_value = _coerce_volume_percent(
             silence_volume_percent_value,
-            DEFAULT_SILENCE_VOLUME_PERCENT,
         )
+        generated_volume_percent_value = volume_options.generated
+        backing_volume_percent_value = volume_options.backing
+        silence_volume_percent_value = volume_options.silence
         resolved_gemini_model = _normalize_gemini_model_name(gemini_model_value)
         gemini_api_key_value = (gemini_api_key_value or "").strip()
         force_gemini_regenerate_flag = _coerce_to_bool(force_gemini_regen_value or False)
@@ -11855,19 +11951,14 @@ async def api_translate_audio(
         uploaded_filename = audio_file.filename if audio_file else None
         audio_bytes: Optional[bytes] = None
         if reuse_source_session is None:
-            audio_io = await load_audio_bytes_from_request(audio_file, audio_reference)
-            if audio_io is None:
-                return JSONResponse(
-                    status_code=400,
-                    content={"status": "error", "message": "No audio provided for translation."},
-                )
-
-            audio_bytes = audio_io.read()
-            if not audio_bytes:
-                return JSONResponse(
-                    status_code=400,
-                    content={"status": "error", "message": "Provided audio data is empty."},
-                )
+            audio_bytes, audio_error = await _read_audio_request_bytes(
+                audio_file,
+                audio_reference,
+                missing_message="No audio provided for translation.",
+                empty_message="Provided audio data is empty.",
+            )
+            if audio_error is not None:
+                return audio_error
 
         input_mime_type = audio_mime_type_value or (audio_file.content_type if audio_file else None) or "audio/wav"
 
@@ -12262,24 +12353,18 @@ async def api_translate_audio(
                 item = await queue.get()
                 if item is None:
                     break
-                yield (json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8")
+                yield _json_event_bytes(item)
 
-        return StreamingResponse(translate_stream(), media_type="application/json")
+        return _json_stream_response(translate_stream())
 
     except RuntimeError as runtime_error:
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(runtime_error)},
-        )
+        return _status_error(str(runtime_error), status_code=500)
     except Exception as exc:
         traceback.print_exc()
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"Translation failed: {str(exc)}"},
-        )
+        return _status_error(f"Translation failed: {str(exc)}", status_code=500)
 
 
-# API Helper Functions (matching deploy_vllm_indextts.py exactly)
+# Audio input helpers
 async def get_audio_bytes_from_url(url: str) -> bytes:
     """Download audio from URL"""
     try:
@@ -12337,10 +12422,46 @@ async def load_audio_bytes_from_request(audio_file, audio):
             raise HTTPException(status_code=400, detail="Reference audio file is empty")
         return BytesIO(content)
 
+
+async def _read_audio_request_bytes(
+    audio_file: Optional[UploadFile],
+    audio_reference: Optional[str],
+    *,
+    missing_message: str,
+    empty_message: str,
+) -> Tuple[Optional[bytes], Optional[JSONResponse]]:
+    try:
+        audio_io = await load_audio_bytes_from_request(audio_file, audio_reference)
+    except HTTPException as exc:
+        return None, _status_error(str(exc.detail), status_code=exc.status_code)
+
+    if audio_io is None:
+        return None, _status_error(missing_message)
+
+    audio_bytes = audio_io.read()
+    if not audio_bytes:
+        return None, _status_error(empty_message)
+
+    return audio_bytes, None
+
+
+async def _persist_reference_audio_to_tempfile(
+    reference_audio_file: Optional[UploadFile],
+    reference_audio: Optional[str],
+) -> Tuple[Optional[str], Optional[JSONResponse]]:
+    audio_io = await load_audio_bytes_from_request(reference_audio_file, reference_audio)
+    if audio_io is None:
+        return None, _success_error("No reference audio provided", status_code=400)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+        tmp_path = tmp_file.name
+    await async_write_file(tmp_path, audio_io.read())
+    return tmp_path, None
+
+
 # API Compatibility Endpoints
 @app.post("/add_speaker")
 async def add_speaker(
-    background_tasks: BackgroundTasks,
     name: str = Form(..., description="The name of the speaker"),
     audio: Optional[str] = Form(None, description="Reference audio URL or base64"),
     reference_text: Optional[str] = Form(None, description="Optional transcript"),
@@ -12352,29 +12473,19 @@ async def add_speaker(
     """API: Add a new speaker"""
     try:
         print(f"🎭 API: Adding speaker '{name}'")
-        print(f"🔍 Debug: audio_file={audio_file}, audio={audio is not None}, reference_text={reference_text}")
         
         if not speaker_api:
-            return JSONResponse(
-                status_code=500,
-                content={"success": False, "error": "Speaker manager not initialized"}
-            )
+            return _success_error("Speaker manager not initialized")
         
-        # Load audio from file or reference string (matching deploy_vllm_indextts.py)
+        # Load audio from file upload or base64/URL reference.
         try:
             audio_io = await load_audio_bytes_from_request(audio_file, audio)
             if audio_io is None:
                 print(f"❌ API: No audio provided for speaker '{name}'")
-                return JSONResponse(
-                    status_code=400,
-                    content={"success": False, "error": "No audio provided"}
-                )
+                return _success_error("No audio provided", status_code=400)
         except Exception as audio_error:
             print(f"❌ API: Audio loading failed for speaker '{name}': {audio_error}")
-            return JSONResponse(
-                status_code=400,
-                content={"success": False, "error": f"Audio loading failed: {str(audio_error)}"}
-            )
+            return _success_error(f"Audio loading failed: {str(audio_error)}", status_code=400)
         
         # Get audio data and filename
         audio_data = audio_io.read()
@@ -12387,10 +12498,7 @@ async def add_speaker(
         if (apply_enhancement or apply_super_resolution_flag) and ClearVoice is None:
             error_msg = "ClearVoice is required for enhancement or super-resolution. Install the `clearvoice` package to enable these options."
             print(f"❌ API: {error_msg}")
-            return JSONResponse(
-                status_code=500,
-                content={"success": False, "error": error_msg}
-            )
+            return _success_error(error_msg)
         
         # Add speaker using SpeakerPresetManager (handles ClearVoice processing internally)
         result = await speaker_api.add_speaker(
@@ -12408,22 +12516,15 @@ async def add_speaker(
                 payload["clearvoice"] = result["clearvoice"]
             return JSONResponse(content=payload)
         else:
-            return JSONResponse(
-                status_code=500,
-                content={"success": False, "error": result["message"]}
-            )
+            return _success_error(result["message"])
             
     except Exception as e:
         error_msg = f"Failed to add speaker '{name}': {str(e)}"
         print(f"❌ API: {error_msg}")
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": error_msg}
-        )
+        return _success_error(error_msg)
 
 @app.post("/delete_speaker")
 async def delete_speaker(
-    background_tasks: BackgroundTasks,
     name: str = Form(..., description="The name of the speaker")
 ):
     """API: Delete a speaker"""
@@ -12431,28 +12532,19 @@ async def delete_speaker(
         print(f"🗑️ API: Deleting speaker '{name}'")
         
         if not speaker_api:
-            return JSONResponse(
-                status_code=500,
-                content={"success": False, "error": "Speaker manager not initialized"}
-            )
+            return _success_error("Speaker manager not initialized")
         
         result = await speaker_api.delete_speaker(name)
         
         if result["status"] == "success":
             return JSONResponse(content={"success": True, "role": name})
         else:
-            return JSONResponse(
-                status_code=500,
-                content={"success": False, "error": result["message"]}
-            )
+            return _success_error(result["message"])
             
     except Exception as e:
         error_msg = f"Failed to delete speaker '{name}': {str(e)}"
         print(f"❌ API: {error_msg}")
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": error_msg}
-        )
+        return _success_error(error_msg)
 
 @app.get("/audio_roles")
 async def audio_roles():
@@ -12482,10 +12574,7 @@ async def audio_roles():
     except Exception as e:
         error_msg = f"Failed to list audio roles: {str(e)}"
         print(f"❌ API: {error_msg}")
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": error_msg}
-        )
+        return _success_error(error_msg)
 
 
 @app.get("/api/speaker_preview/{speaker_name}")
@@ -12513,7 +12602,7 @@ def get_voice_design_manager() -> Qwen3VoiceDesignManager:
         config = Qwen3TTSConfig(
             voice_design_model_path=os.environ.get(
                 "QWEN3_VOICE_DESIGN_MODEL",
-                "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+                "./checkpoints/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
             ),
             device=os.environ.get("QWEN3_TTS_DEVICE", "cuda:0"),
         )
@@ -12758,27 +12847,26 @@ async def api_segment_preview(
     )
 
 
+async def _validate_speaker_preset_request(speaker_name: Optional[str]) -> Optional[JSONResponse]:
+    if not speaker_name:
+        return _success_error("Speaker name is required", status_code=400)
+    if speaker_api and not speaker_api.speaker_exists(speaker_name):
+        speakers_data = await speaker_api.list_speakers()
+        available_roles = list(speakers_data.get("speakers", {}).keys())
+        error_msg = f"'{speaker_name}' is not in the list of existing roles: {', '.join(available_roles)}"
+        return _success_error(error_msg)
+    return None
+
+
 @app.post("/speak")
 async def speak(req: SpeakRequest):
     """API: Generate speech using registered speaker"""
     try:
         print(f"🎭 API: Speaking with '{req.name}' - '{req.text[:50]}...'")
         
-        if not req.name:
-            return JSONResponse(
-                status_code=400,
-                content={"success": False, "error": "Speaker name is required"}
-            )
-        
-        # Simple speaker validation to prevent failures
-        if speaker_api and not speaker_api.speaker_exists(req.name):
-            speakers_data = await speaker_api.list_speakers()
-            available_roles = list(speakers_data.get("speakers", {}).keys())
-            error_msg = f"'{req.name}' is not in the list of existing roles: {', '.join(available_roles)}"
-            return JSONResponse(
-                status_code=500,
-                content={"success": False, "error": error_msg}
-            )
+        speaker_error = await _validate_speaker_preset_request(req.name)
+        if speaker_error is not None:
+            return speaker_error
         
         tts = tts_manager.get_tts()
         
@@ -12799,47 +12887,12 @@ async def speak(req: SpeakRequest):
             speech_length=req.speech_length,
             diffusion_steps=req.diffusion_steps,
             max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
-            verbose=cmd_args.verbose
+            verbose=SETTINGS.verbose
         )
         
-        # Convert to requested format and return as bytes (matching deploy_vllm_indextts.py)
-        if req.response_format != "wav":
-            # Read audio data once
-            audio_data, sample_rate = await async_audio_read(result)
-            # Convert to requested format and get bytes
-            audio_bytes, media_type, _ = await convert_audio_to_format(
-                audio_data, sample_rate, req.response_format, "128k"
-            )
-        else:
-            # Read WAV file as bytes
-            audio_bytes = await async_read_file(result)
-            media_type = "audio/wav"
-        
-        # Set content type (matching deploy_vllm_indextts.py)
-        content_type_map = {
-            "mp3": "audio/mpeg",
-            "opus": "audio/opus", 
-            "aac": "audio/aac",
-            "flac": "audio/flac",
-            "wav": "audio/wav",
-            "pcm": "audio/pcm",
-        }
-        content_type = content_type_map.get(req.response_format, f"audio/{req.response_format}")
-        
-        print(f"✅ API: Generated {len(audio_bytes)} bytes of {req.response_format.upper()} audio")
-        
-        # Cleanup temporary file
-        await async_remove_file(result)
-        
-        # Return Response with bytes (matching deploy_vllm_indextts.py format exactly)
-        return Response(
-            content=audio_bytes,
-            media_type=content_type,
-            headers={
-                "Content-Disposition": f"attachment; filename=speech.{req.response_format}",
-                "Cache-Control": "no-cache",
-            }
-        )
+        response = await _generated_audio_attachment_response(result, req.response_format)
+        print(f"✅ API: Generated {len(response.body or b'')} bytes of {req.response_format.upper()} audio")
+        return response
         
     except Exception as e:
         import traceback
@@ -12847,10 +12900,7 @@ async def speak(req: SpeakRequest):
         print(f"❌ API: {error_msg}")
         print(f"🔍 Full traceback:")
         traceback.print_exc()
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": error_msg}
-        )
+        return _success_error(error_msg)
 
 def parse_clone_form(
     text: str = Form(...),
@@ -12891,19 +12941,13 @@ async def clone_voice(
     try:
         print(f"🎵 API: Cloning voice - '{req.text[:50]}...'")
         
-        # Load reference audio (matching deploy_vllm_indextts.py)
-        audio_io = await load_audio_bytes_from_request(reference_audio_file, req.reference_audio)
-        if audio_io is None:
-            return JSONResponse(
-                status_code=400,
-                content={"success": False, "error": "No reference audio provided"}
-            )
-        
-        # Save reference audio to temporary file
-        audio_data = audio_io.read()
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-            tmp_path = tmp_file.name
-        await async_write_file(tmp_path, audio_data)
+        tmp_path, reference_error = await _persist_reference_audio_to_tempfile(
+            reference_audio_file,
+            req.reference_audio,
+        )
+        if reference_error is not None:
+            return reference_error
+        assert tmp_path is not None
         
         try:
             tts = tts_manager.get_tts()
@@ -12924,46 +12968,12 @@ async def clone_voice(
                 speech_length=req.speech_length,
                 diffusion_steps=req.diffusion_steps,
                 max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
-                verbose=cmd_args.verbose
+                verbose=SETTINGS.verbose
             )
             
-            # Convert to requested format and return as bytes (matching deploy_vllm_indextts.py)
-            if req.response_format != "wav":
-                # Read audio data once
-                audio_data, sample_rate = await async_audio_read(result)
-                # Convert to requested format and get bytes
-                audio_bytes, media_type, _ = await convert_audio_to_format(
-                    audio_data, sample_rate, req.response_format, "128k"
-                )
-            else:
-                # Read WAV file as bytes
-                audio_bytes = await async_read_file(result)
-                media_type = "audio/wav"
-            
-            # Set content type (matching deploy_vllm_indextts.py)
-            content_type_map = {
-                "mp3": "audio/mpeg",
-                "opus": "audio/opus",
-                "aac": "audio/aac", 
-                "flac": "audio/flac",
-                "wav": "audio/wav",
-                "pcm": "audio/pcm",
-            }
-            content_type = content_type_map.get(req.response_format, f"audio/{req.response_format}")
-            
-            print(f"✅ API: Cloned voice - {len(audio_bytes)} bytes of {req.response_format.upper()}")
-            
-            # Cleanup temporary file
-            await async_remove_file(result)
-            
-            return Response(
-                content=audio_bytes,
-                media_type=content_type,
-                headers={
-                    "Content-Disposition": f"attachment; filename=speech.{req.response_format}",
-                    "Cache-Control": "no-cache",
-                }
-            )
+            response = await _generated_audio_attachment_response(result, req.response_format)
+            print(f"✅ API: Cloned voice - {len(response.body or b'')} bytes of {req.response_format.upper()}")
+            return response
             
         finally:
             # Cleanup
@@ -12972,10 +12982,7 @@ async def clone_voice(
     except Exception as e:
         error_msg = f"Failed to clone voice: {str(e)}"
         print(f"❌ API: {error_msg}")
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": error_msg}
-        )
+        return _success_error(error_msg)
 
 @app.get("/server_info")
 async def server_info():
@@ -13002,37 +13009,17 @@ async def server_info():
         })
         
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False,
-                "error": f"Failed to get server info: {str(e)}"
-            }
-        )
+        return _success_error(f"Failed to get server info: {str(e)}")
 
 @app.post("/speak_stream")
 async def speak_stream(req: SpeakRequest):
     """API: Generate speech using registered speaker with streaming"""
-    from fastapi.responses import StreamingResponse
-    
     try:
         print(f"🎭 API Streaming: Speaking with '{req.name}' - '{req.text[:50]}...'")
         
-        if not req.name:
-            return JSONResponse(
-                status_code=400,
-                content={"success": False, "error": "Speaker name is required"}
-            )
-        
-        # Simple speaker validation to prevent failures
-        if speaker_api and not speaker_api.speaker_exists(req.name):
-            speakers_data = await speaker_api.list_speakers()
-            available_roles = list(speakers_data.get("speakers", {}).keys())
-            error_msg = f"'{req.name}' is not in the list of existing roles: {', '.join(available_roles)}"
-            return JSONResponse(
-                status_code=500,
-                content={"success": False, "error": error_msg}
-            )
+        speaker_error = await _validate_speaker_preset_request(req.name)
+        if speaker_error is not None:
+            return speaker_error
         
         tts = tts_manager.get_tts()
         
@@ -13054,31 +13041,12 @@ async def speak_stream(req: SpeakRequest):
                     diffusion_steps=req.diffusion_steps,
                     max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
                     first_chunk_max_tokens=40,  # Default first chunk size
-                    verbose=cmd_args.verbose
+                    verbose=SETTINGS.verbose
                 ):
                     chunk_count += 1
                     print(f"🎵 Streaming chunk {chunk_idx} (is_last={is_last})")
-                    
-                    # Convert tensor to WAV bytes
-                    wav_data = wav_cpu.numpy().astype(np.int16)
-                    
-                    # Create WAV file in memory
-                    with BytesIO() as wav_buffer:
-                        sf.write(wav_buffer, wav_data.T, 22050, format='WAV')
-                        wav_bytes = wav_buffer.getvalue()
-                    
-                    # Convert to requested format
-                    if req.response_format == "wav":
-                        audio_bytes = wav_bytes
-                    else:
-                        audio_segment = AudioSegment.from_wav(BytesIO(wav_bytes))
-                        with BytesIO() as audio_buffer:
-                            audio_segment.export(audio_buffer, format=req.response_format, bitrate="128k" if req.response_format == "mp3" else None)
-                            audio_bytes = audio_buffer.getvalue()
-                    
-                    # Yield chunk with metadata header
-                    header = f"CHUNK:{chunk_idx}:{len(audio_bytes)}:{'LAST' if is_last else 'MORE'}\n".encode('utf-8')
-                    yield header + audio_bytes
+                    audio_bytes = _encode_streaming_audio_chunk(wav_cpu, req.response_format)
+                    yield _streaming_audio_frame(chunk_idx, audio_bytes, is_last)
                 
                 print(f"✅ Streaming complete: {chunk_count} chunks sent")
                 
@@ -13091,10 +13059,7 @@ async def speak_stream(req: SpeakRequest):
         return StreamingResponse(
             audio_stream_generator(),
             media_type="application/octet-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",  # Disable proxy buffering
-            }
+            headers=STREAMING_RESPONSE_HEADERS,
         )
         
     except Exception as e:
@@ -13103,10 +13068,7 @@ async def speak_stream(req: SpeakRequest):
         print(f"❌ API Streaming: {error_msg}")
         print(f"🔍 Full traceback:")
         traceback.print_exc()
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": error_msg}
-        )
+        return _success_error(error_msg)
 
 @app.post("/clone_voice_stream")
 async def clone_voice_stream(
@@ -13114,24 +13076,17 @@ async def clone_voice_stream(
     reference_audio_file: Optional[UploadFile] = File(None),
 ):
     """API: Clone voice using reference audio with streaming"""
-    from fastapi.responses import StreamingResponse
-    
+    tmp_path: Optional[str] = None
     try:
         print(f"🎵 API Streaming: Cloning voice - '{req.text[:50]}...'")
         
-        # Load reference audio (matching deploy_vllm_indextts.py)
-        audio_io = await load_audio_bytes_from_request(reference_audio_file, req.reference_audio)
-        if audio_io is None:
-            return JSONResponse(
-                status_code=400,
-                content={"success": False, "error": "No reference audio provided"}
-            )
-        
-        # Save reference audio to temporary file
-        audio_data = audio_io.read()
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-            tmp_path = tmp_file.name
-        await async_write_file(tmp_path, audio_data)
+        tmp_path, reference_error = await _persist_reference_audio_to_tempfile(
+            reference_audio_file,
+            req.reference_audio,
+        )
+        if reference_error is not None:
+            return reference_error
+        assert tmp_path is not None
         
         tts = tts_manager.get_tts()
         
@@ -13152,31 +13107,12 @@ async def clone_voice_stream(
                     diffusion_steps=req.diffusion_steps,
                     max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
                     first_chunk_max_tokens=40,  # Default first chunk size
-                    verbose=cmd_args.verbose
+                    verbose=SETTINGS.verbose
                 ):
                     chunk_count += 1
                     print(f"🎵 Streaming chunk {chunk_idx} (is_last={is_last})")
-                    
-                    # Convert tensor to WAV bytes
-                    wav_data = wav_cpu.numpy().astype(np.int16)
-                    
-                    # Create WAV file in memory
-                    with BytesIO() as wav_buffer:
-                        sf.write(wav_buffer, wav_data.T, 22050, format='WAV')
-                        wav_bytes = wav_buffer.getvalue()
-                    
-                    # Convert to requested format
-                    if req.response_format == "wav":
-                        audio_bytes = wav_bytes
-                    else:
-                        audio_segment = AudioSegment.from_wav(BytesIO(wav_bytes))
-                        with BytesIO() as audio_buffer:
-                            audio_segment.export(audio_buffer, format=req.response_format, bitrate="128k" if req.response_format == "mp3" else None)
-                            audio_bytes = audio_buffer.getvalue()
-                    
-                    # Yield chunk with metadata header
-                    header = f"CHUNK:{chunk_idx}:{len(audio_bytes)}:{'LAST' if is_last else 'MORE'}\n".encode('utf-8')
-                    yield header + audio_bytes
+                    audio_bytes = _encode_streaming_audio_chunk(wav_cpu, req.response_format)
+                    yield _streaming_audio_frame(chunk_idx, audio_bytes, is_last)
                 
                 print(f"✅ Streaming complete: {chunk_count} chunks sent")
                 
@@ -13192,28 +13128,24 @@ async def clone_voice_stream(
         return StreamingResponse(
             audio_stream_generator(),
             media_type="application/octet-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",  # Disable proxy buffering
-            }
+            headers=STREAMING_RESPONSE_HEADERS,
         )
                 
     except Exception as e:
+        if tmp_path:
+            await async_remove_file(tmp_path)
         error_msg = f"Failed to clone voice with streaming: {str(e)}"
         print(f"❌ API Streaming: {error_msg}")
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": error_msg}
-        )
+        return _success_error(error_msg)
 
 if __name__ == "__main__":
     import uvicorn
     print("🚀 Starting IndexTTS vLLM v2 FastAPI WebUI...")
-    print(f"📁 Model directory: {cmd_args.model_dir}")
-    print(f"🔧 GPU memory utilization: {cmd_args.gpu_memory_utilization}")
-    print(f"🎯 FP16 mode: {cmd_args.is_fp16}")
-    print(f"🌐 Server will start on {cmd_args.host}:{cmd_args.port}")
-    print(f"🎯 Concurrent capacity: 100 requests (matching Modal deployment)")
+    print(f"📁 Model directory: {SETTINGS.model_dir}")
+    print(f"🔧 GPU memory utilization: {SETTINGS.gpu_memory_utilization}")
+    print(f"🎯 FP16 mode: {SETTINGS.is_fp16}")
+    print(f"🌐 Server will start on {SETTINGS.host}:{SETTINGS.port}")
+    print(f"🎯 Concurrent capacity: 100 requests")
     print(f"⚡ Single worker process for optimal GPU utilization")
     print(f"💡 Features:")
     print(f"   - IndexTTS vLLM v2 backend for ultra-fast inference")
@@ -13228,11 +13160,11 @@ if __name__ == "__main__":
     
     uvicorn.run(
         app,
-        host=cmd_args.host,
-        port=cmd_args.port,
+        host=SETTINGS.host,
+        port=SETTINGS.port,
         log_level="info",
-        workers=1,  # Single worker to match Modal's single container
-        limit_concurrency=100,  # Match Modal's max_inputs=100
+        workers=1,
+        limit_concurrency=100,
         limit_max_requests=None,  # No limit on total requests
         backlog=2048,  # Handle request queue efficiently
         timeout_keep_alive=300,  # Set timeout to 300 seconds
