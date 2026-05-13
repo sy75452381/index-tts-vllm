@@ -4418,7 +4418,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     translateLanguageCodeHint = options.languageCode;
                 }
                 const baseMp4 = `"${normalizedBase}.mp4"`;
-                const baseM4a = `"${normalizedBase}.m4a"`;
+                const baseMp3 = `"${normalizedBase}.mp3"`;
                 const translatedMp3 = `"${normalizedBase}_${languageCode}.mp3"`;
                 const translatedMp4 = `"${normalizedBase}_${languageCode}.mp4"`;
                 const translatedSrtFilename = `${normalizedBase}_${languageCode}.srt`;
@@ -4428,7 +4428,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 const translatedSubtitleFilter = `"subtitles='${translatedSrtFilename.replace(/'/g, "\\'")}'"`;
                 const originalSubtitleFilter = `"subtitles='${originalSrtFilename.replace(/'/g, "\\'")}'"`;
                 ffmpegPanel.style.display = 'block';
-                ffmpegExtractCmd.textContent = `ffmpeg -i ${baseMp4} -vn -acodec copy ${baseM4a}`;
+                ffmpegExtractCmd.textContent = `ffmpeg -i ${baseMp4} -vn -codec:a libmp3lame -q:a 2 ${baseMp3}`;
                 ffmpegReplaceCmd.textContent = `ffmpeg -i ${baseMp4} -i ${translatedMp3} -c:v copy -c:a aac -map 0:v:0 -map 1:a:0 ${translatedMp4}`;
                 ffmpegSubtitleCmd.textContent = `ffmpeg -i ${translatedMp4} -vf ${translatedSubtitleFilter} ${srtBurnedMp4}`;
                 if (ffmpegSubtitleOriginalCmd) {

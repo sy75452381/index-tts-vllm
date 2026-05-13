@@ -2049,6 +2049,10 @@ async def _build_translation_segments(
                 {"status": "error", "message": str(exc)},
             ) from exc
 
+    transcription_pipeline = (transcription_pipeline or "").strip().lower()
+    if transcription_pipeline not in ("gemini", "whisperx"):
+        transcription_pipeline = "gemini"
+
     # Resolve pipeline label
     use_whisperx = transcription_pipeline == "whisperx"
     pipeline_label = "WhisperX" if use_whisperx else f"Gemini model '{resolved_gemini_model}'"
@@ -2249,6 +2253,7 @@ async def _build_translation_segments(
         "bitrate": bitrate_value,
         "prompt": final_prompt,
         "gemini_model": resolved_gemini_model,
+        "transcription_pipeline": transcription_pipeline,
         "ignore_non_speech": ignore_non_speech_flag,
         "preserve_silence_audio": preserve_silence_audio_flag,
         "generated_volume_percent": generated_volume_percent_value,
@@ -4436,9 +4441,14 @@ async def _generate_chunk_audio_from_session(
     merge_backing_track: bool,
     silence_volume_percent: float,
     force_gemini_regenerate: bool = False,
+    transcription_pipeline: str = "gemini",
     default_speaker_preset: Optional[str] = None,
     default_emotion_weight: Optional[float] = None,
 ) -> Tuple[str, str, Dict[str, Any]]:
+    transcription_pipeline = (transcription_pipeline or "").strip().lower()
+    if transcription_pipeline not in ("gemini", "whisperx"):
+        transcription_pipeline = "gemini"
+
     clearvoice_settings = chunk_session.clearvoice_settings or {}
     apply_enhancement = bool(clearvoice_settings.get("enhancement"))
     apply_super_resolution = bool(clearvoice_settings.get("super_resolution"))
@@ -4520,6 +4530,7 @@ async def _generate_chunk_audio_from_session(
         default_speaker_preset=default_speaker_preset,
         default_emotion_weight=default_emotion_weight,
         clearvoice_settings=clearvoice_settings,
+        transcription_pipeline=transcription_pipeline,
     )
 
     audio_payload, _media_type, synthesis_metadata = await _synthesize_translated_audio(
@@ -4550,6 +4561,7 @@ async def _generate_chunk_audio_from_session(
     metadata["backing_volume_percent"] = backing_volume_percent
     metadata["silence_volume_percent"] = silence_volume_percent
     metadata["gemini_model"] = gemini_model
+    metadata["transcription_pipeline"] = transcription_pipeline
     metadata["output_base_name"] = resolved_base_name
     metadata["default_speaker_preset"] = default_speaker_preset
     metadata["default_emotion_weight"] = default_emotion_weight
@@ -8553,6 +8565,10 @@ class ChunkBatchGenerateRequest(BaseModel):
         default=None,
         description="Provide a Gemini API key for this batch if environment defaults should be bypassed.",
     )
+    transcription_pipeline: Optional[str] = Field(
+        default=None,
+        description="Transcription pipeline to use for selected chunk generation: 'gemini' (default) or 'whisperx' (local).",
+    )
     merge_backing_track: Optional[bool] = Field(
         default=None,
         description="When true, attempt to mix regenerated speech with the stored backing track if available.",
@@ -10108,6 +10124,9 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
         bitrate_value = payload.bitrate or config_template.bitrate or TRANSLATE_DEFAULT_BITRATE
         gemini_model_value = _normalize_gemini_model_name(payload.gemini_model or config_template.gemini_model)
         gemini_api_key_value = (payload.gemini_api_key or config_template.gemini_api_key or "").strip()
+        transcription_pipeline_value = (payload.transcription_pipeline or "").strip().lower()
+        if transcription_pipeline_value not in ("gemini", "whisperx"):
+            transcription_pipeline_value = "gemini"
         ignore_non_speech_flag = _coerce_to_bool(
             payload.ignore_non_speech if payload.ignore_non_speech is not None else config_template.ignore_non_speech
         )
@@ -10159,6 +10178,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
             "response_format": response_format_value,
             "bitrate": bitrate_value,
             "gemini_model": gemini_model_value,
+            "transcription_pipeline": transcription_pipeline_value,
             "merge_backing": merge_backing_requested,
             "force_gemini_regenerate": force_gemini_regenerate_flag,
         }
@@ -10222,6 +10242,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
                             merge_backing_track=merge_backing_requested,
                             silence_volume_percent=silence_volume_percent_value,
                             force_gemini_regenerate=force_gemini_regenerate_flag,
+                            transcription_pipeline=transcription_pipeline_value,
                             default_speaker_preset=session.default_speaker_preset,
                             default_emotion_weight=session.default_emotion_weight,
                         )
