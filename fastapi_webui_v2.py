@@ -7418,7 +7418,8 @@ async def _synthesize_translated_audio(
 
     combined_audio = _create_silence_segment(0, frame_rate, sample_width, channels)
     generation_log: List[Dict[str, Any]] = []
-    semaphore = asyncio.Semaphore(TRANSLATION_TTS_CONCURRENCY)
+    tts_concurrency = max(1, int(TRANSLATION_TTS_CONCURRENCY or 1))
+    semaphore = asyncio.Semaphore(tts_concurrency)
     override_map: Dict[str, Dict[str, Any]] = {
         str(key).lower(): value for key, value in (speaker_overrides or {}).items()
     }
@@ -7641,8 +7642,48 @@ async def _synthesize_translated_audio(
         
         return result
 
-    segment_tasks = [process_segment_with_progress(idx, segment) for idx, segment in enumerate(segments)]
-    results = await asyncio.gather(*segment_tasks)
+    async def run_segment_tasks_windowed() -> List[Tuple[int, AudioSegment, Dict[str, Any]]]:
+        results_accumulator: List[Tuple[int, AudioSegment, Dict[str, Any]]] = []
+        pending: Set[asyncio.Task] = set()
+        next_index = 0
+
+        def schedule_next() -> bool:
+            nonlocal next_index
+            if next_index >= len(segments):
+                return False
+            task = asyncio.create_task(
+                process_segment_with_progress(next_index, segments[next_index])
+            )
+            pending.add(task)
+            next_index += 1
+            return True
+
+        for _ in range(min(tts_concurrency, len(segments))):
+            schedule_next()
+
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    results_accumulator.append(task.result())
+                    schedule_next()
+        except Exception:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            raise
+
+        return results_accumulator
+
+    print(
+        f"[synthesize] Scheduling {len(segments)} segment tasks "
+        f"with sliding concurrency={tts_concurrency}..."
+    )
+    results = await run_segment_tasks_windowed()
     
     print(f"[synthesize] All {len(results)} segment tasks completed. Sorting results...")
     sort_start = time.perf_counter()

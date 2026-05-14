@@ -24,7 +24,7 @@ import os
 import re
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -965,18 +965,35 @@ def _run_whisperx_pipeline_sync(
                         max_workers=worker_count,
                         thread_name_prefix="whisperx_translate",
                     ) as pool:
-                        future_to_job = {
-                            pool.submit(_run_translation_job, job): job
-                            for job in translation_jobs
-                        }
-                        for future in as_completed(future_to_job):
-                            job = future_to_job[future]
-                            try:
-                                result_job, translated_texts = future.result()
-                            except Exception as exc:
-                                print(f"  [{job['label']}] Batch failed: {exc}")
-                                continue
-                            _apply_translation_result(result_job, translated_texts)
+                        pending_futures: Dict[Any, Dict[str, Any]] = {}
+                        next_job_index = 0
+
+                        def _submit_next_translation_job() -> bool:
+                            nonlocal next_job_index
+                            if next_job_index >= len(translation_jobs):
+                                return False
+                            job = translation_jobs[next_job_index]
+                            pending_futures[pool.submit(_run_translation_job, job)] = job
+                            next_job_index += 1
+                            return True
+
+                        for _ in range(worker_count):
+                            _submit_next_translation_job()
+
+                        while pending_futures:
+                            done, _ = wait(
+                                pending_futures,
+                                return_when=FIRST_COMPLETED,
+                            )
+                            for future in done:
+                                job = pending_futures.pop(future)
+                                try:
+                                    result_job, translated_texts = future.result()
+                                except Exception as exc:
+                                    print(f"  [{job['label']}] Batch failed: {exc}")
+                                else:
+                                    _apply_translation_result(result_job, translated_texts)
+                                _submit_next_translation_job()
 
     # Build raw text for session storage
     raw_output = {
