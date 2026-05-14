@@ -1845,6 +1845,15 @@
                                         <div id="translateSeparationPreview" style="display: none; margin-bottom: 16px;"></div>
                                         <div class="form-group">
                                             <label style="display: flex; align-items: center; gap: 10px;">
+                                                <input type="checkbox" id="translateAudioSeparatorUseSoundfile">
+                                                <span>Use soundfile writer for Audio-Separator stems</span>
+                                            </label>
+                                            <small style="color: var(--text-muted); margin-top: 6px; display: block;">
+                                                Slower fallback for long audio; leave off for faster FFmpeg/Pydub stem export.
+                                            </small>
+                                        </div>
+                                        <div class="form-group">
+                                            <label style="display: flex; align-items: center; gap: 10px;">
                                                 <input type="checkbox" id="translatePreserveSilence">
                                                 <span>Preserve original audio for segments treated as silence</span>
                                             </label>
@@ -2244,6 +2253,7 @@ Status: CONTINUE (more chunks) or LAST (final chunk)</div>
                                                 <div class="api-param-group-title">Audio Separation (Vocal/Instrumental)</div>
                                                 <div class="api-param"><span class="api-param-name">audio_separator_enabled</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable audio-separator for vocal/instrumental separation (recommended for backing track)</span></div>
                                                 <div class="api-param"><span class="api-param-name">audio_separator_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Model: 'fast' (UVR-MDX-NET), 'balance' (default, BS-Roformer), or 'quality' (Mel-Band-Roformer)</span></div>
+                                                <div class="api-param"><span class="api-param-name">audio_separator_use_soundfile</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Use soundfile writer for separated stems (slower fallback; default false)</span></div>
                                             </div>
                                                 <div class="api-param-group">
                                                 <div class="api-param-group-title">ClearVoice Enhancement</div>
@@ -3454,6 +3464,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             const translateSuperEl = document.getElementById('translateSuperResolution');
             const translateAudioSeparatorEl = document.getElementById('translateAudioSeparator');
             const translateAudioSeparatorModelEl = document.getElementById('translateAudioSeparatorModel');
+            const translateAudioSeparatorUseSoundfileEl = document.getElementById('translateAudioSeparatorUseSoundfile');
             const translateMergeBackEl = document.getElementById('translateMergeBack');
             const translateMergeBackLabelEl = document.getElementById('translateMergeBackLabel');
             const translateCustomBackingInput = document.getElementById('translateCustomBackingFile');
@@ -4467,6 +4478,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 formData.append('enhancement_model', translateEnhancementModelEl ? translateEnhancementModelEl.value : 'MossFormerGAN_SE_16K');
                 formData.append('audio_separator_enabled', translateAudioSeparatorEl && translateAudioSeparatorEl.checked ? 'true' : 'false');
                 formData.append('audio_separator_model', translateAudioSeparatorModelEl ? translateAudioSeparatorModelEl.value : 'balance');
+                formData.append('audio_separator_use_soundfile', translateAudioSeparatorUseSoundfileEl && translateAudioSeparatorUseSoundfileEl.checked ? 'true' : 'false');
                 appendClearVoiceParallelSettings(formData);
                 if (translateBaseFilenameInput && translateBaseFilenameInput.value.trim()) {
                     formData.append('base_filename', translateBaseFilenameInput.value.trim());
@@ -5180,6 +5192,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 const audioSepEnabled = translateAudioSeparatorEl && translateAudioSeparatorEl.checked;
                 if (translateAudioSeparatorModelEl) {
                     translateAudioSeparatorModelEl.disabled = !audioSepEnabled;
+                }
+                if (translateAudioSeparatorUseSoundfileEl) {
+                    translateAudioSeparatorUseSoundfileEl.disabled = !audioSepEnabled;
                 }
                 // Also sync the merge back state since it depends on audio-separator
                 syncTranslateMergeBackState();
@@ -6616,6 +6631,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
                         formData.append('audio_separator_enabled', translateAudioSeparatorEl && translateAudioSeparatorEl.checked ? 'true' : 'false');
                         formData.append('audio_separator_model', translateAudioSeparatorModelEl ? translateAudioSeparatorModelEl.value : 'balance');
+                        formData.append('audio_separator_use_soundfile', translateAudioSeparatorUseSoundfileEl && translateAudioSeparatorUseSoundfileEl.checked ? 'true' : 'false');
                         formData.append('merge_backing_track', translateMergeBackEl && translateMergeBackEl.checked ? 'true' : 'false');
                         formData.append('ignore_non_speech', translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? 'true' : 'false');
                         formData.append('preserve_silence_audio', translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? 'true' : 'false');
@@ -6688,6 +6704,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     formData.append('super_resolution_voice', translateSuperEl && translateSuperEl.checked ? 'true' : 'false');
                     formData.append('audio_separator_enabled', translateAudioSeparatorEl && translateAudioSeparatorEl.checked ? 'true' : 'false');
                     formData.append('audio_separator_model', translateAudioSeparatorModelEl ? translateAudioSeparatorModelEl.value : 'balance');
+                    formData.append('audio_separator_use_soundfile', translateAudioSeparatorUseSoundfileEl && translateAudioSeparatorUseSoundfileEl.checked ? 'true' : 'false');
                     formData.append('merge_backing_track', translateMergeBackEl && translateMergeBackEl.checked ? 'true' : 'false');
                     formData.append('ignore_non_speech', translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? 'true' : 'false');
                     formData.append('preserve_silence_audio', translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? 'true' : 'false');

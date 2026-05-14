@@ -24,6 +24,7 @@ import os
 import re
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -66,6 +67,20 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_int(name: str, default: int, *, min_value: int = 1, max_value: Optional[int] = None) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
 WHISPERX_MODEL_SIZE = os.getenv("WHISPERX_MODEL_SIZE", "large-v3")
 WHISPERX_DEVICE = os.getenv("WHISPERX_DEVICE", "cuda")
 WHISPERX_COMPUTE_TYPE = os.getenv("WHISPERX_COMPUTE_TYPE", "float16")
@@ -95,6 +110,12 @@ WHISPERX_TRANSLATION_BATCH_SIZE = int(
 )
 WHISPERX_TRANSLATION_MAX_RETRIES = int(
     os.getenv("WHISPERX_TRANSLATION_MAX_RETRIES", "4")
+)
+WHISPERX_TRANSLATION_MAX_WORKERS = _env_int(
+    "WHISPERX_TRANSLATION_MAX_WORKERS",
+    10,
+    min_value=1,
+    max_value=10,
 )
 
 # ---------------------------------------------------------------------------
@@ -667,6 +688,7 @@ def _run_whisperx_pipeline_sync(
     hf_token: Optional[str] = None,
     translation_llm_model: Optional[str] = None,
     translation_batch_size: int = WHISPERX_TRANSLATION_BATCH_SIZE,
+    translation_max_workers: int = WHISPERX_TRANSLATION_MAX_WORKERS,
     force_refresh: bool = False,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str, Dict[str, Any]]:
     """Run the full WhisperX pipeline synchronously.
@@ -691,6 +713,11 @@ def _run_whisperx_pipeline_sync(
     compute_type = WHISPERX_COMPUTE_TYPE
     batch_size = max(1, WHISPERX_BATCH_SIZE)
     translation_batch_size = max(1, int(translation_batch_size or 1))
+    try:
+        translation_max_workers = int(translation_max_workers or 1)
+    except (TypeError, ValueError):
+        translation_max_workers = WHISPERX_TRANSLATION_MAX_WORKERS
+    translation_max_workers = max(1, min(10, translation_max_workers))
     source_language = _normalize_source_language(source_language)
     llm_model = translation_llm_model or WHISPERX_TRANSLATION_LLM
 
@@ -708,6 +735,7 @@ def _run_whisperx_pipeline_sync(
         "hit": False,
         "force_refresh": False,
         "pipeline": "whisperx",
+        "translation_max_workers": translation_max_workers,
     }
 
     if force_refresh:
@@ -864,14 +892,14 @@ def _run_whisperx_pipeline_sync(
                 "Install with: pip install litai"
             )
         else:
-            llm = LitaiLLM(model=llm_model)
             total_segments = len(segments)
+            translation_jobs: List[Dict[str, Any]] = []
 
             for i in range(0, total_segments, translation_batch_size):
                 chunk = segments[i: i + translation_batch_size]
-                source_texts = [
-                    seg["source_text"] for seg in chunk if seg["source_text"]
-                ]
+                non_empty = [seg for seg in chunk if seg.get("source_text")]
+                source_texts = [seg["source_text"] for seg in non_empty]
+                batch_label = f"Batch {i // translation_batch_size + 1}"
 
                 if not source_texts:
                     print(
@@ -880,35 +908,75 @@ def _run_whisperx_pipeline_sync(
                     )
                     continue
 
-                batch_label = f"Batch {i // translation_batch_size + 1}"
+                translation_jobs.append({
+                    "label": batch_label,
+                    "start": i + 1,
+                    "end": min(i + translation_batch_size, total_segments),
+                    "segments": non_empty,
+                    "source_texts": source_texts,
+                })
+
+            if translation_jobs:
+                worker_count = min(translation_max_workers, len(translation_jobs))
                 print(
-                    f"\n  Translating {batch_label} "
-                    f"(Segments {i + 1} to "
-                    f"{min(i + translation_batch_size, total_segments)})..."
+                    f"  Translating {len(translation_jobs)} batch(es) with "
+                    f"up to {worker_count} parallel worker(s)."
                 )
 
-                translated_texts = _translate_texts_adaptively(
-                    llm=llm,
-                    source_texts=source_texts,
-                    dest_language=dest_language,
-                    batch_label=batch_label,
-                    source_language=source_language,
-                )
+                def _run_translation_job(job: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+                    batch_label = str(job["label"])
+                    print(
+                        f"\n  Translating {batch_label} "
+                        f"(Segments {job['start']} to {job['end']})..."
+                    )
+                    llm = LitaiLLM(model=llm_model)
+                    translated = _translate_texts_adaptively(
+                        llm=llm,
+                        source_texts=job["source_texts"],
+                        dest_language=dest_language,
+                        batch_label=batch_label,
+                        source_language=source_language,
+                    )
+                    return job, translated
 
-                if translated_texts and len(translated_texts) == len(source_texts):
-                    non_empty = [seg for seg in chunk if seg["source_text"]]
-                    for seg_ref, trans in zip(non_empty, translated_texts):
-                        seg_ref["translated_text"] = trans
-                    blank_count = sum(1 for item in translated_texts if not item.strip())
-                    if blank_count:
-                        print(
-                            f"  [{batch_label}] ⚠️ Translated with "
-                            f"{blank_count} empty fallback item(s)."
-                        )
+                def _apply_translation_result(job: Dict[str, Any], translated_texts: List[str]) -> None:
+                    batch_label = str(job["label"])
+                    source_texts = job["source_texts"]
+                    if translated_texts and len(translated_texts) == len(source_texts):
+                        for seg_ref, trans in zip(job["segments"], translated_texts):
+                            seg_ref["translated_text"] = trans
+                        blank_count = sum(1 for item in translated_texts if not item.strip())
+                        if blank_count:
+                            print(
+                                f"  [{batch_label}] Translated with "
+                                f"{blank_count} empty fallback item(s)."
+                            )
+                        else:
+                            print(f"  [{batch_label}] Batch translated successfully.")
                     else:
-                        print(f"  [{batch_label}] ✅ Batch translated successfully.")
+                        print(f"  [{batch_label}] Batch failed after retries.")
+
+                if worker_count <= 1:
+                    for job in translation_jobs:
+                        result_job, translated_texts = _run_translation_job(job)
+                        _apply_translation_result(result_job, translated_texts)
                 else:
-                    print(f"  [{batch_label}] ❌ Batch failed after retries.")
+                    with ThreadPoolExecutor(
+                        max_workers=worker_count,
+                        thread_name_prefix="whisperx_translate",
+                    ) as pool:
+                        future_to_job = {
+                            pool.submit(_run_translation_job, job): job
+                            for job in translation_jobs
+                        }
+                        for future in as_completed(future_to_job):
+                            job = future_to_job[future]
+                            try:
+                                result_job, translated_texts = future.result()
+                            except Exception as exc:
+                                print(f"  [{job['label']}] Batch failed: {exc}")
+                                continue
+                            _apply_translation_result(result_job, translated_texts)
 
     # Build raw text for session storage
     raw_output = {
@@ -932,6 +1000,7 @@ def _run_whisperx_pipeline_sync(
         "segment_padding_seconds": WHISPERX_SEGMENT_PADDING_SECONDS,
         "min_segment_seconds": WHISPERX_MIN_SEGMENT_SECONDS,
         "translation_llm_model": llm_model if enable_translation else None,
+        "translation_max_workers": translation_max_workers if enable_translation else None,
         "segments": segments,
         "speaker_profiles": speaker_profiles,
         "raw_text": raw_text,
