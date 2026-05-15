@@ -324,6 +324,7 @@
                 flex-direction: column;
                 gap: 3px;
                 flex: 1;
+                min-width: 0;
             }
             .step-meta h4 {
                 margin: 0;
@@ -334,6 +335,38 @@
                 margin: 2px 0 0;
                 color: var(--text-muted);
                 font-size: 0.88rem;
+            }
+            .step-summary {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 6px;
+                margin-top: 8px;
+            }
+            .summary-chip {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                max-width: 100%;
+                padding: 3px 8px;
+                border: 1px solid rgba(148, 163, 184, 0.22);
+                border-radius: 999px;
+                background: rgba(15, 23, 42, 0.45);
+                color: var(--text-secondary);
+                font-size: 0.76rem;
+                line-height: 1.35;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .summary-chip strong {
+                color: var(--text-muted);
+                font-weight: 600;
+                flex: 0 0 auto;
+            }
+            .summary-chip .summary-value {
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
             }
             .step-toggle {
                 margin-left: auto;
@@ -360,6 +393,12 @@
                 margin-bottom: 0;
             }
             .translate-step.collapsible.collapsed .step-body {
+                display: none;
+            }
+            .translate-step.collapsible.collapsed .step-header {
+                margin-bottom: 0;
+            }
+            .translate-step.collapsible:not(.collapsed) .step-summary {
                 display: none;
             }
             .form-group {
@@ -1682,6 +1721,7 @@
                                         <div class="step-meta">
                                             <h4>AI & Transcription Configuration</h4>
                                             <p class="step-description">Choose the transcription pipeline, target language, and model settings.</p>
+                                            <div id="translateAiConfigSummary" class="step-summary" aria-live="polite"></div>
                                         </div>
                                         <button type="button" class="step-toggle" aria-expanded="false">Expand</button>
                                     </div>
@@ -1705,6 +1745,9 @@
                                                     <option value="Chinese" selected>Chinese</option>
                                                 </select>
                                             </div>
+                                        </div>
+                                        <div id="translateWhisperXSettings" class="checkbox-group" style="display: none; margin-bottom: 14px;">
+                                            <label><input type="checkbox" id="translateWhisperXProxyRefiner"> Speaker-aware proxy refiner</label>
                                         </div>
                                         <div id="translateGeminiSettings" class="form-row-3">
                                             <div class="form-group">
@@ -1794,6 +1837,7 @@
                                         <div class="step-meta">
                                             <h4>Additional Settings</h4>
                                             <p class="step-description">Control output format, merging, mix levels, and silence handling.</p>
+                                            <div id="translateAdditionalSettingsSummary" class="step-summary" aria-live="polite"></div>
                                         </div>
                                         <button type="button" class="step-toggle" aria-expanded="false">Expand</button>
                                     </div>
@@ -2265,6 +2309,8 @@ Status: CONTINUE (more chunks) or LAST (final chunk)</div>
                                             <div class="api-param-group">
                                                 <div class="api-param-group-title">Advanced Options</div>
                                                 <div class="api-param"><span class="api-param-name">prompt</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Custom Gemini instructions</span></div>
+                                                <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini' or 'whisperx'</span></div>
+                                                <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
                                                 <div class="api-param"><span class="api-param-name">segments_json</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Pre-generated Gemini segments (skip inference)</span></div>
                                                 <div class="api-param"><span class="api-param-name">min_speech_ms</span> / <span class="api-param-name">max_merge_ms</span> <span class="api-param-type">int</span> <span class="api-param-desc">— Segment merging heuristics</span></div>
                                             </div>
@@ -2292,6 +2338,8 @@ Content-Type: audio/mpeg</div>
                                                 <div class="api-param"><span class="api-param-name">audio_file</span> <span class="api-param-type">file</span> <span class="api-param-desc">— Source audio</span></div>
                                                 <div class="api-param"><span class="api-param-name">dest_language</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Target language (required)</span></div>
                                                 <div class="api-param"><span class="api-param-name">translate_text</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— true=translate, false=transcribe only</span></div>
+                                                <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini' or 'whisperx'</span></div>
+                                                <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
                                                 <div class="api-param"><span class="api-param-name">gemini_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Model selection (flash/pro)</span></div>
                                                 <div class="api-param"><span class="api-param-name">reuse_session_id</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Reuse audio from previous session</span></div>
                                                 <div class="api-param"><span class="api-param-name">default_speaker_preset</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Default voice for all speakers</span></div>
@@ -2395,6 +2443,8 @@ Content-Type: audio/mpeg</div>
                                                 <div class="api-param-group-title">JSON Body</div>
                                                 <div class="api-param"><span class="api-param-name">chunk_session_ids</span> <span class="api-param-type">array</span> <span class="api-param-desc">— Array of session IDs to process</span></div>
                                                 <div class="api-param"><span class="api-param-name">dest_language</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Target language</span></div>
+                                                <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini' or 'whisperx'</span></div>
+                                                <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
                                             </div>
                                         </div>
                                     </div>
@@ -3493,9 +3543,106 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             const translateTranslatedSrtClear = document.getElementById('translateTranslatedSrtClear');
             const translateSrtSummary = document.getElementById('translateSrtSummary');
             const translateTranscriptionPipeline = document.getElementById('translateTranscriptionPipeline');
+            const translateWhisperXSettingsDiv = document.getElementById('translateWhisperXSettings');
+            const translateWhisperXProxyRefiner = document.getElementById('translateWhisperXProxyRefiner');
             const translateGeminiSettingsDiv = document.getElementById('translateGeminiSettings');
             const translatePipelineInfo = document.getElementById('translatePipelineInfo');
+            const translateAiConfigSummary = document.getElementById('translateAiConfigSummary');
+            const translateAdditionalSettingsSummary = document.getElementById('translateAdditionalSettingsSummary');
             const DEFAULT_EMOTION_WEIGHT = 0.6;
+            const TRANSLATE_SETTINGS_STORAGE_KEY = 'indexTts.translateSettings.v1';
+
+            function readTranslatePersistentSettings() {
+                try {
+                    const raw = window.localStorage
+                        ? window.localStorage.getItem(TRANSLATE_SETTINGS_STORAGE_KEY)
+                        : null;
+                    if (!raw) {
+                        return {};
+                    }
+                    const parsed = JSON.parse(raw);
+                    return parsed && typeof parsed === 'object' ? parsed : {};
+                } catch (error) {
+                    console.warn('Unable to read saved translation settings:', error);
+                    return {};
+                }
+            }
+
+            function writeTranslatePersistentSettings(settings) {
+                try {
+                    if (window.localStorage) {
+                        window.localStorage.setItem(
+                            TRANSLATE_SETTINGS_STORAGE_KEY,
+                            JSON.stringify(settings)
+                        );
+                    }
+                } catch (error) {
+                    console.warn('Unable to save translation settings:', error);
+                }
+            }
+
+            function selectHasOption(selectEl, value) {
+                return Array.from(selectEl.options || []).some(option => option.value === value);
+            }
+
+            function applyTranslatePersistentSettings() {
+                const settings = readTranslatePersistentSettings();
+                if (
+                    translateTranscriptionPipeline &&
+                    typeof settings.transcription_pipeline === 'string' &&
+                    selectHasOption(translateTranscriptionPipeline, settings.transcription_pipeline)
+                ) {
+                    translateTranscriptionPipeline.value = settings.transcription_pipeline;
+                }
+                if (
+                    translateDestLanguageSelect &&
+                    typeof settings.dest_language === 'string' &&
+                    selectHasOption(translateDestLanguageSelect, settings.dest_language)
+                ) {
+                    translateDestLanguageSelect.value = settings.dest_language;
+                }
+                if (
+                    translateGeminiModel &&
+                    typeof settings.gemini_model === 'string' &&
+                    selectHasOption(translateGeminiModel, settings.gemini_model)
+                ) {
+                    translateGeminiModel.value = settings.gemini_model;
+                }
+                if (translateGeminiApiKey && typeof settings.gemini_api_key === 'string') {
+                    translateGeminiApiKey.value = settings.gemini_api_key;
+                }
+                if (
+                    translateWhisperXProxyRefiner &&
+                    typeof settings.whisperx_proxy_refiner === 'boolean'
+                ) {
+                    translateWhisperXProxyRefiner.checked = settings.whisperx_proxy_refiner;
+                }
+                if (
+                    translateIgnoreNonSpeechEl &&
+                    typeof settings.ignore_non_speech === 'boolean'
+                ) {
+                    translateIgnoreNonSpeechEl.checked = settings.ignore_non_speech;
+                }
+            }
+
+            function saveTranslatePersistentSettings() {
+                writeTranslatePersistentSettings({
+                    transcription_pipeline: translateTranscriptionPipeline
+                        ? translateTranscriptionPipeline.value
+                        : '',
+                    whisperx_proxy_refiner: translateWhisperXProxyRefiner
+                        ? translateWhisperXProxyRefiner.checked
+                        : false,
+                    gemini_model: translateGeminiModel ? translateGeminiModel.value : '',
+                    gemini_api_key: translateGeminiApiKey ? translateGeminiApiKey.value : '',
+                    dest_language: translateDestLanguageSelect ? translateDestLanguageSelect.value : '',
+                    ignore_non_speech: translateIgnoreNonSpeechEl
+                        ? translateIgnoreNonSpeechEl.checked
+                        : false,
+                });
+            }
+
+            applyTranslatePersistentSettings();
 
             // Pipeline selector toggle logic
             function updatePipelineVisibility() {
@@ -3504,6 +3651,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     translateGeminiSettingsDiv.style.opacity = isWhisperX ? '0.4' : '1';
                     translateGeminiSettingsDiv.style.pointerEvents = isWhisperX ? 'none' : 'auto';
                 }
+                if (translateWhisperXSettingsDiv) {
+                    translateWhisperXSettingsDiv.style.display = isWhisperX ? 'flex' : 'none';
+                }
                 if (translatePipelineInfo) {
                     translatePipelineInfo.textContent = isWhisperX
                         ? '🖥️ WhisperX local pipeline — Gemini settings do not apply'
@@ -3511,8 +3661,34 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 }
             }
             if (translateTranscriptionPipeline) {
-                translateTranscriptionPipeline.addEventListener('change', updatePipelineVisibility);
+                translateTranscriptionPipeline.addEventListener('change', () => {
+                    saveTranslatePersistentSettings();
+                    updatePipelineVisibility();
+                    updateAiConfigSummary();
+                });
                 updatePipelineVisibility();
+            }
+            if (translateWhisperXProxyRefiner) {
+                translateWhisperXProxyRefiner.addEventListener('change', () => {
+                    saveTranslatePersistentSettings();
+                    updateAiConfigSummary();
+                });
+            }
+            if (translateGeminiModel) {
+                translateGeminiModel.addEventListener('change', () => {
+                    saveTranslatePersistentSettings();
+                    updateAiConfigSummary();
+                });
+            }
+            if (translateGeminiApiKey) {
+                translateGeminiApiKey.addEventListener('input', () => {
+                    saveTranslatePersistentSettings();
+                    updateAiConfigSummary();
+                });
+                translateGeminiApiKey.addEventListener('change', () => {
+                    saveTranslatePersistentSettings();
+                    updateAiConfigSummary();
+                });
             }
             const DEFAULT_VOLUME_PERCENT = 100;
             const MIN_VOLUME_PERCENT = 10;
@@ -3590,6 +3766,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 if (previousValue && availableSpeakerPresets.includes(previousValue)) {
                     translateDefaultSpeakerSelect.value = previousValue;
                 }
+                updateAdditionalSettingsSummary();
             }
             function syncDefaultEmotionWeightDisplay() {
                 if (!translateDefaultEmotionWeightInput || !translateDefaultEmotionWeightValue) {
@@ -3598,6 +3775,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 const parsed = parseFloat(translateDefaultEmotionWeightInput.value);
                 const safeValue = Number.isNaN(parsed) ? DEFAULT_EMOTION_WEIGHT : parsed;
                 translateDefaultEmotionWeightValue.textContent = safeValue.toFixed(2);
+                updateAdditionalSettingsSummary();
             }
             if (translateDefaultEmotionWeightInput) {
                 translateDefaultEmotionWeightInput.addEventListener('input', syncDefaultEmotionWeightDisplay);
@@ -3612,6 +3790,212 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             let translateChunkSelections = new Set();
             let currentChunkSessionId = null;
             let translateLanguageCodeHint = null;
+
+            function selectedOptionLabel(selectEl, fallback = '') {
+                if (!selectEl) {
+                    return fallback;
+                }
+                const selected = selectEl.selectedOptions && selectEl.selectedOptions[0];
+                return (selected ? selected.textContent : selectEl.value || fallback).trim();
+            }
+
+            function numericInputValue(inputEl, fallback = '') {
+                if (!inputEl) {
+                    return fallback;
+                }
+                const value = (inputEl.value || '').trim();
+                return value || fallback;
+            }
+
+            function renderStepSummary(container, items) {
+                if (!container) {
+                    return;
+                }
+                container.textContent = '';
+                items
+                    .filter(item => item && item.value !== undefined && item.value !== null && String(item.value).trim() !== '')
+                    .forEach(item => {
+                        const chip = document.createElement('span');
+                        chip.className = 'summary-chip';
+                        const label = document.createElement('strong');
+                        label.textContent = `${item.label}:`;
+                        const value = document.createElement('span');
+                        value.className = 'summary-value';
+                        value.textContent = String(item.value);
+                        chip.appendChild(label);
+                        chip.appendChild(value);
+                        container.appendChild(chip);
+                    });
+            }
+
+            function updateAiConfigSummary() {
+                const pipelineValue = translateTranscriptionPipeline
+                    ? translateTranscriptionPipeline.value
+                    : 'gemini';
+                const pipelineLabel = pipelineValue === 'whisperx' ? 'WhisperX' : 'Gemini';
+                const items = [
+                    { label: 'Pipeline', value: pipelineLabel },
+                    {
+                        label: 'Lang',
+                        value:
+                            (translateDestLanguageSelect && translateDestLanguageSelect.value) ||
+                            'Select...',
+                    },
+                    {
+                        label: 'Input',
+                        value:
+                            translateSrtSubtitleToggle && translateSrtSubtitleToggle.checked
+                                ? 'SRT'
+                                : translateManualSegmentsToggle && translateManualSegmentsToggle.checked
+                                    ? 'Manual JSON'
+                                    : 'Auto',
+                    },
+                ];
+                if (pipelineValue === 'whisperx') {
+                    items.push({
+                        label: 'Refiner',
+                        value:
+                            translateWhisperXProxyRefiner && translateWhisperXProxyRefiner.checked
+                                ? 'On'
+                                : 'Off',
+                    });
+                } else {
+                    items.push({
+                        label: 'Model',
+                        value: selectedOptionLabel(translateGeminiModel, 'Default'),
+                    });
+                    items.push({
+                        label: 'API key',
+                        value:
+                            translateGeminiApiKey && translateGeminiApiKey.value.trim()
+                                ? 'Set'
+                                : 'Default',
+                    });
+                }
+                items.push({
+                    label: 'Non-speech',
+                    value:
+                        translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked
+                            ? 'Ignored'
+                            : 'Kept',
+                });
+                items.push({
+                    label: 'Cache',
+                    value:
+                        translateForceGeminiRefresh && translateForceGeminiRefresh.checked
+                            ? 'Refresh'
+                            : 'Use',
+                });
+                renderStepSummary(translateAiConfigSummary, items);
+            }
+
+            function updateAdditionalSettingsSummary() {
+                const customBackingSelected =
+                    translateCustomBackingInput &&
+                    translateCustomBackingInput.files &&
+                    translateCustomBackingInput.files.length > 0;
+                const minSpeech = numericInputValue(translateMinSpeechInput, 'Default');
+                const maxMerge = numericInputValue(translateMaxMergeInput, 'Default');
+                const preserveSilence =
+                    translatePreserveSilenceEl && translatePreserveSilenceEl.checked;
+                const outputFormatSelect = document.getElementById('translateOutputFormat');
+                renderStepSummary(translateAdditionalSettingsSummary, [
+                    { label: 'Format', value: selectedOptionLabel(outputFormatSelect, 'MP3') },
+                    {
+                        label: 'Merge',
+                        value:
+                            translateMergeBackEl && translateMergeBackEl.checked && !translateMergeBackEl.disabled
+                                ? 'On'
+                                : 'Off',
+                    },
+                    {
+                        label: 'Speaker',
+                        value:
+                            translateDefaultSpeakerSelect && translateDefaultSpeakerSelect.value
+                                ? translateDefaultSpeakerSelect.value
+                                : 'Auto',
+                    },
+                    {
+                        label: 'Emotion',
+                        value: numericInputValue(translateDefaultEmotionWeightInput, DEFAULT_EMOTION_WEIGHT.toFixed(2)),
+                    },
+                    {
+                        label: 'Vol',
+                        value: `${numericInputValue(translateVolumeInput, '100')}% / ${numericInputValue(translateBackingVolumeInput, '100')}%`,
+                    },
+                    {
+                        label: 'Rules',
+                        value: `Min ${minSpeech} ms, gap ${maxMerge} ms`,
+                    },
+                    {
+                        label: 'Backing',
+                        value: customBackingSelected
+                            ? 'Custom'
+                            : translateBackingAvailableFromSession
+                                ? 'Session'
+                                : 'Default',
+                    },
+                    {
+                        label: 'Silence',
+                        value: preserveSilence
+                            ? `Preserve ${numericInputValue(translateSilenceVolumeInput, '100')}%`
+                            : 'Skip',
+                    },
+                    {
+                        label: 'Soundfile',
+                        value:
+                            translateAudioSeparatorUseSoundfileEl &&
+                            !translateAudioSeparatorUseSoundfileEl.disabled &&
+                            translateAudioSeparatorUseSoundfileEl.checked
+                                ? 'On'
+                                : 'Off',
+                    },
+                ]);
+            }
+
+            function updateTranslateStepSummaries() {
+                updateAiConfigSummary();
+                updateAdditionalSettingsSummary();
+            }
+
+            function bindSummaryInputUpdates(elements) {
+                elements.forEach(element => {
+                    if (!element) {
+                        return;
+                    }
+                    element.addEventListener('input', updateAdditionalSettingsSummary);
+                    element.addEventListener('change', updateAdditionalSettingsSummary);
+                });
+            }
+
+            function bindAiSummaryUpdates(elements) {
+                elements.forEach(element => {
+                    if (!element) {
+                        return;
+                    }
+                    element.addEventListener('input', updateAiConfigSummary);
+                    element.addEventListener('change', updateAiConfigSummary);
+                });
+            }
+
+            bindSummaryInputUpdates([
+                translateMinSpeechInput,
+                translateMaxMergeInput,
+                translateDefaultSpeakerSelect,
+                translateDefaultEmotionWeightInput,
+                translateVolumeInput,
+                translateBackingVolumeInput,
+                translateAudioSeparatorUseSoundfileEl,
+                translateMergeBackEl,
+                translatePreserveSilenceEl,
+                translateSilenceVolumeInput,
+            ]);
+            bindAiSummaryUpdates([
+                translateForceGeminiRefresh,
+                translateManualSegmentsToggle,
+                translateSrtSubtitleToggle,
+            ]);
+            updateTranslateStepSummaries();
 
             if (translateBaseFilenameInput) {
                 translateBaseFilenameInput.addEventListener('input', () => {
@@ -4060,6 +4444,12 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 if (translateTranscriptionPipeline && translateTranscriptionPipeline.value) {
                     payload.transcription_pipeline = translateTranscriptionPipeline.value;
                 }
+                payload.whisperx_proxy_refiner = !!(
+                    translateTranscriptionPipeline &&
+                    translateTranscriptionPipeline.value === 'whisperx' &&
+                    translateWhisperXProxyRefiner &&
+                    translateWhisperXProxyRefiner.checked
+                );
                 payload.merge_backing_track = translateMergeBackEl && translateMergeBackEl.checked ? true : false;
                 payload.ignore_non_speech = translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? true : false;
                 payload.preserve_silence_audio = translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? true : false;
@@ -5081,21 +5471,21 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             }
 
             function updateCustomBackingSummary() {
-                if (!translateCustomBackingSummary) {
-                    return;
+                if (translateCustomBackingSummary) {
+                    if (hasCustomBackingSelection()) {
+                        const file = translateCustomBackingInput.files[0];
+                        translateCustomBackingSummary.textContent = `Selected: ${file ? file.name : ''}`;
+                        translateCustomBackingSummary.style.color = '#0a7c4a';
+                    } else if (translateBackingAvailableFromSession) {
+                        translateCustomBackingSummary.textContent = 'Using stored backing track from current session.';
+                        translateCustomBackingSummary.style.color = '#0a7c4a';
+                    } else {
+                        translateCustomBackingSummary.textContent =
+                            'No custom backing selected. Upload audio here to override the extracted instrumental when mix-back is enabled.';
+                        translateCustomBackingSummary.style.color = '#666';
+                    }
                 }
-                if (hasCustomBackingSelection()) {
-                    const file = translateCustomBackingInput.files[0];
-                    translateCustomBackingSummary.textContent = `Selected: ${file ? file.name : ''}`;
-                    translateCustomBackingSummary.style.color = '#0a7c4a';
-                } else if (translateBackingAvailableFromSession) {
-                    translateCustomBackingSummary.textContent = 'Using stored backing track from current session.';
-                    translateCustomBackingSummary.style.color = '#0a7c4a';
-                } else {
-                    translateCustomBackingSummary.textContent =
-                        'No custom backing selected. Upload audio here to override the extracted instrumental when mix-back is enabled.';
-                    translateCustomBackingSummary.style.color = '#666';
-                }
+                updateAdditionalSettingsSummary();
             }
 
             function setTranslateButtonLabel() {
@@ -5124,6 +5514,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 if (translateMergeBackLabelEl) {
                     translateMergeBackLabelEl.style.opacity = canEnableMerge ? '1' : '0.5';
                 }
+                updateAdditionalSettingsSummary();
             }
 
             function enforceEnhancementForSuperRes() {
@@ -5164,6 +5555,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             updateCustomBackingSummary();
             if (translateDestLanguageSelect) {
                 translateDestLanguageSelect.addEventListener('change', () => {
+                    saveTranslatePersistentSettings();
+                    updateAiConfigSummary();
                     refreshPromptTemplates();
                     updateFfmpegCommands();
                 });
@@ -5183,6 +5576,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             }
             if (translateIgnoreNonSpeechEl) {
                 translateIgnoreNonSpeechEl.addEventListener('change', () => {
+                    saveTranslatePersistentSettings();
+                    updateAiConfigSummary();
                     refreshPromptTemplates();
                 });
             }
@@ -6497,6 +6892,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 }
                 renderSpeakerAssignments();
                 updateChunkSelectionUI();
+                updateTranslateStepSummaries();
             }
 
             function syncSegmentRulesFromMetadata(rules) {
@@ -6517,6 +6913,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         translateMaxMergeInput.value = '';
                     }
                 }
+                updateAdditionalSettingsSummary();
             }
 
             if (translateAdvancedToggle) {
@@ -6651,6 +7048,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         if (translateTranscriptionPipeline && translateTranscriptionPipeline.value) {
                             formData.append('transcription_pipeline', translateTranscriptionPipeline.value);
                         }
+                        if (translateTranscriptionPipeline && translateTranscriptionPipeline.value === 'whisperx') {
+                            formData.append('whisperx_proxy_refiner', translateWhisperXProxyRefiner && translateWhisperXProxyRefiner.checked ? 'true' : 'false');
+                        }
                         if (translateForceGeminiRefresh && translateForceGeminiRefresh.checked) {
                             formData.append('force_gemini_regenerate', 'true');
                         }
@@ -6723,6 +7123,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     }
                     if (translateTranscriptionPipeline && translateTranscriptionPipeline.value) {
                         formData.append('transcription_pipeline', translateTranscriptionPipeline.value);
+                    }
+                    if (translateTranscriptionPipeline && translateTranscriptionPipeline.value === 'whisperx') {
+                        formData.append('whisperx_proxy_refiner', translateWhisperXProxyRefiner && translateWhisperXProxyRefiner.checked ? 'true' : 'false');
                     }
                     if (translateForceGeminiRefresh && translateForceGeminiRefresh.checked) {
                         formData.append('force_gemini_regenerate', 'true');
@@ -7055,6 +7458,14 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     if (translateIgnoreNonSpeechEl && data.metadata && typeof data.metadata.ignore_non_speech === 'boolean') {
                         translateIgnoreNonSpeechEl.checked = !!data.metadata.ignore_non_speech;
                         refreshPromptTemplates();
+                    }
+                    if (
+                        data.metadata &&
+                        (data.metadata.gemini_model ||
+                            typeof data.metadata.ignore_non_speech === 'boolean')
+                    ) {
+                        saveTranslatePersistentSettings();
+                        updateAiConfigSummary();
                     }
                     if (translatePreserveSilenceEl && data.metadata && typeof data.metadata.preserve_silence_audio === 'boolean') {
                         translatePreserveSilenceEl.checked = !!data.metadata.preserve_silence_audio;

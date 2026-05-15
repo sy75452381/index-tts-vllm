@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from whisperx_segment_refiner import RefinerConfig, refine_proxy_segments
+
 # Optional imports — gracefully degrade when not installed
 try:
     import whisperx
@@ -146,7 +148,9 @@ WHISPERX_CACHE_DIR = os.path.join(
     _SCRIPT_DIR,
     "whisperx_cache",
 )
-WHISPERX_CACHE_VERSION = 2
+WHISPERX_CACHE_VERSION = 3
+WHISPERX_PROXY_REFINER_DEFAULT_ENABLED = _env_flag("WHISPERX_PROXY_REFINER_ENABLED", False)
+WHISPERX_PROXY_REFINER_CONFIG = RefinerConfig()
 
 
 def is_whisperx_available() -> bool:
@@ -550,6 +554,7 @@ def _whisperx_cache_key(
     dest_language: str,
     enable_translation: bool,
     translation_llm_model: Optional[str],
+    enable_proxy_refiner: bool,
 ) -> str:
     """Build a deterministic cache key string."""
     parts = [
@@ -564,6 +569,11 @@ def _whisperx_cache_key(
         f"condition_prev={WHISPERX_CONDITION_ON_PREVIOUS_TEXT}",
         f"segment_pad={WHISPERX_SEGMENT_PADDING_SECONDS}",
         f"min_segment={WHISPERX_MIN_SEGMENT_SECONDS}",
+        (
+            f"proxy_refiner={WHISPERX_PROXY_REFINER_CONFIG.version}"
+            if enable_proxy_refiner
+            else "proxy_refiner=disabled"
+        ),
     ]
     if enable_translation:
         parts.append(f"llm={translation_llm_model or 'default'}")
@@ -600,6 +610,22 @@ def _write_whisperx_cache(cache_key: str, record: Dict[str, Any]) -> Optional[st
 
 def _compute_audio_hash(audio_bytes: bytes) -> str:
     return hashlib.md5(audio_bytes).hexdigest()
+
+
+def _print_proxy_refiner_stats(stats: Dict[str, Any]) -> None:
+    """Print a compact, grep-friendly proxy-refiner stats block."""
+    print("[proxy_refiner]")
+    for key in (
+        "raw_proxy_segments",
+        "refined_proxy_segments",
+        "speaker_change_splits",
+        "same_speaker_merges",
+        "long_turn_splits",
+        "speaker_impure_segments_fixed",
+        "segments_without_words",
+        "fallback_used",
+    ):
+        print(f"{key}={stats.get(key)}")
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +716,7 @@ def _run_whisperx_pipeline_sync(
     translation_batch_size: int = WHISPERX_TRANSLATION_BATCH_SIZE,
     translation_max_workers: int = WHISPERX_TRANSLATION_MAX_WORKERS,
     force_refresh: bool = False,
+    enable_proxy_refiner: bool = WHISPERX_PROXY_REFINER_DEFAULT_ENABLED,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str, Dict[str, Any]]:
     """Run the full WhisperX pipeline synchronously.
 
@@ -729,6 +756,7 @@ def _run_whisperx_pipeline_sync(
         dest_language=dest_language,
         enable_translation=enable_translation,
         translation_llm_model=llm_model,
+        enable_proxy_refiner=enable_proxy_refiner,
     )
     cache_info: Dict[str, Any] = {
         "audio_md5": audio_hash,
@@ -736,6 +764,7 @@ def _run_whisperx_pipeline_sync(
         "force_refresh": False,
         "pipeline": "whisperx",
         "translation_max_workers": translation_max_workers,
+        "enable_proxy_refiner": enable_proxy_refiner,
     }
 
     if force_refresh:
@@ -750,6 +779,7 @@ def _run_whisperx_pipeline_sync(
             cache_info["created_at"] = cached.get("created_at")
             cache_info["source_language"] = cached.get("source_language")
             cache_info["translation_llm_model"] = cached.get("translation_llm_model")
+            cache_info["proxy_refiner"] = cached.get("proxy_refiner")
             print(
                 f"♻️ WhisperX cache hit for audio md5={audio_hash}"
             )
@@ -832,6 +862,21 @@ def _run_whisperx_pipeline_sync(
         if diarize_model is not None:
             del diarize_model
         _release_model_memory()
+
+    if enable_proxy_refiner:
+        refined_segments, refine_stats = refine_proxy_segments(
+            proxy_result,
+            config=WHISPERX_PROXY_REFINER_CONFIG,
+        )
+        if refined_segments:
+            proxy_result["segments"] = refined_segments
+        cache_info["proxy_refiner"] = refine_stats
+        _print_proxy_refiner_stats(refine_stats)
+    else:
+        cache_info["proxy_refiner"] = {
+            "enabled": False,
+            "version": WHISPERX_PROXY_REFINER_CONFIG.version,
+        }
 
     print(
         f"  → Pass A produced {len(proxy_result.get('segments', []))} "
@@ -1016,6 +1061,8 @@ def _run_whisperx_pipeline_sync(
         "condition_on_previous_text": WHISPERX_CONDITION_ON_PREVIOUS_TEXT,
         "segment_padding_seconds": WHISPERX_SEGMENT_PADDING_SECONDS,
         "min_segment_seconds": WHISPERX_MIN_SEGMENT_SECONDS,
+        "enable_proxy_refiner": enable_proxy_refiner,
+        "proxy_refiner": cache_info.get("proxy_refiner"),
         "translation_llm_model": llm_model if enable_translation else None,
         "translation_max_workers": translation_max_workers if enable_translation else None,
         "segments": segments,

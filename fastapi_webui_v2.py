@@ -2149,6 +2149,7 @@ async def _build_translation_segments(
     original_audio_source_path: Optional[str] = None,
     backing_track_source_path: Optional[str] = None,
     transcription_pipeline: str = "gemini",
+    whisperx_proxy_refiner: bool = False,
 ) -> SegmentBuildResult:
     manual_chunk_data = None
     manual_speaker_profiles: List[Dict[str, Any]] = []
@@ -2171,6 +2172,10 @@ async def _build_translation_segments(
     transcription_pipeline = (transcription_pipeline or "").strip().lower()
     if transcription_pipeline not in ("gemini", "whisperx"):
         transcription_pipeline = "gemini"
+    whisperx_proxy_refiner = (
+        _coerce_to_bool(whisperx_proxy_refiner)
+        and transcription_pipeline == "whisperx"
+    )
 
     # Resolve pipeline label
     use_whisperx = transcription_pipeline == "whisperx"
@@ -2216,6 +2221,7 @@ async def _build_translation_segments(
                 enable_translation=translate_enabled,
                 translation_max_workers=10,
                 force_refresh=force_gemini_regenerate,
+                enable_proxy_refiner=whisperx_proxy_refiner,
             ),
         )
     else:
@@ -2374,6 +2380,7 @@ async def _build_translation_segments(
         "prompt": final_prompt,
         "gemini_model": resolved_gemini_model,
         "transcription_pipeline": transcription_pipeline,
+        "whisperx_proxy_refiner": whisperx_proxy_refiner,
         "ignore_non_speech": ignore_non_speech_flag,
         "preserve_silence_audio": preserve_silence_audio_flag,
         "generated_volume_percent": generated_volume_percent_value,
@@ -4563,6 +4570,7 @@ async def _generate_chunk_audio_from_session(
     silence_volume_percent: float,
     force_gemini_regenerate: bool = False,
     transcription_pipeline: str = "gemini",
+    whisperx_proxy_refiner: bool = False,
     default_speaker_preset: Optional[str] = None,
     default_emotion_weight: Optional[float] = None,
 ) -> Tuple[str, str, Dict[str, Any]]:
@@ -4570,6 +4578,10 @@ async def _generate_chunk_audio_from_session(
     transcription_pipeline = (transcription_pipeline or "").strip().lower()
     if transcription_pipeline not in ("gemini", "whisperx"):
         transcription_pipeline = "gemini"
+    whisperx_proxy_refiner = (
+        _coerce_to_bool(whisperx_proxy_refiner)
+        and transcription_pipeline == "whisperx"
+    )
 
     clearvoice_settings = chunk_session.clearvoice_settings or {}
     apply_enhancement = bool(clearvoice_settings.get("enhancement"))
@@ -4659,6 +4671,7 @@ async def _generate_chunk_audio_from_session(
         default_emotion_weight=default_emotion_weight,
         clearvoice_settings=clearvoice_settings,
         transcription_pipeline=transcription_pipeline,
+        whisperx_proxy_refiner=whisperx_proxy_refiner,
     )
 
     audio_payload, _media_type, synthesis_metadata = await _synthesize_translated_audio(
@@ -4690,6 +4703,7 @@ async def _generate_chunk_audio_from_session(
     metadata["silence_volume_percent"] = silence_volume_percent
     metadata["gemini_model"] = gemini_model
     metadata["transcription_pipeline"] = transcription_pipeline
+    metadata["whisperx_proxy_refiner"] = whisperx_proxy_refiner
     metadata["output_base_name"] = resolved_base_name
     metadata["default_speaker_preset"] = default_speaker_preset
     metadata["default_emotion_weight"] = default_emotion_weight
@@ -8607,6 +8621,10 @@ class TranslateRequest(BaseModel):
         default=None,
         description="Transcription pipeline to use: 'gemini' (default, cloud-based) or 'whisperx' (local WhisperX + LLM).",
     )
+    whisperx_proxy_refiner: Optional[bool] = Field(
+        default=False,
+        description="When using transcription_pipeline='whisperx', enable the experimental speaker-aware proxy segment refiner.",
+    )
 
 
 class SpeakerOverrideInput(BaseModel):
@@ -8757,6 +8775,10 @@ class ChunkBatchGenerateRequest(BaseModel):
     transcription_pipeline: Optional[str] = Field(
         default=None,
         description="Transcription pipeline to use for selected chunk generation: 'gemini' (default) or 'whisperx' (local).",
+    )
+    whisperx_proxy_refiner: Optional[bool] = Field(
+        default=False,
+        description="When using transcription_pipeline='whisperx', enable the experimental speaker-aware proxy segment refiner.",
     )
     merge_backing_track: Optional[bool] = Field(
         default=None,
@@ -10328,6 +10350,10 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
         transcription_pipeline_value = (payload.transcription_pipeline or "").strip().lower()
         if transcription_pipeline_value not in ("gemini", "whisperx"):
             transcription_pipeline_value = "gemini"
+        whisperx_proxy_refiner_flag = (
+            _coerce_to_bool(payload.whisperx_proxy_refiner)
+            and transcription_pipeline_value == "whisperx"
+        )
         ignore_non_speech_flag = _coerce_to_bool(
             payload.ignore_non_speech if payload.ignore_non_speech is not None else config_template.ignore_non_speech
         )
@@ -10380,6 +10406,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
             "bitrate": bitrate_value,
             "gemini_model": gemini_model_value,
             "transcription_pipeline": transcription_pipeline_value,
+            "whisperx_proxy_refiner": whisperx_proxy_refiner_flag,
             "merge_backing": merge_backing_requested,
             "force_gemini_regenerate": force_gemini_regenerate_flag,
         }
@@ -10444,6 +10471,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
                             silence_volume_percent=silence_volume_percent_value,
                             force_gemini_regenerate=force_gemini_regenerate_flag,
                             transcription_pipeline=transcription_pipeline_value,
+                            whisperx_proxy_refiner=whisperx_proxy_refiner_flag,
                             default_speaker_preset=session.default_speaker_preset,
                             default_emotion_weight=session.default_emotion_weight,
                         )
@@ -10567,6 +10595,7 @@ async def api_translate_segments(
     original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
     translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
     transcription_pipeline: Optional[str] = Form(None, description="Transcription pipeline: 'gemini' (default) or 'whisperx' (local)"),
+    whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
 ):
     """API: Prepare translation segments for advanced translate/edit workflow."""
     reuse_session_id_value: Optional[str] = reuse_session_id
@@ -10607,6 +10636,7 @@ async def api_translate_segments(
         default_speaker_value = default_speaker_preset
         default_emotion_weight_value = default_emotion_weight
         transcription_pipeline_value = transcription_pipeline
+        whisperx_proxy_refiner_value = whisperx_proxy_refiner
 
         payload, payload_error = await _read_optional_json_payload(
             request,
@@ -10677,6 +10707,8 @@ async def api_translate_segments(
                 default_emotion_weight_value = payload.get("default_emotion_weight", default_emotion_weight_value)
             if payload.get("transcription_pipeline"):
                 transcription_pipeline_value = payload.get("transcription_pipeline")
+            if "whisperx_proxy_refiner" in payload:
+                whisperx_proxy_refiner_value = payload.get("whisperx_proxy_refiner")
 
         srt_segments_from_upload, srt_upload_error = await _load_srt_segments_override(
             original_srt_file,
@@ -10767,6 +10799,10 @@ async def api_translate_segments(
         resolved_transcription_pipeline = (transcription_pipeline_value or "").strip().lower()
         if resolved_transcription_pipeline not in ("gemini", "whisperx"):
             resolved_transcription_pipeline = "gemini"
+        whisperx_proxy_refiner_flag = (
+            _coerce_to_bool(whisperx_proxy_refiner_value)
+            and resolved_transcription_pipeline == "whisperx"
+        )
 
         reuse_session_for_segments = reuse_source_session
         session_source_filename = uploaded_filename or (
@@ -10800,6 +10836,8 @@ async def api_translate_segments(
             "translate_enabled": translate_enabled,
             "base_output_name": resolved_base_name,
             "force_gemini_regenerate": force_gemini_regenerate_flag,
+            "transcription_pipeline": resolved_transcription_pipeline,
+            "whisperx_proxy_refiner": whisperx_proxy_refiner_flag,
         }
         print(
             "[translate_segments] dest=%s reuse_session=%s chunk_index=%s upload=%s format=%s backing=%s merge_backing=%s"
@@ -10924,6 +10962,7 @@ async def api_translate_segments(
                         original_audio_source_path=cached_vocals_path,
                         backing_track_source_path=cached_backing_path,
                         transcription_pipeline=resolved_transcription_pipeline,
+                        whisperx_proxy_refiner=whisperx_proxy_refiner_flag,
                     )
 
                     metadata = segment_result.metadata
@@ -11973,6 +12012,7 @@ async def api_translate_audio(
     original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
     translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
     transcription_pipeline: Optional[str] = Form(None, description="Transcription pipeline: 'gemini' (default) or 'whisperx' (local)"),
+    whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
 ):
     """API: Translate speech audio to a target language and return synthesized audio."""
     reuse_session_id_value: Optional[str] = reuse_session_id
@@ -12011,6 +12051,7 @@ async def api_translate_audio(
         default_speaker_value = default_speaker_preset
         default_emotion_weight_value = default_emotion_weight
         transcription_pipeline_value = transcription_pipeline
+        whisperx_proxy_refiner_value = whisperx_proxy_refiner
 
         payload, payload_error = await _read_optional_json_payload(
             request,
@@ -12105,6 +12146,8 @@ async def api_translate_audio(
                 default_emotion_weight_value = translate_req.default_emotion_weight
             if translate_req.transcription_pipeline:
                 transcription_pipeline_value = translate_req.transcription_pipeline
+            if translate_req.whisperx_proxy_refiner is not None:
+                whisperx_proxy_refiner_value = translate_req.whisperx_proxy_refiner
 
         default_speaker_value = (default_speaker_value or "").strip()
         if not default_speaker_value:
@@ -12116,6 +12159,10 @@ async def api_translate_audio(
         resolved_transcription_pipeline = (transcription_pipeline_value or "").strip().lower()
         if resolved_transcription_pipeline not in ("gemini", "whisperx"):
             resolved_transcription_pipeline = "gemini"
+        whisperx_proxy_refiner_flag = (
+            _coerce_to_bool(whisperx_proxy_refiner_value)
+            and resolved_transcription_pipeline == "whisperx"
+        )
 
         srt_segments_from_upload, srt_upload_error = await _load_srt_segments_override(
             original_srt_file,
@@ -12239,6 +12286,8 @@ async def api_translate_audio(
             "reuse_session": bool(reuse_source_session),
             "base_output_name": resolved_base_name,
             "force_gemini_regenerate": force_gemini_regenerate_flag,
+            "transcription_pipeline": resolved_transcription_pipeline,
+            "whisperx_proxy_refiner": whisperx_proxy_refiner_flag,
         }
         print(
             "[translate_audio] dest=%s reuse_session=%s chunk_index=%s upload=%s format=%s backing=%s merge_backing=%s"
@@ -12379,6 +12428,7 @@ async def api_translate_audio(
                         original_audio_source_path=cached_vocals_path,
                         backing_track_source_path=cached_backing_path,
                         transcription_pipeline=resolved_transcription_pipeline,
+                        whisperx_proxy_refiner=whisperx_proxy_refiner_flag,
                     )
                     session = segment_result.session
                     segments = segment_result.segments
