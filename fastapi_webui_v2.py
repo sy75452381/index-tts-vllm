@@ -2175,11 +2175,11 @@ async def _build_translation_segments(
     # Cached source paths for fast session storage (avoids re-encoding)
     original_audio_source_path: Optional[str] = None,
     backing_track_source_path: Optional[str] = None,
-    transcription_pipeline: str = "gemini",
+    transcription_pipeline: str = "qwen_omnivad",
     whisperx_proxy_refiner: bool = False,
     translation_llm_model: Optional[str] = None,
     qwen_omnivad_enable_diarization: bool = True,
-    qwen_omnivad_diarization_min_seconds: float = 10.0,
+    qwen_omnivad_diarization_min_seconds: float = 3.0,
 ) -> SegmentBuildResult:
     manual_chunk_data = None
     manual_speaker_profiles: List[Dict[str, Any]] = []
@@ -4647,7 +4647,7 @@ async def _generate_chunk_audio_from_session(
     default_speaker_preset: Optional[str] = None,
     default_emotion_weight: Optional[float] = None,
     qwen_omnivad_enable_diarization: bool = True,
-    qwen_omnivad_diarization_min_seconds: float = 10.0,
+    qwen_omnivad_diarization_min_seconds: float = 3.0,
 ) -> Tuple[str, str, Dict[str, Any]]:
     response_format = _normalize_translate_output_format(response_format)
     transcription_pipeline = (transcription_pipeline or "").strip().lower()
@@ -8709,7 +8709,7 @@ class TranslateRequest(BaseModel):
         description="Emotion weight (0.0-1.0) when using the original emotion prompt for the default speaker.",
     )
     transcription_pipeline: Optional[str] = Field(
-        default=None,
+        default="qwen_omnivad",
         description="Transcription pipeline to use: 'gemini' (default), 'whisperx', or 'qwen_omnivad' (Qwen3-ASR + OmniVAD).",
     )
     whisperx_proxy_refiner: Optional[bool] = Field(
@@ -8721,7 +8721,7 @@ class TranslateRequest(BaseModel):
         description="When using transcription_pipeline='qwen_omnivad', enable pyannote diarization.",
     )
     qwen_omnivad_diarization_min_seconds: Optional[float] = Field(
-        default=10.0,
+        default=3.0,
         description="When using transcription_pipeline='qwen_omnivad', minimum span duration to split by diarization.",
     )
 
@@ -8876,7 +8876,7 @@ class ChunkBatchGenerateRequest(BaseModel):
         description="LitAI API translation model for local transcription pipelines.",
     )
     transcription_pipeline: Optional[str] = Field(
-        default=None,
+        default="qwen_omnivad",
         description="Transcription pipeline to use for selected chunk generation: 'gemini' (default), 'whisperx', or 'qwen_omnivad'.",
     )
     whisperx_proxy_refiner: Optional[bool] = Field(
@@ -8888,7 +8888,7 @@ class ChunkBatchGenerateRequest(BaseModel):
         description="When using transcription_pipeline='qwen_omnivad', enable pyannote diarization.",
     )
     qwen_omnivad_diarization_min_seconds: Optional[float] = Field(
-        default=10.0,
+        default=3.0,
         description="When using transcription_pipeline='qwen_omnivad', minimum span duration to split by diarization.",
     )
     merge_backing_track: Optional[bool] = Field(
@@ -10711,10 +10711,10 @@ async def api_translate_segments(
     default_emotion_weight: Optional[float] = Form(None),
     original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
     translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
-    transcription_pipeline: Optional[str] = Form(None, description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), or 'qwen_omnivad' (Qwen3-ASR + OmniVAD)"),
+    transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), or 'qwen_omnivad' (Qwen3-ASR + OmniVAD)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
     qwen_omnivad_enable_diarization: Optional[bool] = Form(True, description="Enable pyannote diarization for Qwen OmniVAD pipeline."),
-    qwen_omnivad_diarization_min_seconds: Optional[float] = Form(10.0, description="Minimum span duration to split by diarization."),
+    qwen_omnivad_diarization_min_seconds: Optional[float] = Form(3.0, description="Minimum span duration to split by diarization."),
 ):
     """API: Prepare translation segments for advanced translate/edit workflow."""
     reuse_session_id_value: Optional[str] = reuse_session_id
@@ -11092,7 +11092,7 @@ async def api_translate_segments(
                         transcription_pipeline=resolved_transcription_pipeline,
                         whisperx_proxy_refiner=whisperx_proxy_refiner_flag,
                         qwen_omnivad_enable_diarization=qwen_omnivad_enable_diarization if qwen_omnivad_enable_diarization is not None else True,
-                        qwen_omnivad_diarization_min_seconds=float(qwen_omnivad_diarization_min_seconds) if qwen_omnivad_diarization_min_seconds is not None else 10.0,
+                        qwen_omnivad_diarization_min_seconds=float(qwen_omnivad_diarization_min_seconds) if qwen_omnivad_diarization_min_seconds is not None else 3.0,
                     )
 
                     metadata = segment_result.metadata
@@ -12143,10 +12143,10 @@ async def api_translate_audio(
     default_emotion_weight: Optional[float] = Form(None),
     original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
     translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
-    transcription_pipeline: Optional[str] = Form(None, description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), or 'qwen_omnivad' (Qwen3-ASR + OmniVAD)"),
+    transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), or 'qwen_omnivad' (Qwen3-ASR + OmniVAD)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
     qwen_omnivad_enable_diarization: Optional[bool] = Form(True, description="Enable pyannote diarization for Qwen OmniVAD pipeline."),
-    qwen_omnivad_diarization_min_seconds: Optional[float] = Form(10.0, description="Minimum span duration to split by diarization."),
+    qwen_omnivad_diarization_min_seconds: Optional[float] = Form(3.0, description="Minimum span duration to split by diarization."),
 ):
     """API: Translate speech audio to a target language and return synthesized audio."""
     reuse_session_id_value: Optional[str] = reuse_session_id
@@ -12573,7 +12573,7 @@ async def api_translate_audio(
                         transcription_pipeline=resolved_transcription_pipeline,
                         whisperx_proxy_refiner=whisperx_proxy_refiner_flag,
                         qwen_omnivad_enable_diarization=qwen_omnivad_enable_diarization if qwen_omnivad_enable_diarization is not None else True,
-                        qwen_omnivad_diarization_min_seconds=float(qwen_omnivad_diarization_min_seconds) if qwen_omnivad_diarization_min_seconds is not None else 10.0,
+                        qwen_omnivad_diarization_min_seconds=float(qwen_omnivad_diarization_min_seconds) if qwen_omnivad_diarization_min_seconds is not None else 3.0,
                     )
                     session = segment_result.session
                     segments = segment_result.segments
