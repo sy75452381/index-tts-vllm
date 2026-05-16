@@ -56,12 +56,21 @@ except Exception:
     LitaiLLM = None  # type: ignore[assignment]
     _translate_texts_adaptively = None  # type: ignore[assignment]
 
+try:
+    from whisperx.diarize import DiarizationPipeline
+except ImportError:
+    DiarizationPipeline = None  # type: ignore[assignment,misc]
+
+
 
 QWEN_OMNIVAD_MODEL_DIR = os.getenv(
     "QWEN_OMNIVAD_MODEL_DIR",
     os.path.join(_SCRIPT_DIR, "checkpoints", "qwen_omnivad"),
 )
 QWEN_OMNIVAD_HF_CACHE_DIR = os.path.join(QWEN_OMNIVAD_MODEL_DIR, ".cache", "huggingface")
+QWEN_OMNIVAD_PYANNOTE_CACHE = os.path.join(QWEN_OMNIVAD_MODEL_DIR, "pyannote")
+QWEN_OMNIVAD_HF_TOKEN = os.getenv("QWEN_OMNIVAD_HF_TOKEN", os.getenv("WHISPERX_HF_TOKEN", os.getenv("HF_TOKEN", "")))
+
 QWEN_ASR_LOCAL_DIR = os.getenv("QWEN_ASR_LOCAL_DIR", "").strip()
 QWEN_ASR_FORCED_ALIGNER_LOCAL_DIR = os.getenv("QWEN_ASR_FORCED_ALIGNER_LOCAL_DIR", "").strip()
 QWEN_OMNIVAD_MODEL_FORCE_DOWNLOAD = os.getenv("QWEN_OMNIVAD_MODEL_FORCE_DOWNLOAD", "0").strip().lower() in {
@@ -80,13 +89,13 @@ QWEN_OMNIVAD_OMNIVAD_MODEL_PATH = os.getenv(
     os.path.join(QWEN_OMNIVAD_MODEL_DIR, "omnivad", "vad.omnivad"),
 ).strip()
 QWEN_OMNIVAD_CACHE_DIR = os.path.join(_SCRIPT_DIR, "qwen_omnivad_cache")
-QWEN_OMNIVAD_CACHE_VERSION = 5
+QWEN_OMNIVAD_CACHE_VERSION = 6
 
 QWEN_ASR_MODEL = os.getenv("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
 QWEN_ASR_BACKEND = os.getenv("QWEN_ASR_BACKEND", "transformers").strip().lower()
 QWEN_ASR_DEVICE = os.getenv("QWEN_ASR_DEVICE", "cuda:0")
 QWEN_ASR_DTYPE = os.getenv("QWEN_ASR_DTYPE", "bfloat16")
-QWEN_ASR_MAX_BATCH_SIZE = int(os.getenv("QWEN_ASR_MAX_BATCH_SIZE", "8"))
+QWEN_ASR_MAX_BATCH_SIZE = int(os.getenv("QWEN_ASR_MAX_BATCH_SIZE", "20"))
 QWEN_ASR_MAX_NEW_TOKENS = int(os.getenv("QWEN_ASR_MAX_NEW_TOKENS", "4096"))
 QWEN_ASR_FORCED_ALIGNER = os.getenv("QWEN_ASR_FORCED_ALIGNER", "").strip()
 
@@ -97,6 +106,8 @@ QWEN_OMNIVAD_TRANSLATION_LLM = os.getenv(
 QWEN_OMNIVAD_TRANSLATION_BATCH_SIZE = int(os.getenv("QWEN_OMNIVAD_TRANSLATION_BATCH_SIZE", "30"))
 QWEN_OMNIVAD_TRANSLATION_MAX_WORKERS = int(os.getenv("QWEN_OMNIVAD_TRANSLATION_MAX_WORKERS", "10"))
 QWEN_OMNIVAD_USE_OMNIVAD = os.getenv("QWEN_OMNIVAD_USE_OMNIVAD", "1").strip().lower() not in {"0", "false", "no"}
+QWEN_OMNIVAD_ENABLE_DIARIZATION = os.getenv("QWEN_OMNIVAD_ENABLE_DIARIZATION", "1").strip().lower() not in {"0", "false", "no"}
+QWEN_OMNIVAD_DIARIZATION_MIN_SECONDS = float(os.getenv("QWEN_OMNIVAD_DIARIZATION_MIN_SECONDS", "10.0"))
 QWEN_OMNIVAD_REQUIRE_VAD_TIMELINE = os.getenv(
     "QWEN_OMNIVAD_REQUIRE_VAD_TIMELINE",
     "1",
@@ -400,6 +411,8 @@ def _cache_key(
     enable_translation: bool,
     translation_llm_model: Optional[str],
     input_mime_type: Optional[str],
+    enable_diarization: bool,
+    diarization_min_seconds: float,
 ) -> str:
     raw = "|".join(
         [
@@ -412,6 +425,8 @@ def _cache_key(
             f"model={QWEN_ASR_MODEL}",
             f"backend={QWEN_ASR_BACKEND}",
             f"aligner={QWEN_ASR_FORCED_ALIGNER or 'none'}",
+            f"diarization={enable_diarization}",
+            f"diarization_min={diarization_min_seconds:.2f}",
             f"vad_slice_pipeline=1",
             f"vad_asr_workers={QWEN_OMNIVAD_ASR_SEGMENT_WORKERS}",
             f"vad_min_seg={QWEN_OMNIVAD_MIN_SEGMENT_SECONDS:.4f}",
@@ -625,10 +640,92 @@ def _detect_omnivad_speech_spans(
     return merged, raw_spans
 
 
+def _split_spans_by_diarization(
+    speech_spans: Sequence[Tuple[float, float]],
+    audio_path: str,
+    enable_diarization: bool = True,
+    diarization_min_seconds: float = 10.0,
+) -> List[Tuple[float, float, str]]:
+    if not enable_diarization or DiarizationPipeline is None or not QWEN_OMNIVAD_HF_TOKEN:
+        return [(s, e, "speaker1") for s, e in speech_spans]
+
+    print("Qwen-OmniVAD: Running Pyannote Diarization...")
+    try:
+        import whisperx
+        audio = whisperx.load_audio(audio_path)
+        diarize_model = DiarizationPipeline(
+            token=QWEN_OMNIVAD_HF_TOKEN,
+            device=QWEN_ASR_DEVICE,
+            cache_dir=QWEN_OMNIVAD_PYANNOTE_CACHE,
+        )
+        diarize_df = diarize_model(audio)
+    except Exception as exc:
+        print(f"Warning: Diarization failed: {exc}")
+        return [(s, e, "speaker1") for s, e in speech_spans]
+    finally:
+        _release_memory()
+
+    try:
+        diarize_segments = diarize_df.to_dict('records')
+    except AttributeError:
+        print("Warning: Diarization returned unexpected format. Fallback to speaker1.")
+        return [(s, e, "speaker1") for s, e in speech_spans]
+
+    refined_spans = []
+    for s_start, s_end in speech_spans:
+        duration = s_end - s_start
+        intersecting = []
+        for d in diarize_segments:
+            d_s = max(s_start, d.get("start", 0.0))
+            d_e = min(s_end, d.get("end", 0.0))
+            if d_e > d_s:
+                intersecting.append((d_s, d_e, d.get("speaker", "speaker1")))
+        
+        if not intersecting:
+            refined_spans.append((s_start, s_end, "speaker1"))
+        elif duration < diarization_min_seconds:
+            # Span is too short to split, just assign the dominant speaker
+            speaker_durations = {}
+            for i_s, i_e, spk in intersecting:
+                speaker_durations[spk] = speaker_durations.get(spk, 0.0) + (i_e - i_s)
+            dominant_speaker = max(speaker_durations.items(), key=lambda x: x[1])[0]
+            refined_spans.append((s_start, s_end, dominant_speaker))
+        else:
+            # Span is long, split it by speaker boundaries
+            intersecting.sort(key=lambda x: x[0])
+            merged = [intersecting[0]]
+            for i in range(1, len(intersecting)):
+                curr_s, curr_e, curr_spk = intersecting[i]
+                prev_s, prev_e, prev_spk = merged[-1]
+                if curr_spk == prev_spk and curr_s - prev_e < 0.5:
+                    merged[-1] = (prev_s, max(prev_e, curr_e), prev_spk)
+                else:
+                    merged.append((curr_s, curr_e, curr_spk))
+            
+            for i in range(len(merged)):
+                curr_s, curr_e, curr_spk = merged[i]
+                if i == 0:
+                    curr_s = s_start
+                else:
+                    prev_e = merged[i-1][1]
+                    mid = (prev_e + curr_s) / 2.0
+                    merged[i-1] = (merged[i-1][0], mid, merged[i-1][2])
+                    curr_s = mid
+                
+                if i == len(merged) - 1:
+                    curr_e = s_end
+                
+                merged[i] = (curr_s, curr_e, curr_spk)
+            
+            refined_spans.extend(merged)
+
+    return refined_spans
+
+
 def _transcribe_vad_slices(
     asr: Any,
     audio_path: str,
-    speech_spans: Sequence[Tuple[float, float]],
+    speech_spans: Sequence[Tuple[float, float, str]],
     duration_seconds: float,
     *,
     language: Optional[str],
@@ -651,10 +748,10 @@ def _transcribe_vad_slices(
     batch_size = QWEN_ASR_MAX_BATCH_SIZE
     print(f"Running Qwen3-ASR on {total} VAD speech segment(s) using batch inference (batch_size={batch_size})...")
 
-    VadAsrClipJob = Tuple[int, int, float, float, str]
+    VadAsrClipJob = Tuple[int, int, float, float, str, str]
     jobs: List[VadAsrClipJob] = []
     order_idx = 0
-    for disp_idx, (start_s, end_s) in enumerate(speech_spans, start=1):
+    for disp_idx, (start_s, end_s, speaker) in enumerate(speech_spans, start=1):
         ts = max(0.0, float(start_s))
         te = float(end_s)
         if dur_sec > 0:
@@ -687,7 +784,7 @@ def _transcribe_vad_slices(
             te_out = min(end_ms / 1000.0, dur_ms / 1000.0)
         te_out = max(ts_out + min_sec, te_out)
 
-        jobs.append((order_idx, disp_idx, ts_out, te_out, clip_path))
+        jobs.append((order_idx, disp_idx, ts_out, te_out, clip_path, speaker))
         order_idx += 1
 
     if not jobs:
@@ -722,7 +819,7 @@ def _transcribe_vad_slices(
             continue
             
         for job, clip_result in zip(batch_jobs, batch_results):
-            oi, disp_idx, ts_out, te_out, clip_path = job
+            oi, disp_idx, ts_out, te_out, clip_path, speaker = job
             seg_text = (getattr(clip_result, "text", "") or "").strip()
             lg = getattr(clip_result, "language", None)
             lang_guess: Optional[str] = (
@@ -736,9 +833,9 @@ def _transcribe_vad_slices(
                 
             preview = seg_text.replace("\n", " ")
             cut = preview if len(preview) <= 80 else preview[:77] + "..."
-            print(f"  Segment {disp_idx}/{total}: [{ts_out:.2f}s → {te_out:.2f}s] {cut}")
+            print(f"  Segment {disp_idx}/{total}: [{ts_out:.2f}s → {te_out:.2f}s] [{speaker}] {cut}")
             
-            clip_items = [TimelineItem(start=ts_out, end=te_out, text=seg_text)]
+            clip_items = [TimelineItem(start=ts_out, end=te_out, text=seg_text, speaker=speaker)]
             results_list.append((oi, clip_items, seg_text, lang_guess))
             
     # Cleanup audio clips
@@ -936,6 +1033,8 @@ def translate_audio(
     translation_batch_size: int = QWEN_OMNIVAD_TRANSLATION_BATCH_SIZE,
     translation_max_workers: int = QWEN_OMNIVAD_TRANSLATION_MAX_WORKERS,
     force_refresh: bool = False,
+    enable_diarization: bool = QWEN_OMNIVAD_ENABLE_DIARIZATION,
+    diarization_min_seconds: float = QWEN_OMNIVAD_DIARIZATION_MIN_SECONDS,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str, Dict[str, Any]]:
     """
     OmniVAD splits the audio → Qwen3-ASR on each speech span → `_translate_segments` in batch.
@@ -968,6 +1067,8 @@ def translate_audio(
         enable_translation=enable_translation,
         translation_llm_model=llm_model,
         input_mime_type=input_mime_type,
+        enable_diarization=enable_diarization,
+        diarization_min_seconds=diarization_min_seconds,
     )
     cache_info: Dict[str, Any] = {
         "audio_md5": audio_hash,
@@ -1024,10 +1125,16 @@ def translate_audio(
 
         used_vad_asr_branch = False
         if speech_spans:
+            diarized_spans = _split_spans_by_diarization(
+                speech_spans,
+                audio_path,
+                enable_diarization=enable_diarization,
+                diarization_min_seconds=diarization_min_seconds,
+            )
             items, agg_text, det_lang = _transcribe_vad_slices(
                 asr,
                 audio_path,
-                speech_spans,
+                diarized_spans,
                 duration,
                 language=source_language,
             )

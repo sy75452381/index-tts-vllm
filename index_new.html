@@ -1750,6 +1750,18 @@
                                         <div id="translateWhisperXSettings" class="checkbox-group" style="display: none; margin-bottom: 14px;">
                                             <label><input type="checkbox" id="translateWhisperXProxyRefiner"> Speaker-aware proxy refiner</label>
                                         </div>
+                                        <div id="translateQwenOmniVadSettings" style="display: none; margin-bottom: 14px; background: rgba(16, 185, 129, 0.08); padding: 12px; border-radius: 8px;">
+                                            <div class="checkbox-group" style="margin-bottom: 8px;">
+                                                <label><input type="checkbox" id="translateQwenOmniVadEnableDiarization" checked> Enable Pyannote Diarization Split</label>
+                                            </div>
+                                            <div class="form-group" style="margin-bottom: 0;">
+                                                <label for="translateQwenOmniVadDiarizationMinSeconds">Min Span Duration to Split (sec):</label>
+                                                <input type="number" id="translateQwenOmniVadDiarizationMinSeconds" value="10.0" min="0.0" step="0.5" style="max-width: 120px;">
+                                                <small style="color: var(--text-muted); display: block; margin-top: 4px; font-size: 0.75rem;">
+                                                    VAD spans shorter than this won't be split (they'll just get the dominant speaker ID).
+                                                </small>
+                                            </div>
+                                        </div>
                                         <div id="translateLitAiSettings" class="form-row-2" style="display: none; margin-bottom: 14px;">
                                             <div class="form-group">
                                                 <label for="translateTranslationLlmModel">LitAI Translation Model:</label>
@@ -3563,6 +3575,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             const translateTranscriptionPipeline = document.getElementById('translateTranscriptionPipeline');
             const translateWhisperXSettingsDiv = document.getElementById('translateWhisperXSettings');
             const translateWhisperXProxyRefiner = document.getElementById('translateWhisperXProxyRefiner');
+            const translateQwenOmniVadSettingsDiv = document.getElementById('translateQwenOmniVadSettings');
+            const translateQwenOmniVadEnableDiarization = document.getElementById('translateQwenOmniVadEnableDiarization');
+            const translateQwenOmniVadDiarizationMinSeconds = document.getElementById('translateQwenOmniVadDiarizationMinSeconds');
             const translateLitAiSettingsDiv = document.getElementById('translateLitAiSettings');
             const translateTranslationLlmModel = document.getElementById('translateTranslationLlmModel');
             const translateGeminiSettingsDiv = document.getElementById('translateGeminiSettings');
@@ -3645,6 +3660,18 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     translateWhisperXProxyRefiner.checked = settings.whisperx_proxy_refiner;
                 }
                 if (
+                    translateQwenOmniVadEnableDiarization &&
+                    typeof settings.qwen_omnivad_enable_diarization === 'boolean'
+                ) {
+                    translateQwenOmniVadEnableDiarization.checked = settings.qwen_omnivad_enable_diarization;
+                }
+                if (
+                    translateQwenOmniVadDiarizationMinSeconds &&
+                    typeof settings.qwen_omnivad_diarization_min_seconds === 'number'
+                ) {
+                    translateQwenOmniVadDiarizationMinSeconds.value = settings.qwen_omnivad_diarization_min_seconds;
+                }
+                if (
                     translateIgnoreNonSpeechEl &&
                     typeof settings.ignore_non_speech === 'boolean'
                 ) {
@@ -3660,6 +3687,12 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     whisperx_proxy_refiner: translateWhisperXProxyRefiner
                         ? translateWhisperXProxyRefiner.checked
                         : false,
+                    qwen_omnivad_enable_diarization: translateQwenOmniVadEnableDiarization
+                        ? translateQwenOmniVadEnableDiarization.checked
+                        : true,
+                    qwen_omnivad_diarization_min_seconds: translateQwenOmniVadDiarizationMinSeconds
+                        ? parseFloat(translateQwenOmniVadDiarizationMinSeconds.value) || 10.0
+                        : 10.0,
                     gemini_model: translateGeminiModel ? translateGeminiModel.value : '',
                     translation_llm_model: translateTranslationLlmModel
                         ? translateTranslationLlmModel.value
@@ -3687,6 +3720,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 if (translateWhisperXSettingsDiv) {
                     translateWhisperXSettingsDiv.style.display = isWhisperX ? 'flex' : 'none';
                 }
+                if (translateQwenOmniVadSettingsDiv) {
+                    translateQwenOmniVadSettingsDiv.style.display = pipelineValue === 'qwen_omnivad' ? 'block' : 'none';
+                }
                 if (translateLitAiSettingsDiv) {
                     translateLitAiSettingsDiv.style.display = isLocalTranslationPipeline ? 'grid' : 'none';
                 }
@@ -3708,6 +3744,18 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             }
             if (translateWhisperXProxyRefiner) {
                 translateWhisperXProxyRefiner.addEventListener('change', () => {
+                    saveTranslatePersistentSettings();
+                    updateAiConfigSummary();
+                });
+            }
+            if (translateQwenOmniVadEnableDiarization) {
+                translateQwenOmniVadEnableDiarization.addEventListener('change', () => {
+                    saveTranslatePersistentSettings();
+                    updateAiConfigSummary();
+                });
+            }
+            if (translateQwenOmniVadDiarizationMinSeconds) {
+                translateQwenOmniVadDiarizationMinSeconds.addEventListener('input', () => {
                     saveTranslatePersistentSettings();
                     updateAiConfigSummary();
                 });
@@ -4520,6 +4568,15 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     translateWhisperXProxyRefiner &&
                     translateWhisperXProxyRefiner.checked
                 );
+                payload.qwen_omnivad_enable_diarization = !!(
+                    translateTranscriptionPipeline &&
+                    translateTranscriptionPipeline.value === 'qwen_omnivad' &&
+                    translateQwenOmniVadEnableDiarization &&
+                    translateQwenOmniVadEnableDiarization.checked
+                );
+                payload.qwen_omnivad_diarization_min_seconds = translateQwenOmniVadDiarizationMinSeconds
+                    ? parseFloat(translateQwenOmniVadDiarizationMinSeconds.value) || 10.0
+                    : 10.0;
                 payload.merge_backing_track = translateMergeBackEl && translateMergeBackEl.checked ? true : false;
                 payload.ignore_non_speech = translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? true : false;
                 payload.preserve_silence_audio = translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? true : false;
@@ -7124,6 +7181,10 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         if (translateTranscriptionPipeline && translateTranscriptionPipeline.value === 'whisperx') {
                             formData.append('whisperx_proxy_refiner', translateWhisperXProxyRefiner && translateWhisperXProxyRefiner.checked ? 'true' : 'false');
                         }
+                        if (translateTranscriptionPipeline && translateTranscriptionPipeline.value === 'qwen_omnivad') {
+                            formData.append('qwen_omnivad_enable_diarization', translateQwenOmniVadEnableDiarization && translateQwenOmniVadEnableDiarization.checked ? 'true' : 'false');
+                            formData.append('qwen_omnivad_diarization_min_seconds', translateQwenOmniVadDiarizationMinSeconds ? translateQwenOmniVadDiarizationMinSeconds.value : '10.0');
+                        }
                         if (translateForceGeminiRefresh && translateForceGeminiRefresh.checked) {
                             formData.append('force_gemini_regenerate', 'true');
                         }
@@ -7202,6 +7263,10 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     }
                     if (translateTranscriptionPipeline && translateTranscriptionPipeline.value === 'whisperx') {
                         formData.append('whisperx_proxy_refiner', translateWhisperXProxyRefiner && translateWhisperXProxyRefiner.checked ? 'true' : 'false');
+                    }
+                    if (translateTranscriptionPipeline && translateTranscriptionPipeline.value === 'qwen_omnivad') {
+                        formData.append('qwen_omnivad_enable_diarization', translateQwenOmniVadEnableDiarization && translateQwenOmniVadEnableDiarization.checked ? 'true' : 'false');
+                        formData.append('qwen_omnivad_diarization_min_seconds', translateQwenOmniVadDiarizationMinSeconds ? translateQwenOmniVadDiarizationMinSeconds.value : '10.0');
                     }
                     if (translateForceGeminiRefresh && translateForceGeminiRefresh.checked) {
                         formData.append('force_gemini_regenerate', 'true');
