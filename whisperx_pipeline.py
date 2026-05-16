@@ -105,7 +105,7 @@ WHISPERX_HF_TOKEN = os.getenv(
 )
 WHISPERX_TRANSLATION_LLM = os.getenv(
     "WHISPERX_TRANSLATION_LLM",
-    "lightning-ai/DeepSeek-V3.1",
+    "lightning-ai/gemma-4-31B-it",
 )
 WHISPERX_TRANSLATION_BATCH_SIZE = int(
     os.getenv("WHISPERX_TRANSLATION_BATCH_SIZE", "30")

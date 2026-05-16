@@ -105,6 +105,17 @@ except ImportError:
         return False
     _run_whisperx_pipeline_sync = None  # type: ignore[assignment]
 
+# Qwen3-ASR + OmniVAD transcription pipeline (optional)
+try:
+    from qwen_omnivad_pipeline import (
+        is_qwen_omnivad_available,
+        _run_qwen_omnivad_pipeline_sync,
+    )
+except ImportError:
+    def is_qwen_omnivad_available() -> bool:
+        return False
+    _run_qwen_omnivad_pipeline_sync = None  # type: ignore[assignment]
+
 # Configuration
 import argparse
 
@@ -516,6 +527,22 @@ def _normalize_gemini_model_name(gemini_model_value: Optional[str]) -> str:
     if sanitized and sanitized not in ALLOWED_GEMINI_MODELS:
         return _get_gemini_model_name()
     return sanitized or _get_gemini_model_name()
+
+
+ALLOWED_TRANSLATION_LLM_MODELS: Tuple[str, ...] = (
+    "lightning-ai/gemma-4-31B-it",
+    "lightning-ai/gpt-oss-20b",
+    "lightning-ai/gpt-oss-120b",
+    "lightning-ai/minimax-m2.5",
+)
+DEFAULT_TRANSLATION_LLM_MODEL = "lightning-ai/gemma-4-31B-it"
+
+
+def _normalize_translation_llm_model(model_value: Optional[str]) -> str:
+    sanitized = (model_value or "").strip()
+    if sanitized in ALLOWED_TRANSLATION_LLM_MODELS:
+        return sanitized
+    return DEFAULT_TRANSLATION_LLM_MODEL
 
 
 def _coerce_merge_backing_flag(
@@ -2150,6 +2177,7 @@ async def _build_translation_segments(
     backing_track_source_path: Optional[str] = None,
     transcription_pipeline: str = "gemini",
     whisperx_proxy_refiner: bool = False,
+    translation_llm_model: Optional[str] = None,
 ) -> SegmentBuildResult:
     manual_chunk_data = None
     manual_speaker_profiles: List[Dict[str, Any]] = []
@@ -2170,16 +2198,25 @@ async def _build_translation_segments(
             ) from exc
 
     transcription_pipeline = (transcription_pipeline or "").strip().lower()
-    if transcription_pipeline not in ("gemini", "whisperx"):
+    if transcription_pipeline not in ("gemini", "whisperx", "qwen_omnivad"):
         transcription_pipeline = "gemini"
     whisperx_proxy_refiner = (
         _coerce_to_bool(whisperx_proxy_refiner)
         and transcription_pipeline == "whisperx"
     )
+    resolved_translation_llm_model = _normalize_translation_llm_model(
+        translation_llm_model
+    )
 
     # Resolve pipeline label
     use_whisperx = transcription_pipeline == "whisperx"
-    pipeline_label = "WhisperX" if use_whisperx else f"Gemini model '{resolved_gemini_model}'"
+    use_qwen_omnivad = transcription_pipeline == "qwen_omnivad"
+    if use_whisperx:
+        pipeline_label = "WhisperX"
+    elif use_qwen_omnivad:
+        pipeline_label = "Qwen3-ASR + OmniVAD"
+    else:
+        pipeline_label = f"Gemini model '{resolved_gemini_model}'"
 
     if emit_status:
         await emit_status(
@@ -2219,9 +2256,35 @@ async def _build_translation_segments(
                 processed_audio_bytes,
                 dest_language=dest_language,
                 enable_translation=translate_enabled,
-                translation_max_workers=10,
+                translation_llm_model=resolved_translation_llm_model,
                 force_refresh=force_gemini_regenerate,
                 enable_proxy_refiner=whisperx_proxy_refiner,
+            ),
+        )
+    elif use_qwen_omnivad:
+        # --- Qwen3-ASR + OmniVAD pipeline ---
+        if _run_qwen_omnivad_pipeline_sync is None:
+            raise TranslateWorkflowHttpError(
+                500,
+                {"status": "error", "message": "Qwen3-ASR/OmniVAD pipeline is not installed. Install qwen-asr, omnivad, and litai."},
+            )
+        print(f"[translate] Using Qwen3-ASR + OmniVAD pipeline for transcription/translation")
+        loop = asyncio.get_event_loop()
+        (
+            gemini_chunks,
+            speaker_profiles,
+            raw_gemini_response_text,
+            gemini_cache_info,
+        ) = await loop.run_in_executor(
+            executor,
+            functools.partial(
+                _run_qwen_omnivad_pipeline_sync,
+                processed_audio_bytes,
+                input_mime_type=gemini_mime_type,
+                dest_language=dest_language,
+                enable_translation=translate_enabled,
+                translation_llm_model=resolved_translation_llm_model,
+                force_refresh=force_gemini_regenerate,
             ),
         )
     else:
@@ -2326,6 +2389,7 @@ async def _build_translation_segments(
         gemini_chunks,
         resolved_gemini_model,
         gemini_api_key_value,
+        translation_llm_model=resolved_translation_llm_model,
         backing_track_audio=backing_track_audio,
         merge_with_backing=merge_with_backing,
         ignore_non_speech=ignore_non_speech_flag,
@@ -2379,6 +2443,7 @@ async def _build_translation_segments(
         "bitrate": bitrate_value,
         "prompt": final_prompt,
         "gemini_model": resolved_gemini_model,
+        "translation_llm_model": resolved_translation_llm_model,
         "transcription_pipeline": transcription_pipeline,
         "whisperx_proxy_refiner": whisperx_proxy_refiner,
         "ignore_non_speech": ignore_non_speech_flag,
@@ -2481,6 +2546,7 @@ class TranslateSessionData:
     gemini_chunks: List[Dict[str, Any]]
     gemini_model: str
     gemini_api_key: Optional[str]
+    translation_llm_model: str = DEFAULT_TRANSLATION_LLM_MODEL
     source_audio_filename: Optional[str] = None
     source_base_name: Optional[str] = None
     original_audio_path: Optional[str] = None
@@ -4360,6 +4426,7 @@ def _session_to_manifest(session: TranslateSessionData) -> Dict[str, Any]:
         "gemini_chunks": copy.deepcopy(session.gemini_chunks),
         "gemini_model": session.gemini_model,
         "gemini_api_key": session.gemini_api_key,
+        "translation_llm_model": session.translation_llm_model,
         "source_audio_filename": session.source_audio_filename,
         "source_base_name": session.source_base_name,
         "original_audio_path": session.original_audio_path,
@@ -4410,6 +4477,7 @@ async def _rehydrate_session_from_manifest(manifest: Dict[str, Any]) -> Translat
         manifest.get("gemini_chunks") or [],
         manifest.get("gemini_model") or _get_gemini_model_name(),
         manifest.get("gemini_api_key"),
+        translation_llm_model=manifest.get("translation_llm_model"),
         backing_track_audio=None,
         backing_track_path=manifest.get("backing_track_path"),
         backing_audio_info=backing_info,
@@ -4562,6 +4630,7 @@ async def _generate_chunk_audio_from_session(
     bitrate: str,
     gemini_model: str,
     gemini_api_key: Optional[str],
+    translation_llm_model: Optional[str],
     ignore_non_speech: bool,
     preserve_silence_audio: bool,
     generated_volume_percent: float,
@@ -4576,7 +4645,7 @@ async def _generate_chunk_audio_from_session(
 ) -> Tuple[str, str, Dict[str, Any]]:
     response_format = _normalize_translate_output_format(response_format)
     transcription_pipeline = (transcription_pipeline or "").strip().lower()
-    if transcription_pipeline not in ("gemini", "whisperx"):
+    if transcription_pipeline not in ("gemini", "whisperx", "qwen_omnivad"):
         transcription_pipeline = "gemini"
     whisperx_proxy_refiner = (
         _coerce_to_bool(whisperx_proxy_refiner)
@@ -4661,6 +4730,7 @@ async def _generate_chunk_audio_from_session(
         max_merge_interval=MAX_MERGE_INTERVAL_MS,
         resolved_gemini_model=gemini_model,
         gemini_api_key_value=(gemini_api_key or "").strip() or None,
+        translation_llm_model=translation_llm_model,
         emit_status=None,
         source_chunk_session=chunk_session,
         source_audio_filename=chunk_session.source_audio_filename,
@@ -4702,6 +4772,9 @@ async def _generate_chunk_audio_from_session(
     metadata["backing_volume_percent"] = backing_volume_percent
     metadata["silence_volume_percent"] = silence_volume_percent
     metadata["gemini_model"] = gemini_model
+    metadata["translation_llm_model"] = _normalize_translation_llm_model(
+        translation_llm_model
+    )
     metadata["transcription_pipeline"] = transcription_pipeline
     metadata["whisperx_proxy_refiner"] = whisperx_proxy_refiner
     metadata["output_base_name"] = resolved_base_name
@@ -6591,6 +6664,7 @@ async def _create_translate_session(
     gemini_chunks: List[Dict[str, Any]],
     gemini_model: str,
     gemini_api_key: Optional[str],
+    translation_llm_model: Optional[str] = None,
     backing_track_audio: Optional[AudioSegment] = None,
     backing_track_path: Optional[str] = None,
     backing_audio_info: Optional[AudioAssetInfo] = None,
@@ -6707,6 +6781,7 @@ async def _create_translate_session(
         gemini_chunks=copy.deepcopy(gemini_chunks),
         gemini_model=gemini_model,
         gemini_api_key=gemini_api_key,
+        translation_llm_model=_normalize_translation_llm_model(translation_llm_model),
         source_audio_filename=source_audio_filename,
         source_base_name=resolved_base_name,
         original_audio_path=audio_path,
@@ -8579,6 +8654,14 @@ class TranslateRequest(BaseModel):
         default=None,
         description="Provide a Gemini API key for this request if environment key is not set.",
     )
+    translation_llm_model: Optional[str] = Field(
+        default=None,
+        description=(
+            "LitAI API translation model for local transcription pipelines: "
+            "lightning-ai/gemma-4-31B-it, lightning-ai/gpt-oss-20b, "
+            "lightning-ai/gpt-oss-120b, or lightning-ai/minimax-m2.5."
+        ),
+    )
     force_gemini_regenerate: Optional[bool] = Field(
         default=False,
         description="When true, bypass the Gemini cache and force a fresh analysis.",
@@ -8619,7 +8702,7 @@ class TranslateRequest(BaseModel):
     )
     transcription_pipeline: Optional[str] = Field(
         default=None,
-        description="Transcription pipeline to use: 'gemini' (default, cloud-based) or 'whisperx' (local WhisperX + LLM).",
+        description="Transcription pipeline to use: 'gemini' (default), 'whisperx', or 'qwen_omnivad' (Qwen3-ASR + OmniVAD).",
     )
     whisperx_proxy_refiner: Optional[bool] = Field(
         default=False,
@@ -8772,9 +8855,13 @@ class ChunkBatchGenerateRequest(BaseModel):
         default=None,
         description="Provide a Gemini API key for this batch if environment defaults should be bypassed.",
     )
+    translation_llm_model: Optional[str] = Field(
+        default=None,
+        description="LitAI API translation model for local transcription pipelines.",
+    )
     transcription_pipeline: Optional[str] = Field(
         default=None,
-        description="Transcription pipeline to use for selected chunk generation: 'gemini' (default) or 'whisperx' (local).",
+        description="Transcription pipeline to use for selected chunk generation: 'gemini' (default), 'whisperx', or 'qwen_omnivad'.",
     )
     whisperx_proxy_refiner: Optional[bool] = Field(
         default=False,
@@ -10347,8 +10434,11 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
         bitrate_value = payload.bitrate or config_template.bitrate or TRANSLATE_DEFAULT_BITRATE
         gemini_model_value = _normalize_gemini_model_name(payload.gemini_model or config_template.gemini_model)
         gemini_api_key_value = (payload.gemini_api_key or config_template.gemini_api_key or "").strip()
+        translation_llm_model_value = _normalize_translation_llm_model(
+            payload.translation_llm_model or config_template.translation_llm_model
+        )
         transcription_pipeline_value = (payload.transcription_pipeline or "").strip().lower()
-        if transcription_pipeline_value not in ("gemini", "whisperx"):
+        if transcription_pipeline_value not in ("gemini", "whisperx", "qwen_omnivad"):
             transcription_pipeline_value = "gemini"
         whisperx_proxy_refiner_flag = (
             _coerce_to_bool(payload.whisperx_proxy_refiner)
@@ -10405,6 +10495,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
             "response_format": response_format_value,
             "bitrate": bitrate_value,
             "gemini_model": gemini_model_value,
+            "translation_llm_model": translation_llm_model_value,
             "transcription_pipeline": transcription_pipeline_value,
             "whisperx_proxy_refiner": whisperx_proxy_refiner_flag,
             "merge_backing": merge_backing_requested,
@@ -10463,6 +10554,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
                             bitrate=bitrate_value,
                             gemini_model=gemini_model_value,
                             gemini_api_key=gemini_api_key_value,
+                            translation_llm_model=translation_llm_model_value,
                             ignore_non_speech=ignore_non_speech_flag,
                             preserve_silence_audio=preserve_silence_flag,
                             generated_volume_percent=generated_volume_percent_value,
@@ -10568,6 +10660,7 @@ async def api_translate_segments(
     translate_text: Optional[bool] = Form(True),
     gemini_model: Optional[str] = Form(None),
     gemini_api_key: Optional[str] = Form(None),
+    translation_llm_model: Optional[str] = Form(None, description="LitAI API translation model for WhisperX/Qwen local pipelines."),
     enhance_voice: Optional[bool] = Form(False),
     enhancement_model: Optional[str] = Form(None, description="ClearVoice enhancement model: 'MossFormerGAN_SE_16K' (default), 'FRCRN_SE_16K', or 'MossFormer2_SE_48K'"),
     super_resolution_voice: Optional[bool] = Form(False),
@@ -10594,7 +10687,7 @@ async def api_translate_segments(
     default_emotion_weight: Optional[float] = Form(None),
     original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
     translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
-    transcription_pipeline: Optional[str] = Form(None, description="Transcription pipeline: 'gemini' (default) or 'whisperx' (local)"),
+    transcription_pipeline: Optional[str] = Form(None, description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), or 'qwen_omnivad' (Qwen3-ASR + OmniVAD)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
 ):
     """API: Prepare translation segments for advanced translate/edit workflow."""
@@ -10613,6 +10706,7 @@ async def api_translate_segments(
         translate_flag_value = translate_text
         gemini_model_value = gemini_model
         gemini_api_key_value = gemini_api_key
+        translation_llm_model_value = translation_llm_model
         enhance_voice_value = enhance_voice
         enhancement_model_value = enhancement_model
         super_resolution_voice_value = super_resolution_voice
@@ -10664,6 +10758,7 @@ async def api_translate_segments(
             translate_flag_value = payload.get("translate", translate_flag_value)
             gemini_model_value = payload.get("gemini_model", gemini_model_value)
             gemini_api_key_value = payload.get("gemini_api_key", gemini_api_key_value)
+            translation_llm_model_value = payload.get("translation_llm_model", translation_llm_model_value)
             enhance_voice_value = payload.get("enhance_voice", enhance_voice_value)
             enhancement_model_value = payload.get("enhancement_model", enhancement_model_value)
             super_resolution_voice_value = payload.get("super_resolution_voice", super_resolution_voice_value)
@@ -10785,6 +10880,7 @@ async def api_translate_segments(
         enhancement_model_name_value = preprocess_options.enhancement_model_name
         clearvoice_settings = preprocess_options.to_clearvoice_settings()
         resolved_gemini_model = _normalize_gemini_model_name(gemini_model_value)
+        resolved_translation_llm_model = _normalize_translation_llm_model(translation_llm_model_value)
         gemini_api_key_value = (gemini_api_key_value or "").strip()
         if not default_speaker_value and reuse_source_session:
             default_speaker_value = (reuse_source_session.default_speaker_preset or "").strip()
@@ -10797,7 +10893,7 @@ async def api_translate_segments(
             DEFAULT_EMOTION_WEIGHT,
         )
         resolved_transcription_pipeline = (transcription_pipeline_value or "").strip().lower()
-        if resolved_transcription_pipeline not in ("gemini", "whisperx"):
+        if resolved_transcription_pipeline not in ("gemini", "whisperx", "qwen_omnivad"):
             resolved_transcription_pipeline = "gemini"
         whisperx_proxy_refiner_flag = (
             _coerce_to_bool(whisperx_proxy_refiner_value)
@@ -10836,6 +10932,7 @@ async def api_translate_segments(
             "translate_enabled": translate_enabled,
             "base_output_name": resolved_base_name,
             "force_gemini_regenerate": force_gemini_regenerate_flag,
+            "translation_llm_model": resolved_translation_llm_model,
             "transcription_pipeline": resolved_transcription_pipeline,
             "whisperx_proxy_refiner": whisperx_proxy_refiner_flag,
         }
@@ -10949,6 +11046,7 @@ async def api_translate_segments(
                         max_merge_interval=max_merge_interval,
                         resolved_gemini_model=resolved_gemini_model,
                         gemini_api_key_value=gemini_api_key_value or None,
+                        translation_llm_model=resolved_translation_llm_model,
                         emit_status=emit_status,
                         source_chunk_session=reuse_session_for_segments,
                         source_audio_filename=session_source_filename,
@@ -11280,6 +11378,7 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                     headers = {
                         "Content-Disposition": f"attachment; filename=translated_speech.{response_format_value}",
                         "X-Translation-Model": session.gemini_model or _get_gemini_model_name(),
+                        "X-Translation-LLM": session.translation_llm_model,
                         "X-Translation-Segments": str(len(final_segments)),
                         "X-Translation-Generated": str(generated_count),
                         "X-Translation-Preserved": str(preserved_count),
@@ -11985,6 +12084,7 @@ async def api_translate_audio(
     prompt: Optional[str] = Form(None),
     gemini_model: Optional[str] = Form(None),
     gemini_api_key: Optional[str] = Form(None),
+    translation_llm_model: Optional[str] = Form(None, description="LitAI API translation model for WhisperX/Qwen local pipelines."),
     enhance_voice: Optional[bool] = Form(False),
     enhancement_model: Optional[str] = Form(None, description="ClearVoice enhancement model: 'MossFormerGAN_SE_16K' (default), 'FRCRN_SE_16K', or 'MossFormer2_SE_48K'"),
     super_resolution_voice: Optional[bool] = Form(False),
@@ -12011,7 +12111,7 @@ async def api_translate_audio(
     default_emotion_weight: Optional[float] = Form(None),
     original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
     translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
-    transcription_pipeline: Optional[str] = Form(None, description="Transcription pipeline: 'gemini' (default) or 'whisperx' (local)"),
+    transcription_pipeline: Optional[str] = Form(None, description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), or 'qwen_omnivad' (Qwen3-ASR + OmniVAD)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
 ):
     """API: Translate speech audio to a target language and return synthesized audio."""
@@ -12029,6 +12129,7 @@ async def api_translate_audio(
         bitrate_value = bitrate
         gemini_model_value = gemini_model
         gemini_api_key_value = gemini_api_key
+        translation_llm_model_value = translation_llm_model
         enhance_voice_value = enhance_voice
         enhancement_model_value = enhancement_model
         super_resolution_voice_value = super_resolution_voice
@@ -12081,6 +12182,7 @@ async def api_translate_audio(
             bitrate_value = translate_req.bitrate or bitrate_value
             gemini_model_value = translate_req.gemini_model or gemini_model_value
             gemini_api_key_value = translate_req.gemini_api_key or gemini_api_key_value
+            translation_llm_model_value = translate_req.translation_llm_model or translation_llm_model_value
             enhance_voice_value = translate_req.enhance_voice if translate_req.enhance_voice is not None else enhance_voice_value
             super_resolution_voice_value = (
                 translate_req.super_resolution_voice if translate_req.super_resolution_voice is not None else super_resolution_voice_value
@@ -12157,7 +12259,7 @@ async def api_translate_audio(
             DEFAULT_EMOTION_WEIGHT,
         )
         resolved_transcription_pipeline = (transcription_pipeline_value or "").strip().lower()
-        if resolved_transcription_pipeline not in ("gemini", "whisperx"):
+        if resolved_transcription_pipeline not in ("gemini", "whisperx", "qwen_omnivad"):
             resolved_transcription_pipeline = "gemini"
         whisperx_proxy_refiner_flag = (
             _coerce_to_bool(whisperx_proxy_refiner_value)
@@ -12236,6 +12338,7 @@ async def api_translate_audio(
         backing_volume_percent_value = volume_options.backing
         silence_volume_percent_value = volume_options.silence
         resolved_gemini_model = _normalize_gemini_model_name(gemini_model_value)
+        resolved_translation_llm_model = _normalize_translation_llm_model(translation_llm_model_value)
         gemini_api_key_value = (gemini_api_key_value or "").strip()
         force_gemini_regenerate_flag = _coerce_to_bool(force_gemini_regen_value or False)
 
@@ -12286,6 +12389,7 @@ async def api_translate_audio(
             "reuse_session": bool(reuse_source_session),
             "base_output_name": resolved_base_name,
             "force_gemini_regenerate": force_gemini_regenerate_flag,
+            "translation_llm_model": resolved_translation_llm_model,
             "transcription_pipeline": resolved_transcription_pipeline,
             "whisperx_proxy_refiner": whisperx_proxy_refiner_flag,
         }
@@ -12415,6 +12519,7 @@ async def api_translate_audio(
                         max_merge_interval=max_merge_interval,
                         resolved_gemini_model=resolved_gemini_model,
                         gemini_api_key_value=gemini_api_key_value or None,
+                        translation_llm_model=resolved_translation_llm_model,
                         emit_status=emit_status,
                         source_chunk_session=reuse_session_for_translate,
                          source_audio_filename=session_source_filename,
@@ -12506,6 +12611,7 @@ async def api_translate_audio(
 
                     headers = {
                         "X-Translation-Model": resolved_gemini_model,
+                        "X-Translation-LLM": resolved_translation_llm_model,
                         "X-Translation-Segments": str(metadata.get("segment_count", len(segments))),
                         "X-Translation-Speech-Segments": str(metadata.get("speech_segment_count", 0)),
                         "X-Translation-Silence-Segments": str(metadata.get("silence_segment_count", 0)),
@@ -13306,6 +13412,9 @@ async def server_info():
                 "speaker_presets": True,
                 "speaker_manager": "SpeakerPresetManager",
                 "whisperx_available": is_whisperx_available(),
+                "qwen_omnivad_available": is_qwen_omnivad_available(),
+                "translation_llm_default": DEFAULT_TRANSLATION_LLM_MODEL,
+                "translation_llm_models": list(ALLOWED_TRANSLATION_LLM_MODELS),
             }
         })
         

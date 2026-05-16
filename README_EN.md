@@ -13,7 +13,6 @@ conda install -c conda-forge libstdcxx-ng
 conda install -c conda-forge sox
 pip install whisperx
 pip install json-repair
-git clone https://github.com/garyswansrs/index-tts-vllm.git
 cd index-tts-vllm
 pip install -r requirements.txt
 pip install pydub
@@ -22,6 +21,10 @@ pip install flash-attn --no-build-isolation --no-cache-dir
 pip install audio-separator
 pip install clearvoice
 pip install google-genai
+pip install qwen-asr
+pip install omnivad
+pip install sentencepiece
+pip install "numpy<2"
 sudo apt install ffmpeg
 hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
 python fastapi_webui_v2.py --use_torch_compile
@@ -47,7 +50,7 @@ By leveraging vLLM's PagedAttention and continuous batching, this implementation
 - **⚡ Parallel Chunk Generation**: Automatically splits long text into chunks and processes them in parallel, achieving up to 50x speedup for long synthesis tasks.
 - **🎵 MP3 & Multi-Format Output**: Support for MP3 output (via pydub/ffmpeg) for significantly smaller file sizes without sacrificing quality.
 - **🌍 Advanced Translation Workflow**:
-    - **Transcription**: Local (WhisperX) or Cloud (Gemini) speech-to-text.
+    - **Transcription**: Cloud Gemini, local WhisperX, or Qwen3-ASR + OmniVAD.
     - **Translation**: High-quality translation preserving speaker diarization.
     - **Diarization**: Automatic speaker detection and voice cloning for each speaker.
     - **Edit Mode**: Interactive segment editing, selective regeneration, and timestamp control.
@@ -81,7 +84,13 @@ pip install flashinfer-python flash-attn --no-build-isolation
 
 # For advanced audio features
 pip install audio-separator[gpu] clearvoice google-genai whisperx pydub
+
+# Optional higher-quality ASR/alignment pipeline
+# Install this in a separate environment from qwen-tts for now.
+pip install qwen-asr omnivad litai
 ```
+
+Do not install `qwen-asr` into the same environment as `qwen-tts` for now: current releases pin incompatible exact `transformers` versions (`qwen-tts` pins `4.57.3`, while `qwen-asr` pins `4.57.6`). Also do not install `qwen-asr[vllm]` into this environment; this project pins `vllm==0.10.2` for IndexTTS2. See `AUDIO_TRANSLATION_PIPELINES.md` for Qwen3-ASR + OmniVAD configuration and compatibility notes.
 
 ### 4. Model Weights
 Download the pre-converted IndexTTS2 vLLM weights:
