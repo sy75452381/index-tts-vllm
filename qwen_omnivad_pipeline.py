@@ -107,7 +107,7 @@ QWEN_OMNIVAD_TRANSLATION_BATCH_SIZE = int(os.getenv("QWEN_OMNIVAD_TRANSLATION_BA
 QWEN_OMNIVAD_TRANSLATION_MAX_WORKERS = int(os.getenv("QWEN_OMNIVAD_TRANSLATION_MAX_WORKERS", "10"))
 QWEN_OMNIVAD_USE_OMNIVAD = os.getenv("QWEN_OMNIVAD_USE_OMNIVAD", "1").strip().lower() not in {"0", "false", "no"}
 QWEN_OMNIVAD_ENABLE_DIARIZATION = os.getenv("QWEN_OMNIVAD_ENABLE_DIARIZATION", "1").strip().lower() not in {"0", "false", "no"}
-QWEN_OMNIVAD_DIARIZATION_MIN_SECONDS = float(os.getenv("QWEN_OMNIVAD_DIARIZATION_MIN_SECONDS", "3.0"))
+QWEN_OMNIVAD_DIARIZATION_MIN_SECONDS = float(os.getenv("QWEN_OMNIVAD_DIARIZATION_MIN_SECONDS", "0.0"))
 QWEN_OMNIVAD_REQUIRE_VAD_TIMELINE = os.getenv(
     "QWEN_OMNIVAD_REQUIRE_VAD_TIMELINE",
     "1",
@@ -644,12 +644,26 @@ def _split_spans_by_diarization(
     speech_spans: Sequence[Tuple[float, float]],
     audio_path: str,
     enable_diarization: bool = True,
-    diarization_min_seconds: float = 3.0,
+    diarization_min_seconds: float = 0.0,
 ) -> List[Tuple[float, float, str]]:
-    if not enable_diarization or DiarizationPipeline is None or not QWEN_OMNIVAD_HF_TOKEN:
+    if isinstance(enable_diarization, str):
+        enable_diarization = enable_diarization.strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        diarization_min_seconds = max(0.0, float(diarization_min_seconds))
+    except (TypeError, ValueError):
+        diarization_min_seconds = max(0.0, QWEN_OMNIVAD_DIARIZATION_MIN_SECONDS)
+
+    if not enable_diarization:
+        print("Qwen-OmniVAD: Pyannote diarization skipped (disabled).")
+        return [(s, e, "speaker1") for s, e in speech_spans]
+    if DiarizationPipeline is None:
+        print("Qwen-OmniVAD: Pyannote diarization skipped (whisperx.diarize is unavailable).")
+        return [(s, e, "speaker1") for s, e in speech_spans]
+    if not QWEN_OMNIVAD_HF_TOKEN:
+        print("Qwen-OmniVAD: Pyannote diarization skipped (missing QWEN_OMNIVAD_HF_TOKEN/WHISPERX_HF_TOKEN/HF_TOKEN).")
         return [(s, e, "speaker1") for s, e in speech_spans]
 
-    print("Qwen-OmniVAD: Running Pyannote Diarization...")
+    print(f"Qwen-OmniVAD: Running Pyannote Diarization (min_split={diarization_min_seconds:.2f}s)...")
     try:
         import whisperx
         audio = whisperx.load_audio(audio_path)

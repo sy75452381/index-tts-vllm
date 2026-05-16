@@ -2179,7 +2179,7 @@ async def _build_translation_segments(
     whisperx_proxy_refiner: bool = False,
     translation_llm_model: Optional[str] = None,
     qwen_omnivad_enable_diarization: bool = True,
-    qwen_omnivad_diarization_min_seconds: float = 3.0,
+    qwen_omnivad_diarization_min_seconds: float = 0.0,
 ) -> SegmentBuildResult:
     manual_chunk_data = None
     manual_speaker_profiles: List[Dict[str, Any]] = []
@@ -2213,6 +2213,14 @@ async def _build_translation_segments(
     # Resolve pipeline label
     use_whisperx = transcription_pipeline == "whisperx"
     use_qwen_omnivad = transcription_pipeline == "qwen_omnivad"
+    (
+        qwen_omnivad_enable_diarization,
+        qwen_omnivad_diarization_min_seconds,
+    ) = _resolve_qwen_omnivad_diarization_options(
+        transcription_pipeline,
+        qwen_omnivad_enable_diarization,
+        qwen_omnivad_diarization_min_seconds,
+    )
     if use_whisperx:
         pipeline_label = "WhisperX"
     elif use_qwen_omnivad:
@@ -2394,6 +2402,10 @@ async def _build_translation_segments(
         resolved_gemini_model,
         gemini_api_key_value,
         translation_llm_model=resolved_translation_llm_model,
+        transcription_pipeline=transcription_pipeline,
+        whisperx_proxy_refiner=whisperx_proxy_refiner,
+        qwen_omnivad_enable_diarization=qwen_omnivad_enable_diarization,
+        qwen_omnivad_diarization_min_seconds=qwen_omnivad_diarization_min_seconds,
         backing_track_audio=backing_track_audio,
         merge_with_backing=merge_with_backing,
         ignore_non_speech=ignore_non_speech_flag,
@@ -2450,6 +2462,8 @@ async def _build_translation_segments(
         "translation_llm_model": resolved_translation_llm_model,
         "transcription_pipeline": transcription_pipeline,
         "whisperx_proxy_refiner": whisperx_proxy_refiner,
+        "qwen_omnivad_enable_diarization": qwen_omnivad_enable_diarization,
+        "qwen_omnivad_diarization_min_seconds": qwen_omnivad_diarization_min_seconds,
         "ignore_non_speech": ignore_non_speech_flag,
         "preserve_silence_audio": preserve_silence_audio_flag,
         "generated_volume_percent": generated_volume_percent_value,
@@ -2551,6 +2565,10 @@ class TranslateSessionData:
     gemini_model: str
     gemini_api_key: Optional[str]
     translation_llm_model: str = DEFAULT_TRANSLATION_LLM_MODEL
+    transcription_pipeline: str = "qwen_omnivad"
+    whisperx_proxy_refiner: bool = False
+    qwen_omnivad_enable_diarization: bool = True
+    qwen_omnivad_diarization_min_seconds: float = 0.0
     source_audio_filename: Optional[str] = None
     source_base_name: Optional[str] = None
     original_audio_path: Optional[str] = None
@@ -4431,6 +4449,10 @@ def _session_to_manifest(session: TranslateSessionData) -> Dict[str, Any]:
         "gemini_model": session.gemini_model,
         "gemini_api_key": session.gemini_api_key,
         "translation_llm_model": session.translation_llm_model,
+        "transcription_pipeline": session.transcription_pipeline,
+        "whisperx_proxy_refiner": session.whisperx_proxy_refiner,
+        "qwen_omnivad_enable_diarization": session.qwen_omnivad_enable_diarization,
+        "qwen_omnivad_diarization_min_seconds": session.qwen_omnivad_diarization_min_seconds,
         "source_audio_filename": session.source_audio_filename,
         "source_base_name": session.source_base_name,
         "original_audio_path": session.original_audio_path,
@@ -4482,6 +4504,10 @@ async def _rehydrate_session_from_manifest(manifest: Dict[str, Any]) -> Translat
         manifest.get("gemini_model") or _get_gemini_model_name(),
         manifest.get("gemini_api_key"),
         translation_llm_model=manifest.get("translation_llm_model"),
+        transcription_pipeline=manifest.get("transcription_pipeline", "qwen_omnivad"),
+        whisperx_proxy_refiner=manifest.get("whisperx_proxy_refiner", False),
+        qwen_omnivad_enable_diarization=manifest.get("qwen_omnivad_enable_diarization", True),
+        qwen_omnivad_diarization_min_seconds=manifest.get("qwen_omnivad_diarization_min_seconds", 0.0),
         backing_track_audio=None,
         backing_track_path=manifest.get("backing_track_path"),
         backing_audio_info=backing_info,
@@ -4642,20 +4668,44 @@ async def _generate_chunk_audio_from_session(
     merge_backing_track: bool,
     silence_volume_percent: float,
     force_gemini_regenerate: bool = False,
-    transcription_pipeline: str = "gemini",
-    whisperx_proxy_refiner: bool = False,
+    transcription_pipeline: Optional[str] = None,
+    whisperx_proxy_refiner: Any = None,
     default_speaker_preset: Optional[str] = None,
     default_emotion_weight: Optional[float] = None,
-    qwen_omnivad_enable_diarization: bool = True,
-    qwen_omnivad_diarization_min_seconds: float = 3.0,
+    qwen_omnivad_enable_diarization: Any = None,
+    qwen_omnivad_diarization_min_seconds: Any = None,
 ) -> Tuple[str, str, Dict[str, Any]]:
     response_format = _normalize_translate_output_format(response_format)
-    transcription_pipeline = (transcription_pipeline or "").strip().lower()
+    transcription_pipeline = (
+        transcription_pipeline
+        or getattr(chunk_session, "transcription_pipeline", None)
+        or "qwen_omnivad"
+    ).strip().lower()
     if transcription_pipeline not in ("gemini", "whisperx", "qwen_omnivad"):
         transcription_pipeline = "gemini"
     whisperx_proxy_refiner = (
-        _coerce_to_bool(whisperx_proxy_refiner)
+        _coerce_to_bool(
+            whisperx_proxy_refiner
+            if whisperx_proxy_refiner is not None
+            else getattr(chunk_session, "whisperx_proxy_refiner", False)
+        )
         and transcription_pipeline == "whisperx"
+    )
+    (
+        qwen_omnivad_enable_diarization,
+        qwen_omnivad_diarization_min_seconds,
+    ) = _resolve_qwen_omnivad_diarization_options(
+        transcription_pipeline,
+        (
+            qwen_omnivad_enable_diarization
+            if qwen_omnivad_enable_diarization is not None
+            else getattr(chunk_session, "qwen_omnivad_enable_diarization", True)
+        ),
+        (
+            qwen_omnivad_diarization_min_seconds
+            if qwen_omnivad_diarization_min_seconds is not None
+            else getattr(chunk_session, "qwen_omnivad_diarization_min_seconds", 0.0)
+        ),
     )
 
     clearvoice_settings = chunk_session.clearvoice_settings or {}
@@ -6269,6 +6319,25 @@ def _coerce_positive_float(
     return parsed
 
 
+def _resolve_qwen_omnivad_diarization_options(
+    transcription_pipeline: Any,
+    enable_diarization: Any,
+    diarization_min_seconds: Any,
+) -> Tuple[bool, float]:
+    pipeline = (str(transcription_pipeline or "")).strip().lower()
+    enabled = (
+        _coerce_to_bool(enable_diarization if enable_diarization is not None else True)
+        if pipeline == "qwen_omnivad"
+        else False
+    )
+    min_seconds = _coerce_positive_float(
+        diarization_min_seconds if diarization_min_seconds is not None else 0.0,
+        0.0,
+        min_value=0.0,
+    )
+    return enabled, min_seconds
+
+
 def _coerce_float_range(
     value: Any,
     default: float,
@@ -6673,6 +6742,10 @@ async def _create_translate_session(
     gemini_model: str,
     gemini_api_key: Optional[str],
     translation_llm_model: Optional[str] = None,
+    transcription_pipeline: str = "qwen_omnivad",
+    whisperx_proxy_refiner: bool = False,
+    qwen_omnivad_enable_diarization: Any = True,
+    qwen_omnivad_diarization_min_seconds: Any = 0.0,
     backing_track_audio: Optional[AudioSegment] = None,
     backing_track_path: Optional[str] = None,
     backing_audio_info: Optional[AudioAssetInfo] = None,
@@ -6712,6 +6785,21 @@ async def _create_translate_session(
     normalized_default_emotion = _coerce_emotion_weight(
         default_emotion_weight,
         DEFAULT_EMOTION_WEIGHT,
+    )
+    resolved_transcription_pipeline = (transcription_pipeline or "").strip().lower()
+    if resolved_transcription_pipeline not in ("gemini", "whisperx", "qwen_omnivad"):
+        resolved_transcription_pipeline = "gemini"
+    resolved_whisperx_proxy_refiner = (
+        _coerce_to_bool(whisperx_proxy_refiner)
+        and resolved_transcription_pipeline == "whisperx"
+    )
+    (
+        resolved_qwen_omnivad_enable_diarization,
+        resolved_qwen_omnivad_diarization_min_seconds,
+    ) = _resolve_qwen_omnivad_diarization_options(
+        resolved_transcription_pipeline,
+        qwen_omnivad_enable_diarization,
+        qwen_omnivad_diarization_min_seconds,
     )
 
     audio_path = original_audio_path
@@ -6790,6 +6878,10 @@ async def _create_translate_session(
         gemini_model=gemini_model,
         gemini_api_key=gemini_api_key,
         translation_llm_model=_normalize_translation_llm_model(translation_llm_model),
+        transcription_pipeline=resolved_transcription_pipeline,
+        whisperx_proxy_refiner=resolved_whisperx_proxy_refiner,
+        qwen_omnivad_enable_diarization=resolved_qwen_omnivad_enable_diarization,
+        qwen_omnivad_diarization_min_seconds=resolved_qwen_omnivad_diarization_min_seconds,
         source_audio_filename=source_audio_filename,
         source_base_name=resolved_base_name,
         original_audio_path=audio_path,
@@ -8721,7 +8813,7 @@ class TranslateRequest(BaseModel):
         description="When using transcription_pipeline='qwen_omnivad', enable pyannote diarization.",
     )
     qwen_omnivad_diarization_min_seconds: Optional[float] = Field(
-        default=3.0,
+        default=0.0,
         description="When using transcription_pipeline='qwen_omnivad', minimum span duration to split by diarization.",
     )
 
@@ -8876,19 +8968,19 @@ class ChunkBatchGenerateRequest(BaseModel):
         description="LitAI API translation model for local transcription pipelines.",
     )
     transcription_pipeline: Optional[str] = Field(
-        default="qwen_omnivad",
+        default=None,
         description="Transcription pipeline to use for selected chunk generation: 'gemini' (default), 'whisperx', or 'qwen_omnivad'.",
     )
     whisperx_proxy_refiner: Optional[bool] = Field(
-        default=False,
+        default=None,
         description="When using transcription_pipeline='whisperx', enable the experimental speaker-aware proxy segment refiner.",
     )
     qwen_omnivad_enable_diarization: Optional[bool] = Field(
-        default=True,
+        default=None,
         description="When using transcription_pipeline='qwen_omnivad', enable pyannote diarization.",
     )
     qwen_omnivad_diarization_min_seconds: Optional[float] = Field(
-        default=3.0,
+        default=None,
         description="When using transcription_pipeline='qwen_omnivad', minimum span duration to split by diarization.",
     )
     merge_backing_track: Optional[bool] = Field(
@@ -10461,12 +10553,36 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
         translation_llm_model_value = _normalize_translation_llm_model(
             payload.translation_llm_model or config_template.translation_llm_model
         )
-        transcription_pipeline_value = (payload.transcription_pipeline or "").strip().lower()
+        transcription_pipeline_value = (
+            payload.transcription_pipeline
+            or getattr(config_template, "transcription_pipeline", None)
+            or "qwen_omnivad"
+        ).strip().lower()
         if transcription_pipeline_value not in ("gemini", "whisperx", "qwen_omnivad"):
             transcription_pipeline_value = "gemini"
         whisperx_proxy_refiner_flag = (
-            _coerce_to_bool(payload.whisperx_proxy_refiner)
+            _coerce_to_bool(
+                payload.whisperx_proxy_refiner
+                if payload.whisperx_proxy_refiner is not None
+                else getattr(config_template, "whisperx_proxy_refiner", False)
+            )
             and transcription_pipeline_value == "whisperx"
+        )
+        (
+            qwen_omnivad_enable_diarization_flag,
+            qwen_omnivad_diarization_min_seconds_value,
+        ) = _resolve_qwen_omnivad_diarization_options(
+            transcription_pipeline_value,
+            (
+                payload.qwen_omnivad_enable_diarization
+                if payload.qwen_omnivad_enable_diarization is not None
+                else getattr(config_template, "qwen_omnivad_enable_diarization", True)
+            ),
+            (
+                payload.qwen_omnivad_diarization_min_seconds
+                if payload.qwen_omnivad_diarization_min_seconds is not None
+                else getattr(config_template, "qwen_omnivad_diarization_min_seconds", 0.0)
+            ),
         )
         ignore_non_speech_flag = _coerce_to_bool(
             payload.ignore_non_speech if payload.ignore_non_speech is not None else config_template.ignore_non_speech
@@ -10522,6 +10638,8 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
             "translation_llm_model": translation_llm_model_value,
             "transcription_pipeline": transcription_pipeline_value,
             "whisperx_proxy_refiner": whisperx_proxy_refiner_flag,
+            "qwen_omnivad_enable_diarization": qwen_omnivad_enable_diarization_flag,
+            "qwen_omnivad_diarization_min_seconds": qwen_omnivad_diarization_min_seconds_value,
             "merge_backing": merge_backing_requested,
             "force_gemini_regenerate": force_gemini_regenerate_flag,
         }
@@ -10590,6 +10708,8 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
                             whisperx_proxy_refiner=whisperx_proxy_refiner_flag,
                             default_speaker_preset=session.default_speaker_preset,
                             default_emotion_weight=session.default_emotion_weight,
+                            qwen_omnivad_enable_diarization=qwen_omnivad_enable_diarization_flag,
+                            qwen_omnivad_diarization_min_seconds=qwen_omnivad_diarization_min_seconds_value,
                         )
                         async with counter_lock:
                             success_count += 1
@@ -10714,7 +10834,7 @@ async def api_translate_segments(
     transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), or 'qwen_omnivad' (Qwen3-ASR + OmniVAD)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
     qwen_omnivad_enable_diarization: Optional[bool] = Form(True, description="Enable pyannote diarization for Qwen OmniVAD pipeline."),
-    qwen_omnivad_diarization_min_seconds: Optional[float] = Form(3.0, description="Minimum span duration to split by diarization."),
+    qwen_omnivad_diarization_min_seconds: Optional[float] = Form(0.0, description="Minimum span duration to split by diarization."),
 ):
     """API: Prepare translation segments for advanced translate/edit workflow."""
     reuse_session_id_value: Optional[str] = reuse_session_id
@@ -10929,6 +11049,14 @@ async def api_translate_segments(
             _coerce_to_bool(whisperx_proxy_refiner_value)
             and resolved_transcription_pipeline == "whisperx"
         )
+        (
+            qwen_omnivad_enable_diarization_flag,
+            qwen_omnivad_diarization_min_seconds_value,
+        ) = _resolve_qwen_omnivad_diarization_options(
+            resolved_transcription_pipeline,
+            qwen_omnivad_enable_diarization,
+            qwen_omnivad_diarization_min_seconds,
+        )
 
         reuse_session_for_segments = reuse_source_session
         session_source_filename = uploaded_filename or (
@@ -10965,6 +11093,8 @@ async def api_translate_segments(
             "translation_llm_model": resolved_translation_llm_model,
             "transcription_pipeline": resolved_transcription_pipeline,
             "whisperx_proxy_refiner": whisperx_proxy_refiner_flag,
+            "qwen_omnivad_enable_diarization": qwen_omnivad_enable_diarization_flag,
+            "qwen_omnivad_diarization_min_seconds": qwen_omnivad_diarization_min_seconds_value,
         }
         print(
             "[translate_segments] dest=%s reuse_session=%s chunk_index=%s upload=%s format=%s backing=%s merge_backing=%s"
@@ -11091,8 +11221,8 @@ async def api_translate_segments(
                         backing_track_source_path=cached_backing_path,
                         transcription_pipeline=resolved_transcription_pipeline,
                         whisperx_proxy_refiner=whisperx_proxy_refiner_flag,
-                        qwen_omnivad_enable_diarization=qwen_omnivad_enable_diarization if qwen_omnivad_enable_diarization is not None else True,
-                        qwen_omnivad_diarization_min_seconds=float(qwen_omnivad_diarization_min_seconds) if qwen_omnivad_diarization_min_seconds is not None else 3.0,
+                        qwen_omnivad_enable_diarization=qwen_omnivad_enable_diarization_flag,
+                        qwen_omnivad_diarization_min_seconds=qwen_omnivad_diarization_min_seconds_value,
                     )
 
                     metadata = segment_result.metadata
@@ -12146,7 +12276,7 @@ async def api_translate_audio(
     transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), or 'qwen_omnivad' (Qwen3-ASR + OmniVAD)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
     qwen_omnivad_enable_diarization: Optional[bool] = Form(True, description="Enable pyannote diarization for Qwen OmniVAD pipeline."),
-    qwen_omnivad_diarization_min_seconds: Optional[float] = Form(3.0, description="Minimum span duration to split by diarization."),
+    qwen_omnivad_diarization_min_seconds: Optional[float] = Form(0.0, description="Minimum span duration to split by diarization."),
 ):
     """API: Translate speech audio to a target language and return synthesized audio."""
     reuse_session_id_value: Optional[str] = reuse_session_id
@@ -12303,6 +12433,14 @@ async def api_translate_audio(
             _coerce_to_bool(whisperx_proxy_refiner_value)
             and resolved_transcription_pipeline == "whisperx"
         )
+        (
+            qwen_omnivad_enable_diarization_flag,
+            qwen_omnivad_diarization_min_seconds_value,
+        ) = _resolve_qwen_omnivad_diarization_options(
+            resolved_transcription_pipeline,
+            qwen_omnivad_enable_diarization,
+            qwen_omnivad_diarization_min_seconds,
+        )
 
         srt_segments_from_upload, srt_upload_error = await _load_srt_segments_override(
             original_srt_file,
@@ -12430,6 +12568,8 @@ async def api_translate_audio(
             "translation_llm_model": resolved_translation_llm_model,
             "transcription_pipeline": resolved_transcription_pipeline,
             "whisperx_proxy_refiner": whisperx_proxy_refiner_flag,
+            "qwen_omnivad_enable_diarization": qwen_omnivad_enable_diarization_flag,
+            "qwen_omnivad_diarization_min_seconds": qwen_omnivad_diarization_min_seconds_value,
         }
         print(
             "[translate_audio] dest=%s reuse_session=%s chunk_index=%s upload=%s format=%s backing=%s merge_backing=%s"
@@ -12572,8 +12712,8 @@ async def api_translate_audio(
                         backing_track_source_path=cached_backing_path,
                         transcription_pipeline=resolved_transcription_pipeline,
                         whisperx_proxy_refiner=whisperx_proxy_refiner_flag,
-                        qwen_omnivad_enable_diarization=qwen_omnivad_enable_diarization if qwen_omnivad_enable_diarization is not None else True,
-                        qwen_omnivad_diarization_min_seconds=float(qwen_omnivad_diarization_min_seconds) if qwen_omnivad_diarization_min_seconds is not None else 3.0,
+                        qwen_omnivad_enable_diarization=qwen_omnivad_enable_diarization_flag,
+                        qwen_omnivad_diarization_min_seconds=qwen_omnivad_diarization_min_seconds_value,
                     )
                     session = segment_result.session
                     segments = segment_result.segments
