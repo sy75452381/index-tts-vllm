@@ -110,7 +110,7 @@ PARAKEET_ASR_CACHE_DIR = os.getenv(
     "PARAKEET_ASR_CACHE_DIR",
     os.path.join(_SCRIPT_DIR, "parakeet_cache"),
 )
-PARAKEET_ASR_CACHE_VERSION = 2
+PARAKEET_ASR_CACHE_VERSION = 4
 PARAKEET_ASR_BATCH_SIZE = _env_int("PARAKEET_ASR_BATCH_SIZE", 1)
 PARAKEET_ASR_USE_OMNIVAD = os.getenv(
     "PARAKEET_ASR_USE_OMNIVAD",
@@ -125,9 +125,19 @@ PARAKEET_ASR_MAX_CLIP_SECONDS = _env_float(
     300.0,
     min_value=30.0,
 )
+PARAKEET_ASR_SPLIT_SEARCH_START_SECONDS = _env_float(
+    "PARAKEET_ASR_SPLIT_SEARCH_START_SECONDS",
+    180.0,
+    min_value=1.0,
+)
+PARAKEET_ASR_SPLIT_SEARCH_WINDOW_SECONDS = _env_float(
+    "PARAKEET_ASR_SPLIT_SEARCH_WINDOW_SECONDS",
+    60.0,
+    min_value=1.0,
+)
 PARAKEET_ASR_MIN_SPLIT_SILENCE_SECONDS = _env_float(
     "PARAKEET_ASR_MIN_SPLIT_SILENCE_SECONDS",
-    0.05,
+    1.0,
     min_value=0.0,
 )
 PARAKEET_ASR_OMNIVAD_CHUNK_SECONDS = _env_float(
@@ -479,10 +489,14 @@ def _build_silence_aligned_chunks(
     speech_spans: Sequence[Tuple[float, float]],
     *,
     max_clip_seconds: float = PARAKEET_ASR_MAX_CLIP_SECONDS,
+    search_start_seconds: float = PARAKEET_ASR_SPLIT_SEARCH_START_SECONDS,
+    search_window_seconds: float = PARAKEET_ASR_SPLIT_SEARCH_WINDOW_SECONDS,
     min_silence_seconds: float = PARAKEET_ASR_MIN_SPLIT_SILENCE_SECONDS,
 ) -> List[AudioChunk]:
     duration = max(0.0, float(duration_seconds or 0.0))
     max_clip = max(1.0, float(max_clip_seconds or PARAKEET_ASR_MAX_CLIP_SECONDS))
+    search_start = max(1.0, float(search_start_seconds or PARAKEET_ASR_SPLIT_SEARCH_START_SECONDS))
+    search_window = max(1.0, float(search_window_seconds or PARAKEET_ASR_SPLIT_SEARCH_WINDOW_SECONDS))
     if duration <= 0:
         return []
     if duration <= max_clip + 0.001:
@@ -495,70 +509,78 @@ def _build_silence_aligned_chunks(
     eps = 0.001
     chunks: List[AudioChunk] = []
 
-    def add_forced_chunks(start: float, end: float) -> None:
-        length = end - start
-        if length <= eps:
-            return
-        count = max(1, int(math.ceil(length / max_clip)))
-        cursor = start
-        for idx in range(count):
-            next_end = end if idx == count - 1 else start + (length * (idx + 1) / count)
-            if next_end > cursor + eps:
-                chunks.append(
-                    AudioChunk(
-                        start=cursor,
-                        end=next_end,
-                        split_reason="forced",
-                    )
+    usable_gaps: List[Tuple[float, float, float, float]] = []
+    for gap_start, gap_end in gaps:
+        silence_len = gap_end - gap_start
+        if silence_len < min_silence_seconds:
+            continue
+        split_point = (gap_start + gap_end) / 2.0
+        if split_point <= eps or split_point >= duration - eps:
+            continue
+        usable_gaps.append((gap_start, gap_end, split_point, silence_len))
+
+    cursor = 0.0
+    while duration - cursor > max_clip + eps:
+        window_start = cursor + search_start
+        selected: Optional[Tuple[float, float, float, float]] = None
+        while window_start < duration - eps:
+            window_end = min(duration - eps, window_start + search_window)
+            candidates = [
+                gap
+                for gap in usable_gaps
+                if cursor + eps < gap[2] and window_start <= gap[2] <= window_end
+            ]
+            if candidates:
+                selected = max(
+                    candidates,
+                    key=lambda gap: (gap[3], -abs(gap[2] - window_start)),
                 )
-            cursor = next_end
+                break
+            window_start = window_end
 
-    def split_range(start: float, end: float) -> None:
-        if end - start <= max_clip + eps:
-            chunks.append(AudioChunk(start=start, end=end, split_reason="silence"))
-            return
-
-        candidates: List[Tuple[float, float, float, float, float]] = []
-        center = (start + end) / 2.0
-        for gap_start, gap_end in gaps:
-            usable_start = max(start, gap_start)
-            usable_end = min(end, gap_end)
-            silence_len = usable_end - usable_start
-            if silence_len < min_silence_seconds:
-                continue
-            if gap_start <= start + eps or gap_end >= end - eps:
-                continue
-            split_point = (usable_start + usable_end) / 2.0
-            if split_point <= start + eps or split_point >= end - eps:
-                continue
-            candidates.append(
-                (
-                    silence_len,
-                    -abs(split_point - center),
-                    split_point,
-                    usable_start,
-                    usable_end,
+        if selected is None:
+            chunks.append(
+                AudioChunk(
+                    start=cursor,
+                    end=duration,
+                    split_reason="unsplit_no_silence",
                 )
             )
+            cursor = duration
+            break
 
-        if not candidates:
-            add_forced_chunks(start, end)
-            return
+        gap_start, gap_end, split_point, _silence_len = selected
+        if split_point <= cursor + eps or split_point >= duration - eps:
+            chunks.append(
+                AudioChunk(
+                    start=cursor,
+                    end=duration,
+                    split_reason="unsplit_no_silence",
+                )
+            )
+            cursor = duration
+            break
 
-        _silence_len, _center_score, split_point, silence_start, silence_end = max(candidates)
-        split_range(start, split_point)
-        split_range(split_point, end)
-        for chunk in chunks:
-            if (
-                chunk.silence_start is None
-                and abs(chunk.end - split_point) <= 0.002
-            ):
-                chunk.split_reason = "silence"
-                chunk.silence_start = silence_start
-                chunk.silence_end = silence_end
-                break
+        chunks.append(
+            AudioChunk(
+                start=cursor,
+                end=split_point,
+                split_reason="silence",
+                silence_start=gap_start,
+                silence_end=gap_end,
+            )
+        )
+        cursor = split_point
 
-    split_range(0.0, duration)
+    if cursor < duration - eps:
+        chunks.append(
+            AudioChunk(
+                start=cursor,
+                end=duration,
+                split_reason="final" if chunks else "full",
+            )
+        )
+
     normalized = [
         AudioChunk(
             start=max(0.0, min(chunk.start, duration)),
@@ -570,7 +592,7 @@ def _build_silence_aligned_chunks(
         for chunk in sorted(chunks, key=lambda item: item.start)
         if chunk.end > chunk.start + eps
     ]
-    return normalized or [AudioChunk(start=0.0, end=duration, split_reason="forced")]
+    return normalized or [AudioChunk(start=0.0, end=duration, split_reason="full")]
 
 
 def _export_audio_chunks(
@@ -957,6 +979,8 @@ def _cache_key(
             f"omnivad_required={PARAKEET_ASR_REQUIRE_OMNIVAD_FOR_LONG_AUDIO}",
             f"omnivad_model={PARAKEET_ASR_OMNIVAD_MODEL_PATH or 'default'}",
             f"max_clip={PARAKEET_ASR_MAX_CLIP_SECONDS:.3f}",
+            f"split_search_start={PARAKEET_ASR_SPLIT_SEARCH_START_SECONDS:.3f}",
+            f"split_search_window={PARAKEET_ASR_SPLIT_SEARCH_WINDOW_SECONDS:.3f}",
             f"min_split_silence={PARAKEET_ASR_MIN_SPLIT_SILENCE_SECONDS:.3f}",
             f"vad_chunk={PARAKEET_ASR_OMNIVAD_CHUNK_SECONDS:.3f}",
             f"vad_overlap={PARAKEET_ASR_OMNIVAD_OVERLAP_SECONDS:.3f}",
@@ -1083,7 +1107,10 @@ def _transcribe_chunks_with_timestamps(
 
     print(
         f"Running NVIDIA Parakeet ASR on {len(chunks)} silence-aligned chunk(s) "
-        f"(target max {PARAKEET_ASR_MAX_CLIP_SECONDS:.1f}s, batch_size={PARAKEET_ASR_BATCH_SIZE})..."
+        f"(search starts at {PARAKEET_ASR_SPLIT_SEARCH_START_SECONDS:.1f}s "
+        f"in {PARAKEET_ASR_SPLIT_SEARCH_WINDOW_SECONDS:.1f}s windows; "
+        f"cut at silence midpoint; no fixed mid-speech cuts; "
+        f"batch_size={PARAKEET_ASR_BATCH_SIZE})..."
     )
     jobs = _export_audio_chunks(wav_path, chunks)
     results_by_index: List[Tuple[int, List[TimelineItem], str, Optional[str], str]] = []
@@ -1344,6 +1371,9 @@ def translate_audio(
         "omnivad_available": bool(OmniVAD is not None),
         "omnivad_required_for_long_audio": bool(PARAKEET_ASR_REQUIRE_OMNIVAD_FOR_LONG_AUDIO),
         "max_clip_seconds": PARAKEET_ASR_MAX_CLIP_SECONDS,
+        "split_search_start_seconds": PARAKEET_ASR_SPLIT_SEARCH_START_SECONDS,
+        "split_search_window_seconds": PARAKEET_ASR_SPLIT_SEARCH_WINDOW_SECONDS,
+        "min_split_silence_seconds": PARAKEET_ASR_MIN_SPLIT_SILENCE_SECONDS,
     }
 
     if not force_refresh:
@@ -1401,6 +1431,8 @@ def translate_audio(
             duration,
             speech_spans,
             max_clip_seconds=PARAKEET_ASR_MAX_CLIP_SECONDS,
+            search_start_seconds=PARAKEET_ASR_SPLIT_SEARCH_START_SECONDS,
+            search_window_seconds=PARAKEET_ASR_SPLIT_SEARCH_WINDOW_SECONDS,
             min_silence_seconds=PARAKEET_ASR_MIN_SPLIT_SILENCE_SECONDS,
         )
         model = _load_parakeet_model()

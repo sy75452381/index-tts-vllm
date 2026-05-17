@@ -12,6 +12,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -536,6 +537,7 @@ def _cache_key(
     diarization_backend: Any,
     diarization_min_seconds: float,
     enable_forced_aligner: bool,
+    merge_gap_seconds: float,
 ) -> str:
     normalized_diarization_backend = _normalize_diarization_backend(diarization_backend)
     effective_diarization_backend = _effective_diarization_backend(
@@ -564,7 +566,7 @@ def _cache_key(
             f"asr_timestamps={'forced_aligner' if enable_forced_aligner else 'ignored'}",
             f"vad_chunk={QWEN_OMNIVAD_CHUNK_SECONDS:.3f}",
             f"vad_overlap={QWEN_OMNIVAD_OVERLAP_SECONDS:.3f}",
-            f"vad_merge_gap={QWEN_OMNIVAD_MERGE_GAP_SECONDS:.4f}",
+            f"vad_merge_gap={merge_gap_seconds:.4f}",
             f"vad_asr_workers={QWEN_OMNIVAD_ASR_SEGMENT_WORKERS}",
             f"vad_min_seg={QWEN_OMNIVAD_MIN_SEGMENT_SECONDS:.4f}",
             f"llm={translation_llm_model or 'default'}",
@@ -790,10 +792,23 @@ def _merge_nearby_speech_spans(
     return merged
 
 
+def _coerce_omnivad_merge_gap_seconds(value: Any) -> float:
+    if value is None:
+        return max(0.0, QWEN_OMNIVAD_MERGE_GAP_SECONDS)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return max(0.0, QWEN_OMNIVAD_MERGE_GAP_SECONDS)
+    if not math.isfinite(parsed):
+        return max(0.0, QWEN_OMNIVAD_MERGE_GAP_SECONDS)
+    return max(0.0, parsed)
+
+
 def _detect_omnivad_speech_spans(
     audio_path: str,
     *,
     duration_seconds: float,
+    merge_gap_seconds: float,
 ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
     """Run OmniVAD; return merged speech intervals and raw intervals in seconds."""
     global _OMNIVAD_MODEL_LOAD_PATH
@@ -849,9 +864,10 @@ def _detect_omnivad_speech_spans(
     if not raw_spans:
         return [], []
 
+    effective_merge_gap_seconds = _coerce_omnivad_merge_gap_seconds(merge_gap_seconds)
     merged = _merge_nearby_speech_spans(
         raw_spans,
-        max_gap_seconds=QWEN_OMNIVAD_MERGE_GAP_SECONDS,
+        max_gap_seconds=effective_merge_gap_seconds,
     )
     preserved_gaps = sum(
         1
@@ -859,13 +875,13 @@ def _detect_omnivad_speech_spans(
         if merged[idx][0] > merged[idx - 1][1] + 0.05
     )
     print(
-        f"OmniVAD → {len(raw_spans)} speech span(s) after clipping → "
-        f"{len(merged)} merged span(s) (gap≤{QWEN_OMNIVAD_MERGE_GAP_SECONDS:.2f}s); "
+        f"OmniVAD -> {len(raw_spans)} speech span(s) after clipping -> "
+        f"{len(merged)} merged span(s) (gap<={effective_merge_gap_seconds:.2f}s); "
         f"{preserved_gaps} silence gap(s) kept."
     )
     print("OmniVAD Raw Spans:")
     for rs_idx, (rs_start, rs_end) in enumerate(raw_spans, start=1):
-        print(f"  Raw Span {rs_idx}: [{rs_start:.3f}s → {rs_end:.3f}s]")
+        print(f"  Raw Span {rs_idx}: [{rs_start:.3f}s -> {rs_end:.3f}s]")
     return merged, raw_spans
 
 
@@ -1654,6 +1670,7 @@ def translate_audio(
     diarization_backend: str = QWEN_OMNIVAD_DIARIZATION_BACKEND,
     diarization_min_seconds: float = QWEN_OMNIVAD_DIARIZATION_MIN_SECONDS,
     enable_forced_aligner: bool = QWEN_OMNIVAD_ENABLE_FORCED_ALIGNER,
+    merge_gap_seconds: float = QWEN_OMNIVAD_MERGE_GAP_SECONDS,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str, Dict[str, Any]]:
     """
     Full-audio diarization + OmniVAD define timestamped ASR windows; Qwen3-ASR
@@ -1661,7 +1678,8 @@ def translate_audio(
 
     Same return signature as Gemini/WhisperX helpers consumed by ``fastapi_webui_v2.py``.
 
-    Optional env: ``QWEN_OMNIVAD_ASR_SEGMENT_WORKERS`` (default 1),
+    Optional env: ``QWEN_OMNIVAD_MERGE_GAP_SECONDS`` (default 0.001),
+    ``QWEN_OMNIVAD_ASR_SEGMENT_WORKERS`` (default 1), and
     ``QWEN_OMNIVAD_MIN_SEGMENT_SECONDS`` (default 0.05; floor 0.02s).
     """
     if not is_qwen_omnivad_available():
@@ -1683,6 +1701,7 @@ def translate_audio(
     effective_diarization_backend = _effective_diarization_backend(
         resolved_diarization_backend
     )
+    effective_merge_gap_seconds = _coerce_omnivad_merge_gap_seconds(merge_gap_seconds)
     audio_hash = hashlib.md5(audio_bytes).hexdigest()
     cache_key = _cache_key(
         audio_hash,
@@ -1695,6 +1714,7 @@ def translate_audio(
         diarization_backend=resolved_diarization_backend,
         diarization_min_seconds=diarization_min_seconds,
         enable_forced_aligner=enable_forced_aligner,
+        merge_gap_seconds=effective_merge_gap_seconds,
     )
     cache_info: Dict[str, Any] = {
         "audio_md5": audio_hash,
@@ -1709,6 +1729,7 @@ def translate_audio(
         "translation_max_workers": translation_max_workers,
         "vad_asr_segment_workers": QWEN_OMNIVAD_ASR_SEGMENT_WORKERS,
         "vad_min_segment_seconds": QWEN_OMNIVAD_MIN_SEGMENT_SECONDS,
+        "vad_merge_gap_seconds": effective_merge_gap_seconds,
         "timeline_authority": "full_diarization_plus_omnivad",
         "diarization_backend_requested": resolved_diarization_backend,
         "diarization_backend": effective_diarization_backend,
@@ -1793,6 +1814,7 @@ def translate_audio(
             speech_spans, raw_vad_spans = _detect_omnivad_speech_spans(
                 audio_path,
                 duration_seconds=duration,
+                merge_gap_seconds=effective_merge_gap_seconds,
             )
 
         used_vad_asr_branch = False
@@ -1918,6 +1940,7 @@ def translate_audio(
             "forced_aligner_model": QWEN_ASR_FORCED_ALIGNER if effective_enable_forced_aligner else None,
             "forced_aligner_path": _FORCED_ALIGNER_LOAD_PATH,
             "omnivad_model_path": _OMNIVAD_MODEL_LOAD_PATH,
+            "vad_merge_gap_seconds": effective_merge_gap_seconds,
             "source_language": detected_language,
             "timeline_source": timeline_source,
             "asr_timestamps": "forced_aligner" if effective_enable_forced_aligner else "ignored",

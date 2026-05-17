@@ -1776,6 +1776,13 @@
                                                     VAD spans shorter than this won't be split (they'll just get the dominant speaker ID).
                                                 </small>
                                             </div>
+                                            <div class="form-group" style="margin-top: 8px; margin-bottom: 0;">
+                                                <label for="translateQwenOmniVadMergeGapSeconds">Merge Adjacent VAD Gap (sec):</label>
+                                                <input type="number" id="translateQwenOmniVadMergeGapSeconds" value="0.001" min="0.0" step="0.001" style="max-width: 120px;">
+                                                <small style="color: var(--text-muted); display: block; margin-top: 4px; font-size: 0.75rem;">
+                                                    Adjacent OmniVAD speech spans with gaps at or below this value are merged.
+                                                </small>
+                                            </div>
                                         </div>
                                         <div id="translateLitAiSettings" class="form-row-2" style="display: none; margin-bottom: 14px;">
                                             <div class="form-group">
@@ -2358,6 +2365,7 @@ Status: CONTINUE (more chunks) or LAST (final chunk)</div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (default true)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_diarization</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable diarization for Qwen OmniVAD (default true)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_diarization_backend</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'auto', 'pyannote', or 'sortformer' (Sortformer fallback when no HF token)</span></div>
+                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_merge_gap_seconds</span> <span class="api-param-type">float</span> <span class="api-param-desc">— Merge adjacent OmniVAD spans separated by this many seconds (default 0.001)</span></div>
                                                 <div class="api-param"><span class="api-param-name">segments_json</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Pre-generated Gemini segments (skip inference)</span></div>
                                                 <div class="api-param"><span class="api-param-name">min_speech_ms</span> / <span class="api-param-name">max_merge_ms</span> <span class="api-param-type">int</span> <span class="api-param-desc">— Segment merging heuristics</span></div>
                                             </div>
@@ -2391,6 +2399,7 @@ Content-Type: audio/mpeg</div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (default true)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_diarization</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable diarization for Qwen OmniVAD (default true)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_diarization_backend</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'auto', 'pyannote', or 'sortformer' (Sortformer fallback when no HF token)</span></div>
+                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_merge_gap_seconds</span> <span class="api-param-type">float</span> <span class="api-param-desc">— Merge adjacent OmniVAD spans separated by this many seconds (default 0.001)</span></div>
                                                 <div class="api-param"><span class="api-param-name">gemini_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Model selection (flash/pro)</span></div>
                                                 <div class="api-param"><span class="api-param-name">reuse_session_id</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Reuse audio from previous session</span></div>
                                                 <div class="api-param"><span class="api-param-name">default_speaker_preset</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Default voice for all speakers</span></div>
@@ -2500,6 +2509,7 @@ Content-Type: audio/mpeg</div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (inherits session; default true)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_diarization</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable diarization for Qwen OmniVAD</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_diarization_backend</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'auto', 'pyannote', or 'sortformer'</span></div>
+                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_merge_gap_seconds</span> <span class="api-param-type">float</span> <span class="api-param-desc">— Merge adjacent OmniVAD spans separated by this many seconds</span></div>
                                             </div>
                                         </div>
                                     </div>
@@ -3605,6 +3615,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             const translateQwenOmniVadDiarizationBackend = document.getElementById('translateQwenOmniVadDiarizationBackend');
             const translateQwenOmniVadEnableForcedAligner = document.getElementById('translateQwenOmniVadEnableForcedAligner');
             const translateQwenOmniVadDiarizationMinSeconds = document.getElementById('translateQwenOmniVadDiarizationMinSeconds');
+            const translateQwenOmniVadMergeGapSeconds = document.getElementById('translateQwenOmniVadMergeGapSeconds');
             const translateLitAiSettingsDiv = document.getElementById('translateLitAiSettings');
             const translateTranslationLlmModel = document.getElementById('translateTranslationLlmModel');
             const translateGeminiSettingsDiv = document.getElementById('translateGeminiSettings');
@@ -3712,6 +3723,12 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     translateQwenOmniVadDiarizationMinSeconds.value = settings.qwen_omnivad_diarization_min_seconds;
                 }
                 if (
+                    translateQwenOmniVadMergeGapSeconds &&
+                    typeof settings.qwen_omnivad_merge_gap_seconds === 'number'
+                ) {
+                    translateQwenOmniVadMergeGapSeconds.value = settings.qwen_omnivad_merge_gap_seconds;
+                }
+                if (
                     translateIgnoreNonSpeechEl &&
                     typeof settings.ignore_non_speech === 'boolean'
                 ) {
@@ -3737,6 +3754,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         ? translateQwenOmniVadEnableForcedAligner.checked
                         : true,
                     qwen_omnivad_diarization_min_seconds: getQwenOmniVadDiarizationMinSeconds(),
+                    qwen_omnivad_merge_gap_seconds: getQwenOmniVadMergeGapSeconds(),
                     gemini_model: translateGeminiModel ? translateGeminiModel.value : '',
                     translation_llm_model: translateTranslationLlmModel
                         ? translateTranslationLlmModel.value
@@ -3755,6 +3773,14 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     : '';
                 const parsed = parseFloat(rawValue);
                 return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0.0;
+            }
+
+            function getQwenOmniVadMergeGapSeconds() {
+                const rawValue = translateQwenOmniVadMergeGapSeconds
+                    ? translateQwenOmniVadMergeGapSeconds.value
+                    : '';
+                const parsed = parseFloat(rawValue);
+                return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0.001;
             }
 
             applyTranslatePersistentSettings();
@@ -3823,6 +3849,12 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             }
             if (translateQwenOmniVadDiarizationMinSeconds) {
                 translateQwenOmniVadDiarizationMinSeconds.addEventListener('input', () => {
+                    saveTranslatePersistentSettings();
+                    updateAiConfigSummary();
+                });
+            }
+            if (translateQwenOmniVadMergeGapSeconds) {
+                translateQwenOmniVadMergeGapSeconds.addEventListener('input', () => {
                     saveTranslatePersistentSettings();
                     updateAiConfigSummary();
                 });
@@ -4049,6 +4081,10 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             translateQwenOmniVadEnableForcedAligner.checked
                                 ? 'Aligner'
                                 : 'OmniVAD',
+                    });
+                    items.push({
+                        label: 'Merge Gap',
+                        value: `${getQwenOmniVadMergeGapSeconds()}s`,
                     });
                 } else if (pipelineValue === 'parakeet') {
                     items.push({
@@ -4677,6 +4713,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     translateQwenOmniVadEnableForcedAligner.checked
                 );
                 payload.qwen_omnivad_diarization_min_seconds = getQwenOmniVadDiarizationMinSeconds();
+                payload.qwen_omnivad_merge_gap_seconds = getQwenOmniVadMergeGapSeconds();
                 payload.merge_backing_track = translateMergeBackEl && translateMergeBackEl.checked ? true : false;
                 payload.ignore_non_speech = translateIgnoreNonSpeechEl && translateIgnoreNonSpeechEl.checked ? true : false;
                 payload.preserve_silence_audio = translatePreserveSilenceEl && translatePreserveSilenceEl.checked ? true : false;
@@ -7286,6 +7323,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             formData.append('qwen_omnivad_diarization_backend', translateQwenOmniVadDiarizationBackend ? translateQwenOmniVadDiarizationBackend.value : 'auto');
                             formData.append('qwen_omnivad_enable_forced_aligner', translateQwenOmniVadEnableForcedAligner && translateQwenOmniVadEnableForcedAligner.checked ? 'true' : 'false');
                             formData.append('qwen_omnivad_diarization_min_seconds', String(getQwenOmniVadDiarizationMinSeconds()));
+                            formData.append('qwen_omnivad_merge_gap_seconds', String(getQwenOmniVadMergeGapSeconds()));
                         }
                         if (translateForceGeminiRefresh && translateForceGeminiRefresh.checked) {
                             formData.append('force_gemini_regenerate', 'true');
@@ -7371,6 +7409,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         formData.append('qwen_omnivad_diarization_backend', translateQwenOmniVadDiarizationBackend ? translateQwenOmniVadDiarizationBackend.value : 'auto');
                         formData.append('qwen_omnivad_enable_forced_aligner', translateQwenOmniVadEnableForcedAligner && translateQwenOmniVadEnableForcedAligner.checked ? 'true' : 'false');
                         formData.append('qwen_omnivad_diarization_min_seconds', String(getQwenOmniVadDiarizationMinSeconds()));
+                        formData.append('qwen_omnivad_merge_gap_seconds', String(getQwenOmniVadMergeGapSeconds()));
                     }
                     if (translateForceGeminiRefresh && translateForceGeminiRefresh.checked) {
                         formData.append('force_gemini_regenerate', 'true');
