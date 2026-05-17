@@ -534,6 +534,7 @@ ALLOWED_TRANSLATION_LLM_MODELS: Tuple[str, ...] = (
     "lightning-ai/gpt-oss-20b",
     "lightning-ai/gpt-oss-120b",
     "lightning-ai/minimax-m2.5",
+    "tencent/HY-MT1.5-1.8B",
 )
 DEFAULT_TRANSLATION_LLM_MODEL = "lightning-ai/gemma-4-31B-it"
 
@@ -6391,10 +6392,6 @@ def _resolve_qwen_omnivad_diarization_backend_option(
         return "auto"
     value = str(diarization_backend or "auto").strip().lower().replace("-", "_")
     aliases = {
-        "diarizen_large_v2": "diarizen",
-        "large_v2": "diarizen",
-        "largev2": "diarizen",
-        "diarizen_v2": "diarizen",
         "pyannote_audio": "pyannote",
         "nvidia_sortformer": "sortformer",
         "sortformer_4spk": "sortformer",
@@ -6402,7 +6399,7 @@ def _resolve_qwen_omnivad_diarization_backend_option(
         "sortformer_v2.1": "sortformer",
     }
     value = aliases.get(value, value)
-    return value if value in {"auto", "pyannote", "diarizen", "sortformer"} else "auto"
+    return value if value in {"auto", "pyannote", "sortformer"} else "auto"
 
 
 def _resolve_qwen_omnivad_forced_aligner_option(
@@ -8848,9 +8845,10 @@ class TranslateRequest(BaseModel):
     translation_llm_model: Optional[str] = Field(
         default=None,
         description=(
-            "LitAI API translation model for local transcription pipelines: "
+            "Translation model for local transcription pipelines: "
             "lightning-ai/gemma-4-31B-it, lightning-ai/gpt-oss-20b, "
-            "lightning-ai/gpt-oss-120b, or lightning-ai/minimax-m2.5."
+            "lightning-ai/gpt-oss-120b, lightning-ai/minimax-m2.5, "
+            "or tencent/HY-MT1.5-1.8B."
         ),
     )
     force_gemini_regenerate: Optional[bool] = Field(
@@ -8903,9 +8901,9 @@ class TranslateRequest(BaseModel):
         default=True,
         description="When using transcription_pipeline='qwen_omnivad', enable diarization.",
     )
-    qwen_omnivad_diarization_backend: Optional[Literal["auto", "pyannote", "diarizen", "sortformer"]] = Field(
+    qwen_omnivad_diarization_backend: Optional[Literal["auto", "pyannote", "sortformer"]] = Field(
         default="auto",
-        description="Diarization backend for Qwen OmniVAD: auto, pyannote, diarizen, or sortformer.",
+        description="Diarization backend for Qwen OmniVAD: auto, pyannote, or sortformer.",
     )
     qwen_omnivad_enable_forced_aligner: Optional[bool] = Field(
         default=True,
@@ -9064,7 +9062,7 @@ class ChunkBatchGenerateRequest(BaseModel):
     )
     translation_llm_model: Optional[str] = Field(
         default=None,
-        description="LitAI API translation model for local transcription pipelines.",
+        description="Translation model for local transcription pipelines.",
     )
     transcription_pipeline: Optional[str] = Field(
         default=None,
@@ -9078,9 +9076,9 @@ class ChunkBatchGenerateRequest(BaseModel):
         default=None,
         description="When using transcription_pipeline='qwen_omnivad', enable diarization.",
     )
-    qwen_omnivad_diarization_backend: Optional[Literal["auto", "pyannote", "diarizen", "sortformer"]] = Field(
+    qwen_omnivad_diarization_backend: Optional[Literal["auto", "pyannote", "sortformer"]] = Field(
         default=None,
-        description="Diarization backend for Qwen OmniVAD: auto, pyannote, diarizen, or sortformer.",
+        description="Diarization backend for Qwen OmniVAD: auto, pyannote, or sortformer.",
     )
     qwen_omnivad_enable_forced_aligner: Optional[bool] = Field(
         default=None,
@@ -10931,7 +10929,7 @@ async def api_translate_segments(
     translate_text: Optional[bool] = Form(True),
     gemini_model: Optional[str] = Form(None),
     gemini_api_key: Optional[str] = Form(None),
-    translation_llm_model: Optional[str] = Form(None, description="LitAI API translation model for WhisperX/Qwen local pipelines."),
+    translation_llm_model: Optional[str] = Form(None, description="Translation model for WhisperX/Qwen local pipelines."),
     enhance_voice: Optional[bool] = Form(False),
     enhancement_model: Optional[str] = Form(None, description="ClearVoice enhancement model: 'MossFormerGAN_SE_16K' (default), 'FRCRN_SE_16K', or 'MossFormer2_SE_48K'"),
     super_resolution_voice: Optional[bool] = Form(False),
@@ -10961,7 +10959,7 @@ async def api_translate_segments(
     transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), or 'qwen_omnivad' (Qwen3-ASR + OmniVAD)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
     qwen_omnivad_enable_diarization: Optional[bool] = Form(True, description="Enable diarization for Qwen OmniVAD pipeline."),
-    qwen_omnivad_diarization_backend: Optional[str] = Form("auto", description="Qwen OmniVAD diarization backend: auto, pyannote, diarizen, or sortformer."),
+    qwen_omnivad_diarization_backend: Optional[str] = Form("auto", description="Qwen OmniVAD diarization backend: auto, pyannote, or sortformer."),
     qwen_omnivad_enable_forced_aligner: Optional[bool] = Form(True, description="Enable Qwen3 ForcedAligner timestamps for Qwen OmniVAD pipeline."),
     qwen_omnivad_diarization_min_seconds: Optional[float] = Form(0.0, description="Minimum span duration to split by diarization."),
 ):
@@ -12393,7 +12391,7 @@ async def api_translate_audio(
     prompt: Optional[str] = Form(None),
     gemini_model: Optional[str] = Form(None),
     gemini_api_key: Optional[str] = Form(None),
-    translation_llm_model: Optional[str] = Form(None, description="LitAI API translation model for WhisperX/Qwen local pipelines."),
+    translation_llm_model: Optional[str] = Form(None, description="Translation model for WhisperX/Qwen local pipelines."),
     enhance_voice: Optional[bool] = Form(False),
     enhancement_model: Optional[str] = Form(None, description="ClearVoice enhancement model: 'MossFormerGAN_SE_16K' (default), 'FRCRN_SE_16K', or 'MossFormer2_SE_48K'"),
     super_resolution_voice: Optional[bool] = Form(False),
@@ -12423,7 +12421,7 @@ async def api_translate_audio(
     transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), or 'qwen_omnivad' (Qwen3-ASR + OmniVAD)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
     qwen_omnivad_enable_diarization: Optional[bool] = Form(True, description="Enable diarization for Qwen OmniVAD pipeline."),
-    qwen_omnivad_diarization_backend: Optional[str] = Form("auto", description="Qwen OmniVAD diarization backend: auto, pyannote, diarizen, or sortformer."),
+    qwen_omnivad_diarization_backend: Optional[str] = Form("auto", description="Qwen OmniVAD diarization backend: auto, pyannote, or sortformer."),
     qwen_omnivad_enable_forced_aligner: Optional[bool] = Form(True, description="Enable Qwen3 ForcedAligner timestamps for Qwen OmniVAD pipeline."),
     qwen_omnivad_diarization_min_seconds: Optional[float] = Form(0.0, description="Minimum span duration to split by diarization."),
 ):

@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -45,6 +46,12 @@ try:
     import torch
 except ImportError:
     torch = None  # type: ignore[assignment]
+
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+except ImportError:
+    AutoModelForCausalLM = None  # type: ignore[assignment]
+    AutoTokenizer = None  # type: ignore[assignment]
 
 try:
     from litai import LLM as LitaiLLM  # type: ignore[import]
@@ -78,6 +85,27 @@ def _env_int(name: str, default: int, *, min_value: int = 1, max_value: Optional
     except (TypeError, ValueError):
         return default
     value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if min_value is not None:
+        value = max(min_value, value)
     if max_value is not None:
         value = min(max_value, value)
     return value
@@ -119,6 +147,59 @@ WHISPERX_TRANSLATION_MAX_WORKERS = _env_int(
     min_value=1,
     max_value=10,
 )
+HY_MT_TRANSLATION_MODEL = (
+    os.getenv("HY_MT_TRANSLATION_MODEL", "tencent/HY-MT1.5-1.8B").strip()
+    or "tencent/HY-MT1.5-1.8B"
+)
+HY_MT_TRANSLATION_MODEL_ALIASES = {
+    "hy-mt",
+    "hy-mt1.5-1.8b",
+    "tencent/hy-mt1.5-1.8b",
+}
+HY_MT_TRANSLATION_FALLBACK_ENABLED = _env_flag(
+    "HY_MT_TRANSLATION_FALLBACK_ENABLED",
+    True,
+)
+HY_MT_TRANSLATION_LOCAL_FILES_ONLY = _env_flag(
+    "HY_MT_TRANSLATION_LOCAL_FILES_ONLY",
+    False,
+)
+HY_MT_TRANSLATION_DEVICE = os.getenv("HY_MT_TRANSLATION_DEVICE", "auto").strip() or "auto"
+HY_MT_TRANSLATION_DTYPE = os.getenv("HY_MT_TRANSLATION_DTYPE", "auto").strip().lower()
+HY_MT_TRANSLATION_MAX_NEW_TOKENS = _env_int(
+    "HY_MT_TRANSLATION_MAX_NEW_TOKENS",
+    2048,
+    min_value=1,
+    max_value=65536,
+)
+HY_MT_TRANSLATION_TOP_K = _env_int(
+    "HY_MT_TRANSLATION_TOP_K",
+    20,
+    min_value=1,
+    max_value=1000,
+)
+HY_MT_TRANSLATION_TOP_P = _env_float(
+    "HY_MT_TRANSLATION_TOP_P",
+    0.6,
+    min_value=0.0,
+    max_value=1.0,
+)
+HY_MT_TRANSLATION_TEMPERATURE = _env_float(
+    "HY_MT_TRANSLATION_TEMPERATURE",
+    0.7,
+    min_value=0.0,
+    max_value=2.0,
+)
+HY_MT_TRANSLATION_REPETITION_PENALTY = _env_float(
+    "HY_MT_TRANSLATION_REPETITION_PENALTY",
+    1.05,
+    min_value=0.1,
+    max_value=5.0,
+)
+HY_MT_TRANSLATION_DEBUG_RESPONSES = _env_flag(
+    "HY_MT_TRANSLATION_DEBUG_RESPONSES",
+    True,
+)
 
 # ---------------------------------------------------------------------------
 # Model storage — redirect all downloads into checkpoints/whisperx/
@@ -142,6 +223,486 @@ os.environ.setdefault("TRANSFORMERS_CACHE", WHISPERX_MODEL_DIR)
 os.environ.setdefault("PYANNOTE_CACHE", WHISPERX_PYANNOTE_CACHE)
 
 print(f"📂 WhisperX model cache directory: {WHISPERX_MODEL_DIR}")
+
+_HY_MT_TOKENIZER: Any = None
+_HY_MT_MODEL: Any = None
+_HY_MT_MODEL_REF: Optional[str] = None
+_HY_MT_LOCK = threading.Lock()
+
+
+def _lightning_api_key_configured() -> bool:
+    return bool(os.getenv("LIGHTNING_API_KEY", "").strip())
+
+
+def _is_hy_mt_translation_model(model_ref: Optional[str]) -> bool:
+    normalized = (model_ref or "").strip().lower()
+    return normalized == HY_MT_TRANSLATION_MODEL.lower() or normalized in HY_MT_TRANSLATION_MODEL_ALIASES
+
+
+def _can_attempt_translation_backend() -> bool:
+    return (
+        (LitaiLLM is not None and _lightning_api_key_configured())
+        or HY_MT_TRANSLATION_FALLBACK_ENABLED
+    )
+
+
+def _hy_mt_torch_dtype() -> Any:
+    if torch is None:
+        return None
+    if HY_MT_TRANSLATION_DTYPE in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if HY_MT_TRANSLATION_DTYPE in {"fp16", "float16", "half"}:
+        return torch.float16
+    if HY_MT_TRANSLATION_DTYPE in {"fp32", "float32"}:
+        return torch.float32
+    return None
+
+
+def _hy_mt_target_device(model: Any) -> Any:
+    device = getattr(model, "device", None)
+    if device is not None:
+        return device
+    try:
+        return next(model.parameters()).device
+    except Exception:
+        return "cpu"
+
+
+def _load_hy_mt_model() -> Tuple[Any, Any]:
+    global _HY_MT_MODEL, _HY_MT_MODEL_REF, _HY_MT_TOKENIZER
+
+    if not HY_MT_TRANSLATION_FALLBACK_ENABLED:
+        raise RuntimeError("HY-MT fallback translation is disabled.")
+    if AutoModelForCausalLM is None or AutoTokenizer is None:
+        raise RuntimeError(
+            "transformers is required for HY-MT fallback translation."
+        )
+    if torch is None:
+        raise RuntimeError("torch is required for HY-MT fallback translation.")
+
+    if (
+        _HY_MT_TOKENIZER is not None
+        and _HY_MT_MODEL is not None
+        and _HY_MT_MODEL_REF == HY_MT_TRANSLATION_MODEL
+    ):
+        return _HY_MT_TOKENIZER, _HY_MT_MODEL
+
+    with _HY_MT_LOCK:
+        if (
+            _HY_MT_TOKENIZER is not None
+            and _HY_MT_MODEL is not None
+            and _HY_MT_MODEL_REF == HY_MT_TRANSLATION_MODEL
+        ):
+            return _HY_MT_TOKENIZER, _HY_MT_MODEL
+
+        print(
+            "Loading HY-MT fallback translation model "
+            f"'{HY_MT_TRANSLATION_MODEL}'..."
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            HY_MT_TRANSLATION_MODEL,
+            local_files_only=HY_MT_TRANSLATION_LOCAL_FILES_ONLY,
+        )
+
+        model_kwargs: Dict[str, Any] = {
+            "local_files_only": HY_MT_TRANSLATION_LOCAL_FILES_ONLY,
+        }
+        dtype = _hy_mt_torch_dtype()
+        if dtype is not None:
+            model_kwargs["torch_dtype"] = dtype
+
+        device = HY_MT_TRANSLATION_DEVICE.strip().lower()
+        if device == "auto":
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    HY_MT_TRANSLATION_MODEL,
+                    device_map="auto",
+                    **model_kwargs,
+                )
+            except Exception as exc:
+                message = str(exc).lower()
+                if "accelerate" not in message and "device_map" not in message:
+                    raise
+                print(
+                    "HY-MT device_map='auto' is unavailable; "
+                    "loading on a single device instead."
+                )
+                model = AutoModelForCausalLM.from_pretrained(
+                    HY_MT_TRANSLATION_MODEL,
+                    **model_kwargs,
+                )
+                fallback_device = (
+                    "cuda"
+                    if hasattr(torch, "cuda") and torch.cuda.is_available()
+                    else "cpu"
+                )
+                model = model.to(fallback_device)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                HY_MT_TRANSLATION_MODEL,
+                **model_kwargs,
+            )
+            model = model.to(HY_MT_TRANSLATION_DEVICE)
+
+        if hasattr(model, "eval"):
+            model.eval()
+
+        _HY_MT_TOKENIZER = tokenizer
+        _HY_MT_MODEL = model
+        _HY_MT_MODEL_REF = HY_MT_TRANSLATION_MODEL
+        return tokenizer, model
+
+
+def _hy_mt_prompt(
+    source_text: str,
+    dest_language: str,
+    *,
+    source_language: Optional[str] = None,
+) -> str:
+    _ = source_language
+    return (
+        f"Translate the following text into {dest_language}. "
+        f"Output only the translated text.\n\n{source_text}"
+    )
+
+
+def _clean_hy_mt_translation(text: str) -> str:
+    cleaned = (text or "").strip()
+    cleaned = cleaned.replace("<|im_end|>", "").replace("<|endoftext|>", "")
+    cleaned = re.sub(
+        r"^(assistant|translation|translated text)\s*[:：]\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return cleaned.strip()
+
+
+def _hy_mt_generation_kwargs() -> Dict[str, Any]:
+    generation_kwargs: Dict[str, Any] = {
+        "max_new_tokens": HY_MT_TRANSLATION_MAX_NEW_TOKENS,
+        "repetition_penalty": HY_MT_TRANSLATION_REPETITION_PENALTY,
+    }
+    if HY_MT_TRANSLATION_TEMPERATURE > 0:
+        generation_kwargs.update({
+            "do_sample": True,
+            "temperature": HY_MT_TRANSLATION_TEMPERATURE,
+            "top_k": HY_MT_TRANSLATION_TOP_K,
+            "top_p": HY_MT_TRANSLATION_TOP_P,
+        })
+    else:
+        generation_kwargs["do_sample"] = False
+    return generation_kwargs
+
+
+def _hy_mt_pad_token_id(tokenizer: Any) -> Optional[int]:
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is not None:
+        return pad_token_id
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None and getattr(tokenizer, "pad_token", None) is None:
+        try:
+            tokenizer.pad_token = getattr(tokenizer, "eos_token", None)
+        except Exception:
+            pass
+    return getattr(tokenizer, "pad_token_id", None) or eos_token_id
+
+
+def _filter_hy_mt_generate_inputs(tokenized: Any) -> Dict[str, Any]:
+    allowed_keys = {"input_ids", "attention_mask"}
+    filtered = {
+        key: value
+        for key, value in dict(tokenized).items()
+        if key in allowed_keys
+    }
+    dropped_keys = sorted(set(dict(tokenized).keys()) - set(filtered.keys()))
+    if dropped_keys and HY_MT_TRANSLATION_DEBUG_RESPONSES:
+        print(f"HY-MT generate input dropped unused key(s): {dropped_keys}")
+    return filtered
+
+
+def _debug_hy_mt_batch_outputs(
+    source_texts: List[str],
+    raw_outputs: List[str],
+    cleaned_outputs: List[str],
+) -> None:
+    if not HY_MT_TRANSLATION_DEBUG_RESPONSES:
+        return
+    print("HY-MT raw batch responses:")
+    for index, (source_text, raw_output, cleaned_output) in enumerate(
+        zip(source_texts, raw_outputs, cleaned_outputs),
+        start=1,
+    ):
+        print(f"  [HY-MT {index}] source: {source_text}")
+        print(f"  [HY-MT {index}] raw: {raw_output}")
+        print(f"  [HY-MT {index}] cleaned: {cleaned_output}")
+
+
+def _hy_mt_prompt_texts(
+    source_texts: List[str],
+    dest_language: str,
+    tokenizer: Any,
+) -> List[str]:
+    prompts = [
+        _hy_mt_prompt(source_text, dest_language)
+        for source_text in source_texts
+    ]
+    if not hasattr(tokenizer, "apply_chat_template"):
+        return prompts
+
+    chat_prompts: List[str] = []
+    try:
+        for prompt in prompts:
+            chat_prompts.append(
+                tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+            )
+    except Exception as exc:
+        print(f"HY-MT chat template failed; using plain prompts: {exc}")
+        return prompts
+    return chat_prompts
+
+
+def _translate_batch_with_hy_mt_model(
+    source_texts: List[str],
+    dest_language: str,
+) -> List[str]:
+    if not source_texts:
+        return []
+
+    tokenizer, model = _load_hy_mt_model()
+    prompts = _hy_mt_prompt_texts(source_texts, dest_language, tokenizer)
+    generation_kwargs = _hy_mt_generation_kwargs()
+    pad_token_id = _hy_mt_pad_token_id(tokenizer)
+    if pad_token_id is not None:
+        generation_kwargs["pad_token_id"] = pad_token_id
+
+    device = _hy_mt_target_device(model)
+    with _HY_MT_LOCK:
+        old_padding_side = getattr(tokenizer, "padding_side", None)
+        if old_padding_side is not None:
+            tokenizer.padding_side = "left"
+        try:
+            tokenized = tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+            )
+        finally:
+            if old_padding_side is not None:
+                tokenizer.padding_side = old_padding_side
+
+    if hasattr(tokenized, "to"):
+        tokenized = tokenized.to(device)
+    else:
+        tokenized = {
+            key: value.to(device) if hasattr(value, "to") else value
+            for key, value in tokenized.items()
+        }
+    input_length = tokenized["input_ids"].shape[-1]
+    generate_inputs = _filter_hy_mt_generate_inputs(tokenized)
+
+    with torch.inference_mode():
+        outputs = model.generate(**generate_inputs, **generation_kwargs)
+
+    raw_outputs: List[str] = []
+    translated: List[str] = []
+    for output in outputs:
+        new_tokens = output[input_length:]
+        output_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        raw_outputs.append(output_text)
+        translated.append(_clean_hy_mt_translation(output_text))
+    _debug_hy_mt_batch_outputs(source_texts, raw_outputs, translated)
+    return translated
+
+
+def _translate_with_hy_mt_model(
+    source_text: str,
+    dest_language: str,
+) -> str:
+    translated = _translate_batch_with_hy_mt_model([source_text], dest_language)
+    return translated[0] if translated else ""
+
+
+def _extract_translation_input_array(prompt: str) -> List[str]:
+    marker = "Input Array:"
+    if marker not in prompt:
+        raise ValueError("Translation prompt does not contain an input array.")
+    payload = prompt.split(marker, 1)[1].strip()
+    source_texts = json.loads(payload)
+    if not isinstance(source_texts, list):
+        raise ValueError("Translation input array payload is not a list.")
+    return [str(item) if item is not None else "" for item in source_texts]
+
+
+def _translate_texts_with_hy_mt(
+    source_texts: List[str],
+    dest_language: str,
+    batch_label: str,
+    *,
+    source_language: Optional[str] = None,
+) -> List[str]:
+    _ = source_language
+    print(
+        f"  [{batch_label}] Using HY-MT fallback translator "
+        f"({HY_MT_TRANSLATION_MODEL}) for batched plain-text translation."
+    )
+
+    translated = [""] * len(source_texts)
+    non_empty_positions: List[int] = []
+    non_empty_texts: List[str] = []
+    for index, source_text in enumerate(source_texts):
+        if (source_text or "").strip():
+            non_empty_positions.append(index)
+            non_empty_texts.append(source_text)
+
+    if not non_empty_texts:
+        return translated
+
+    try:
+        batch_translated = _translate_batch_with_hy_mt_model(
+            non_empty_texts,
+            dest_language,
+        )
+    except Exception as exc:
+        print(f"  [{batch_label}] HY-MT batch failed: {exc}")
+        return translated
+
+    if len(batch_translated) != len(non_empty_texts):
+        print(
+            f"  [{batch_label}] HY-MT batch length mismatch: "
+            f"got {len(batch_translated)}, expected {len(non_empty_texts)}."
+        )
+
+    for index, text in zip(non_empty_positions, batch_translated):
+        translated[index] = text
+    return translated
+
+
+class _HyMtFallbackLLM:
+    def __init__(
+        self,
+        *,
+        dest_language: str,
+        source_language: Optional[str],
+        batch_label: str,
+    ) -> None:
+        self.dest_language = dest_language
+        self.source_language = source_language
+        self.batch_label = batch_label
+
+    def chat(self, prompt: str, max_tokens: Optional[int] = None) -> str:
+        source_texts = _extract_translation_input_array(prompt)
+        translated = _translate_texts_with_hy_mt(
+            source_texts,
+            self.dest_language,
+            self.batch_label,
+            source_language=self.source_language,
+        )
+        return json.dumps(translated, ensure_ascii=False)
+
+
+class _LitaiLLMWithFallback:
+    def __init__(
+        self,
+        primary: Any,
+        *,
+        dest_language: str,
+        source_language: Optional[str],
+        batch_label: str,
+    ) -> None:
+        self.primary = primary
+        self.fallback = _HyMtFallbackLLM(
+            dest_language=dest_language,
+            source_language=source_language,
+            batch_label=batch_label,
+        )
+        self.batch_label = batch_label
+
+    def chat(self, prompt: str, max_tokens: Optional[int] = None) -> str:
+        try:
+            response = self.primary.chat(prompt, max_tokens=max_tokens)
+            if response and str(response).strip():
+                return response
+            print(
+                f"  [{self.batch_label}] LitAI returned an empty response; "
+                "trying HY-MT fallback."
+            )
+        except Exception as exc:
+            print(
+                f"  [{self.batch_label}] LitAI translation failed: {exc}; "
+                "trying HY-MT fallback."
+            )
+        return self.fallback.chat(prompt, max_tokens=max_tokens)
+
+
+def _make_translation_llm(
+    *,
+    llm_model: str,
+    dest_language: str,
+    source_language: Optional[str],
+    batch_label: str,
+) -> Any:
+    if _is_hy_mt_translation_model(llm_model):
+        print(
+            f"  [{batch_label}] HY-MT translation model selected; "
+            "using local HY-MT backend."
+        )
+        return _HyMtFallbackLLM(
+            dest_language=dest_language,
+            source_language=source_language,
+            batch_label=batch_label,
+        )
+
+    if LitaiLLM is None:
+        print(
+            f"  [{batch_label}] litai is unavailable; "
+            "using HY-MT fallback."
+        )
+        return _HyMtFallbackLLM(
+            dest_language=dest_language,
+            source_language=source_language,
+            batch_label=batch_label,
+        )
+
+    if not _lightning_api_key_configured():
+        print(
+            f"  [{batch_label}] LIGHTNING_API_KEY is not set; "
+            "using HY-MT fallback."
+        )
+        return _HyMtFallbackLLM(
+            dest_language=dest_language,
+            source_language=source_language,
+            batch_label=batch_label,
+        )
+
+    try:
+        primary = LitaiLLM(model=llm_model)
+    except Exception as exc:
+        if not HY_MT_TRANSLATION_FALLBACK_ENABLED:
+            raise
+        print(
+            f"  [{batch_label}] LitAI initialization failed: {exc}; "
+            "using HY-MT fallback."
+        )
+        return _HyMtFallbackLLM(
+            dest_language=dest_language,
+            source_language=source_language,
+            batch_label=batch_label,
+        )
+
+    if not HY_MT_TRANSLATION_FALLBACK_ENABLED:
+        return primary
+    return _LitaiLLMWithFallback(
+        primary,
+        dest_language=dest_language,
+        source_language=source_language,
+        batch_label=batch_label,
+    )
+
 
 # Cache directory for WhisperX results
 WHISPERX_CACHE_DIR = os.path.join(
@@ -931,10 +1492,10 @@ def _run_whisperx_pipeline_sync(
         print(f"PASS C [WhisperX]: LLM translation → {dest_language}")
         print("=" * 60)
 
-        if LitaiLLM is None:
+        if not _can_attempt_translation_backend():
             print(
-                "⚠️ litai package not installed — skipping LLM translation. "
-                "Install with: pip install litai"
+                "No translation backend available. "
+                "litai unavailable and HY-MT fallback disabled."
             )
         else:
             total_segments = len(segments)
@@ -974,7 +1535,12 @@ def _run_whisperx_pipeline_sync(
                         f"\n  Translating {batch_label} "
                         f"(Segments {job['start']} to {job['end']})..."
                     )
-                    llm = LitaiLLM(model=llm_model)
+                    llm = _make_translation_llm(
+                        llm_model=llm_model,
+                        dest_language=dest_language,
+                        source_language=source_language,
+                        batch_label=batch_label,
+                    )
                     translated = _translate_texts_adaptively(
                         llm=llm,
                         source_texts=job["source_texts"],
