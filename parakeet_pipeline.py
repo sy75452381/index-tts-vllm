@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import shutil
 import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -37,6 +38,11 @@ try:
     from pydub import AudioSegment
 except Exception:
     AudioSegment = None  # type: ignore[assignment]
+
+try:
+    from omnivad import OmniVAD
+except Exception:
+    OmniVAD = None  # type: ignore[assignment,misc]
 
 try:
     from whisperx_pipeline import (
@@ -74,6 +80,27 @@ def _env_int(
     return value
 
 
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    min_value: float = 0.0,
+    max_value: Optional[float] = None,
+) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        value = default
+    else:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = default
+    value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
 PARAKEET_ASR_MODEL = (
     os.getenv("PARAKEET_ASR_MODEL", "nvidia/parakeet-tdt-0.6b-v3").strip()
     or "nvidia/parakeet-tdt-0.6b-v3"
@@ -83,8 +110,54 @@ PARAKEET_ASR_CACHE_DIR = os.getenv(
     "PARAKEET_ASR_CACHE_DIR",
     os.path.join(_SCRIPT_DIR, "parakeet_cache"),
 )
-PARAKEET_ASR_CACHE_VERSION = 1
+PARAKEET_ASR_CACHE_VERSION = 2
 PARAKEET_ASR_BATCH_SIZE = _env_int("PARAKEET_ASR_BATCH_SIZE", 1)
+PARAKEET_ASR_USE_OMNIVAD = os.getenv(
+    "PARAKEET_ASR_USE_OMNIVAD",
+    "1",
+).strip().lower() not in {"0", "false", "no", "off"}
+PARAKEET_ASR_REQUIRE_OMNIVAD_FOR_LONG_AUDIO = os.getenv(
+    "PARAKEET_ASR_REQUIRE_OMNIVAD_FOR_LONG_AUDIO",
+    "1",
+).strip().lower() not in {"0", "false", "no", "off"}
+PARAKEET_ASR_MAX_CLIP_SECONDS = _env_float(
+    "PARAKEET_ASR_MAX_CLIP_SECONDS",
+    300.0,
+    min_value=30.0,
+)
+PARAKEET_ASR_MIN_SPLIT_SILENCE_SECONDS = _env_float(
+    "PARAKEET_ASR_MIN_SPLIT_SILENCE_SECONDS",
+    0.05,
+    min_value=0.0,
+)
+PARAKEET_ASR_OMNIVAD_CHUNK_SECONDS = _env_float(
+    "PARAKEET_ASR_OMNIVAD_CHUNK_SECONDS",
+    600.0,
+    min_value=30.0,
+)
+PARAKEET_ASR_OMNIVAD_OVERLAP_SECONDS = _env_float(
+    "PARAKEET_ASR_OMNIVAD_OVERLAP_SECONDS",
+    2.0,
+    min_value=0.0,
+)
+PARAKEET_ASR_OMNIVAD_MERGE_GAP_SECONDS = _env_float(
+    "PARAKEET_ASR_OMNIVAD_MERGE_GAP_SECONDS",
+    0.001,
+    min_value=0.0,
+)
+PARAKEET_ASR_OMNIVAD_MODEL_PATH = os.getenv(
+    "PARAKEET_ASR_OMNIVAD_MODEL_PATH",
+    os.getenv(
+        "QWEN_OMNIVAD_OMNIVAD_MODEL_PATH",
+        os.path.join(
+            _SCRIPT_DIR,
+            "checkpoints",
+            "qwen_omnivad",
+            "omnivad",
+            "vad.omnivad",
+        ),
+    ),
+).strip()
 PARAKEET_ASR_USE_LOCAL_ATTENTION = os.getenv(
     "PARAKEET_ASR_USE_LOCAL_ATTENTION",
     "0",
@@ -144,8 +217,18 @@ class TimelineItem:
     speaker: str = "speaker1"
 
 
+@dataclass
+class AudioChunk:
+    start: float
+    end: float
+    split_reason: str = "full"
+    silence_start: Optional[float] = None
+    silence_end: Optional[float] = None
+
+
 _PARAKEET_MODEL: Any = None
 _PARAKEET_MODEL_DEVICE: Optional[str] = None
+_OMNIVAD_MODEL_LOAD_PATH: Optional[str] = None
 
 
 def is_parakeet_available() -> bool:
@@ -252,6 +335,269 @@ def _write_temp_wav(audio_bytes: bytes, input_mime_type: Optional[str]) -> Tuple
             os.remove(input_path)
         except OSError:
             pass
+
+
+def _resolve_omnivad_model_path() -> Optional[str]:
+    if not PARAKEET_ASR_OMNIVAD_MODEL_PATH:
+        return None
+
+    target_path = os.path.abspath(os.path.expanduser(PARAKEET_ASR_OMNIVAD_MODEL_PATH))
+    if os.path.isfile(target_path):
+        return target_path
+
+    try:
+        from omnivad.vad import default_model_dir
+
+        source_path = os.path.join(default_model_dir(), "vad.omnivad")
+        if os.path.isfile(source_path):
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            shutil.copyfile(source_path, target_path)
+            print(f"Copied OmniVAD model to {target_path}")
+            return target_path
+    except Exception as exc:
+        print(f"Warning: could not stage OmniVAD model for Parakeet: {exc}")
+
+    return None
+
+
+def _merge_nearby_speech_spans(
+    spans: Sequence[Tuple[float, float]],
+    *,
+    max_gap_seconds: float,
+) -> List[Tuple[float, float]]:
+    cleaned = sorted(
+        (max(0.0, float(start)), max(0.0, float(end)))
+        for start, end in spans
+        if float(end) > float(start)
+    )
+    if not cleaned or max_gap_seconds <= 0:
+        return cleaned
+
+    merged: List[Tuple[float, float]] = [cleaned[0]]
+    for start, end in cleaned[1:]:
+        prev_start, prev_end = merged[-1]
+        if start - prev_end <= max_gap_seconds:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _detect_omnivad_speech_spans(
+    audio_path: str,
+    *,
+    duration_seconds: float,
+) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    """Run OmniVAD and return merged and raw speech intervals in seconds."""
+    global _OMNIVAD_MODEL_LOAD_PATH
+
+    if not PARAKEET_ASR_USE_OMNIVAD or OmniVAD is None:
+        return [], []
+
+    try:
+        _OMNIVAD_MODEL_LOAD_PATH = _resolve_omnivad_model_path()
+        vad = OmniVAD(model_path=_OMNIVAD_MODEL_LOAD_PATH) if _OMNIVAD_MODEL_LOAD_PATH else OmniVAD()
+        result = vad.detect(
+            audio_path,
+            chunk_seconds=PARAKEET_ASR_OMNIVAD_CHUNK_SECONDS,
+            overlap_seconds=PARAKEET_ASR_OMNIVAD_OVERLAP_SECONDS,
+        )
+    except Exception as exc:
+        print(f"Warning: OmniVAD detection for Parakeet failed: {exc}")
+        return [], []
+
+    timestamps = result.get("timestamps") if isinstance(result, dict) else None
+    if not timestamps:
+        return [], []
+
+    clipped: List[Tuple[float, float]] = []
+    for start, end in timestamps:
+        try:
+            start_f = float(start)
+            end_f = float(end)
+        except (TypeError, ValueError):
+            continue
+        if duration_seconds > 0:
+            start_f = max(0.0, min(start_f, duration_seconds))
+            end_f = max(0.0, min(end_f, duration_seconds))
+        if end_f > start_f:
+            clipped.append((start_f, end_f))
+
+    if not clipped:
+        return [], []
+
+    raw_spans = sorted(clipped, key=lambda span: span[0])
+    merged = _merge_nearby_speech_spans(
+        raw_spans,
+        max_gap_seconds=PARAKEET_ASR_OMNIVAD_MERGE_GAP_SECONDS,
+    )
+    preserved_gaps = sum(
+        1
+        for idx in range(1, len(merged))
+        if merged[idx][0] > merged[idx - 1][1] + 0.05
+    )
+    print(
+        f"OmniVAD [Parakeet] -> {len(raw_spans)} speech span(s) after clipping -> "
+        f"{len(merged)} merged span(s); {preserved_gaps} silence gap(s) kept."
+    )
+    return merged, raw_spans
+
+
+def _silence_gaps_from_speech_spans(
+    speech_spans: Sequence[Tuple[float, float]],
+    *,
+    duration_seconds: float,
+) -> List[Tuple[float, float]]:
+    duration = max(0.0, float(duration_seconds or 0.0))
+    if duration <= 0:
+        return []
+
+    clipped = _merge_nearby_speech_spans(
+        [
+            (
+                max(0.0, min(float(start), duration)),
+                max(0.0, min(float(end), duration)),
+            )
+            for start, end in speech_spans
+            if float(end) > float(start)
+        ],
+        max_gap_seconds=PARAKEET_ASR_OMNIVAD_MERGE_GAP_SECONDS,
+    )
+    gaps: List[Tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in clipped:
+        if start > cursor:
+            gaps.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < duration:
+        gaps.append((cursor, duration))
+    return gaps
+
+
+def _build_silence_aligned_chunks(
+    duration_seconds: float,
+    speech_spans: Sequence[Tuple[float, float]],
+    *,
+    max_clip_seconds: float = PARAKEET_ASR_MAX_CLIP_SECONDS,
+    min_silence_seconds: float = PARAKEET_ASR_MIN_SPLIT_SILENCE_SECONDS,
+) -> List[AudioChunk]:
+    duration = max(0.0, float(duration_seconds or 0.0))
+    max_clip = max(1.0, float(max_clip_seconds or PARAKEET_ASR_MAX_CLIP_SECONDS))
+    if duration <= 0:
+        return []
+    if duration <= max_clip + 0.001:
+        return [AudioChunk(start=0.0, end=duration, split_reason="full")]
+
+    gaps = _silence_gaps_from_speech_spans(
+        speech_spans,
+        duration_seconds=duration,
+    )
+    eps = 0.001
+    chunks: List[AudioChunk] = []
+
+    def add_forced_chunks(start: float, end: float) -> None:
+        length = end - start
+        if length <= eps:
+            return
+        count = max(1, int(math.ceil(length / max_clip)))
+        cursor = start
+        for idx in range(count):
+            next_end = end if idx == count - 1 else start + (length * (idx + 1) / count)
+            if next_end > cursor + eps:
+                chunks.append(
+                    AudioChunk(
+                        start=cursor,
+                        end=next_end,
+                        split_reason="forced",
+                    )
+                )
+            cursor = next_end
+
+    def split_range(start: float, end: float) -> None:
+        if end - start <= max_clip + eps:
+            chunks.append(AudioChunk(start=start, end=end, split_reason="silence"))
+            return
+
+        candidates: List[Tuple[float, float, float, float, float]] = []
+        center = (start + end) / 2.0
+        for gap_start, gap_end in gaps:
+            usable_start = max(start, gap_start)
+            usable_end = min(end, gap_end)
+            silence_len = usable_end - usable_start
+            if silence_len < min_silence_seconds:
+                continue
+            if gap_start <= start + eps or gap_end >= end - eps:
+                continue
+            split_point = (usable_start + usable_end) / 2.0
+            if split_point <= start + eps or split_point >= end - eps:
+                continue
+            candidates.append(
+                (
+                    silence_len,
+                    -abs(split_point - center),
+                    split_point,
+                    usable_start,
+                    usable_end,
+                )
+            )
+
+        if not candidates:
+            add_forced_chunks(start, end)
+            return
+
+        _silence_len, _center_score, split_point, silence_start, silence_end = max(candidates)
+        split_range(start, split_point)
+        split_range(split_point, end)
+        for chunk in chunks:
+            if (
+                chunk.silence_start is None
+                and abs(chunk.end - split_point) <= 0.002
+            ):
+                chunk.split_reason = "silence"
+                chunk.silence_start = silence_start
+                chunk.silence_end = silence_end
+                break
+
+    split_range(0.0, duration)
+    normalized = [
+        AudioChunk(
+            start=max(0.0, min(chunk.start, duration)),
+            end=max(0.0, min(chunk.end, duration)),
+            split_reason=chunk.split_reason,
+            silence_start=chunk.silence_start,
+            silence_end=chunk.silence_end,
+        )
+        for chunk in sorted(chunks, key=lambda item: item.start)
+        if chunk.end > chunk.start + eps
+    ]
+    return normalized or [AudioChunk(start=0.0, end=duration, split_reason="forced")]
+
+
+def _export_audio_chunks(
+    wav_path: str,
+    chunks: Sequence[AudioChunk],
+) -> List[Tuple[AudioChunk, str]]:
+    if AudioSegment is None:
+        raise RuntimeError("pydub is required for Parakeet chunking; install pydub and ffmpeg.")
+
+    full = AudioSegment.from_file(wav_path)
+    duration_ms = max(1, len(full))
+    jobs: List[Tuple[AudioChunk, str]] = []
+    for chunk in chunks:
+        start_ms = max(0, min(int(round(chunk.start * 1000.0)), duration_ms - 1))
+        end_ms = max(start_ms + 1, min(int(round(chunk.end * 1000.0)), duration_ms))
+        fd, clip_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        full[start_ms:end_ms].export(clip_path, format="wav")
+        actual_chunk = AudioChunk(
+            start=start_ms / 1000.0,
+            end=end_ms / 1000.0,
+            split_reason=chunk.split_reason,
+            silence_start=chunk.silence_start,
+            silence_end=chunk.silence_end,
+        )
+        jobs.append((actual_chunk, clip_path))
+    return jobs
 
 
 def _format_timestamp(seconds: float) -> str:
@@ -475,10 +821,43 @@ def _extract_timestamp_payload(result: Any) -> Any:
     return getattr(result, "timestamp", None) or getattr(result, "timestamps", None)
 
 
+def _offset_timeline_items(
+    items: Sequence[TimelineItem],
+    *,
+    start_offset: float,
+    end_limit: Optional[float],
+) -> List[TimelineItem]:
+    offset = max(0.0, float(start_offset or 0.0))
+    limit = float(end_limit) if end_limit is not None else None
+    adjusted: List[TimelineItem] = []
+    for item in items:
+        start = offset + max(0.0, float(item.start or 0.0))
+        end = offset + max(0.0, float(item.end or 0.0))
+        if limit is not None:
+            start = min(max(offset, start), limit)
+            end = min(max(offset, end), limit)
+        if end <= start:
+            end = start + 0.05
+            if limit is not None:
+                end = min(end, limit)
+        if end > start:
+            adjusted.append(
+                TimelineItem(
+                    start=start,
+                    end=end,
+                    text=item.text,
+                    speaker=item.speaker,
+                )
+            )
+    return adjusted
+
+
 def _transcription_to_timeline(
     result: Any,
     *,
     duration_seconds: float,
+    start_offset: float = 0.0,
+    end_limit: Optional[float] = None,
 ) -> Tuple[List[TimelineItem], str, Optional[str], str]:
     text = _extract_text(result)
     language = _extract_language(result)
@@ -510,6 +889,12 @@ def _transcription_to_timeline(
     if not items:
         items = _proportional_timeline(text, 0.0, max(duration_seconds, 0.1))
         timestamp_source = "proportional"
+    if start_offset or end_limit is not None:
+        items = _offset_timeline_items(
+            items,
+            start_offset=start_offset,
+            end_limit=end_limit,
+        )
     return items, text, language, timestamp_source
 
 
@@ -568,6 +953,14 @@ def _cache_key(
             f"model={PARAKEET_ASR_MODEL}",
             f"device={PARAKEET_ASR_DEVICE}",
             f"batch={PARAKEET_ASR_BATCH_SIZE}",
+            f"omnivad={PARAKEET_ASR_USE_OMNIVAD}",
+            f"omnivad_required={PARAKEET_ASR_REQUIRE_OMNIVAD_FOR_LONG_AUDIO}",
+            f"omnivad_model={PARAKEET_ASR_OMNIVAD_MODEL_PATH or 'default'}",
+            f"max_clip={PARAKEET_ASR_MAX_CLIP_SECONDS:.3f}",
+            f"min_split_silence={PARAKEET_ASR_MIN_SPLIT_SILENCE_SECONDS:.3f}",
+            f"vad_chunk={PARAKEET_ASR_OMNIVAD_CHUNK_SECONDS:.3f}",
+            f"vad_overlap={PARAKEET_ASR_OMNIVAD_OVERLAP_SECONDS:.3f}",
+            f"vad_merge_gap={PARAKEET_ASR_OMNIVAD_MERGE_GAP_SECONDS:.4f}",
             f"local_attn={PARAKEET_ASR_USE_LOCAL_ATTENTION}",
             f"att_ctx={PARAKEET_ASR_ATT_CONTEXT_SIZE}",
             f"llm={translation_llm_model or 'default'}",
@@ -618,6 +1011,152 @@ def _transcribe_with_timestamps(model: Any, wav_path: str) -> Any:
     if not results:
         raise RuntimeError("Parakeet returned no transcription results.")
     return results[0]
+
+
+def _transcribe_paths_with_timestamps(model: Any, wav_paths: Sequence[str]) -> List[Any]:
+    paths = [path for path in wav_paths if path]
+    if not paths:
+        return []
+
+    kwargs = {
+        "timestamps": True,
+        "batch_size": PARAKEET_ASR_BATCH_SIZE,
+    }
+    try:
+        results = model.transcribe(paths, **kwargs)
+    except TypeError:
+        kwargs.pop("batch_size", None)
+        results = model.transcribe(paths, **kwargs)
+    if isinstance(results, tuple) and results:
+        results = results[0]
+    if results is None:
+        return []
+    if len(paths) == 1 and not isinstance(results, (list, tuple)):
+        return [results]
+    return list(results)
+
+
+def _combined_timestamp_source(sources: Sequence[str], *, chunked: bool) -> str:
+    clean = [source for source in sources if source]
+    if not clean:
+        return "none"
+    if len(set(clean)) == 1:
+        source = clean[0]
+    elif any(source != "proportional" for source in clean):
+        source = "parakeet_mixed"
+    else:
+        source = "proportional"
+    return f"{source}_chunked" if chunked else source
+
+
+def _transcribe_chunks_with_timestamps(
+    model: Any,
+    wav_path: str,
+    chunks: Sequence[AudioChunk],
+) -> Tuple[List[TimelineItem], str, Optional[str], str, List[Dict[str, Any]]]:
+    if not chunks:
+        raise RuntimeError("Parakeet chunk planner returned no audio chunks.")
+
+    chunked = len(chunks) > 1
+    if not chunked:
+        result = _transcribe_with_timestamps(model, wav_path)
+        duration = max(0.1, chunks[0].end - chunks[0].start)
+        items, text, language, timestamp_source = _transcription_to_timeline(
+            result,
+            duration_seconds=duration,
+        )
+        return (
+            items,
+            text,
+            language,
+            timestamp_source,
+            [
+                {
+                    "index": 1,
+                    "start": chunks[0].start,
+                    "end": chunks[0].end,
+                    "duration": duration,
+                    "split_reason": chunks[0].split_reason,
+                }
+            ],
+        )
+
+    print(
+        f"Running NVIDIA Parakeet ASR on {len(chunks)} silence-aligned chunk(s) "
+        f"(target max {PARAKEET_ASR_MAX_CLIP_SECONDS:.1f}s, batch_size={PARAKEET_ASR_BATCH_SIZE})..."
+    )
+    jobs = _export_audio_chunks(wav_path, chunks)
+    results_by_index: List[Tuple[int, List[TimelineItem], str, Optional[str], str]] = []
+    chunk_records: List[Dict[str, Any]] = []
+    try:
+        batch_size = max(1, PARAKEET_ASR_BATCH_SIZE)
+        for start_idx in range(0, len(jobs), batch_size):
+            batch_jobs = jobs[start_idx : start_idx + batch_size]
+            batch_paths = [path for _chunk, path in batch_jobs]
+            batch_results = _transcribe_paths_with_timestamps(model, batch_paths)
+            if len(batch_results) != len(batch_jobs):
+                raise RuntimeError(
+                    "Parakeet returned an unexpected number of chunk transcription results "
+                    f"({len(batch_results)} for {len(batch_jobs)} inputs)."
+                )
+
+            for offset, ((chunk, _path), result) in enumerate(zip(batch_jobs, batch_results)):
+                index = start_idx + offset + 1
+                chunk_duration = max(0.1, chunk.end - chunk.start)
+                items, text, language, source = _transcription_to_timeline(
+                    result,
+                    duration_seconds=chunk_duration,
+                    start_offset=chunk.start,
+                    end_limit=chunk.end,
+                )
+                preview = text.replace("\n", " ").strip()
+                if len(preview) > 80:
+                    preview = preview[:77] + "..."
+                print(
+                    f"  Chunk {index}/{len(jobs)}: "
+                    f"[{chunk.start:.2f}s -> {chunk.end:.2f}s] {preview}"
+                )
+                results_by_index.append((index, items, text, language, source))
+                chunk_records.append(
+                    {
+                        "index": index,
+                        "start": chunk.start,
+                        "end": chunk.end,
+                        "duration": chunk_duration,
+                        "split_reason": chunk.split_reason,
+                        "silence_start": chunk.silence_start,
+                        "silence_end": chunk.silence_end,
+                        "timestamp_source": source,
+                    }
+                )
+    finally:
+        for _chunk, path in jobs:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    results_by_index.sort(key=lambda row: row[0])
+    chunk_records.sort(key=lambda row: int(row["index"]))
+    all_items: List[TimelineItem] = []
+    fragments: List[str] = []
+    detected_language: Optional[str] = None
+    timestamp_sources: List[str] = []
+    for _index, items, text, language, source in results_by_index:
+        if items:
+            all_items.extend(items)
+        if text.strip():
+            fragments.append(text.strip())
+        if language:
+            detected_language = language
+        timestamp_sources.append(source)
+    return (
+        all_items,
+        " ".join(fragments).strip(),
+        detected_language,
+        _combined_timestamp_source(timestamp_sources, chunked=True),
+        chunk_records,
+    )
 
 
 def _translate_segments(
@@ -801,6 +1340,10 @@ def translate_audio(
         "supported_languages": list(PARAKEET_SUPPORTED_LANGUAGES),
         "translation_batch_size": translation_batch_size,
         "translation_max_workers": translation_max_workers,
+        "omnivad_enabled": bool(PARAKEET_ASR_USE_OMNIVAD),
+        "omnivad_available": bool(OmniVAD is not None),
+        "omnivad_required_for_long_audio": bool(PARAKEET_ASR_REQUIRE_OMNIVAD_FOR_LONG_AUDIO),
+        "max_clip_seconds": PARAKEET_ASR_MAX_CLIP_SECONDS,
     }
 
     if not force_refresh:
@@ -819,11 +1362,54 @@ def translate_audio(
     wav_path, duration = _write_temp_wav(audio_bytes, input_mime_type)
     try:
         print("Running NVIDIA Parakeet ASR transcription...")
+        speech_spans: List[Tuple[float, float]] = []
+        raw_vad_spans: List[Tuple[float, float]] = []
+        silence_gaps: List[Tuple[float, float]] = []
+        vad_attempted = False
+        if duration > PARAKEET_ASR_MAX_CLIP_SECONDS + 0.001 and PARAKEET_ASR_USE_OMNIVAD:
+            if OmniVAD is None:
+                if PARAKEET_ASR_REQUIRE_OMNIVAD_FOR_LONG_AUDIO:
+                    raise RuntimeError(
+                        "OmniVAD is required to split long audio for the Parakeet pipeline, "
+                        "but the omnivad package is not importable. Install omnivad or set "
+                        "PARAKEET_ASR_REQUIRE_OMNIVAD_FOR_LONG_AUDIO=0 to use fixed-size chunks."
+                    )
+                print(
+                    "Warning: OmniVAD is unavailable; Parakeet will split long audio "
+                    "into fixed-size chunks."
+                )
+            else:
+                vad_attempted = True
+                print("OmniVAD [Parakeet]: detecting speech spans for silence-based chunking...")
+                speech_spans, raw_vad_spans = _detect_omnivad_speech_spans(
+                    wav_path,
+                    duration_seconds=duration,
+                )
+                if not speech_spans and PARAKEET_ASR_REQUIRE_OMNIVAD_FOR_LONG_AUDIO:
+                    raise RuntimeError(
+                        "OmniVAD did not return usable speech timestamps for this long audio, "
+                        "so Parakeet cannot build silence-aligned chunks safely. Check the "
+                        "OmniVAD model path/logs, or set "
+                        "PARAKEET_ASR_REQUIRE_OMNIVAD_FOR_LONG_AUDIO=0 to use fixed-size chunks."
+                    )
+                silence_gaps = _silence_gaps_from_speech_spans(
+                    speech_spans,
+                    duration_seconds=duration,
+                )
+
+        chunks = _build_silence_aligned_chunks(
+            duration,
+            speech_spans,
+            max_clip_seconds=PARAKEET_ASR_MAX_CLIP_SECONDS,
+            min_silence_seconds=PARAKEET_ASR_MIN_SPLIT_SILENCE_SECONDS,
+        )
         model = _load_parakeet_model()
-        result = _transcribe_with_timestamps(model, wav_path)
-        items, text, detected_language, timestamp_source = _transcription_to_timeline(
-            result,
-            duration_seconds=duration,
+        items, text, detected_language, timestamp_source, chunk_records = (
+            _transcribe_chunks_with_timestamps(
+                model,
+                wav_path,
+                chunks,
+            )
         )
         if not text:
             raise RuntimeError("Parakeet returned an empty transcription.")
@@ -835,6 +1421,12 @@ def translate_audio(
         cache_info["source_language"] = detected_language or "auto"
         cache_info["timestamp_source"] = timestamp_source
         cache_info["duration_seconds"] = duration
+        cache_info["omnivad_attempted"] = vad_attempted
+        cache_info["omnivad_model_path"] = _OMNIVAD_MODEL_LOAD_PATH
+        cache_info["raw_vad_span_count"] = len(raw_vad_spans)
+        cache_info["merged_vad_span_count"] = len(speech_spans)
+        cache_info["silence_gap_count"] = len(silence_gaps)
+        cache_info["parakeet_chunk_count"] = len(chunk_records)
 
         if enable_translation and dest_language:
             _translate_segments(
@@ -857,6 +1449,11 @@ def translate_audio(
             "source_language": detected_language or "auto",
             "timestamp_source": timestamp_source,
             "duration_seconds": duration,
+            "omnivad_model_path": _OMNIVAD_MODEL_LOAD_PATH,
+            "raw_vad_spans": raw_vad_spans,
+            "merged_vad_spans": speech_spans,
+            "silence_gaps": silence_gaps,
+            "asr_chunks": chunk_records,
             "text": text,
             "speakers": speaker_profiles,
             "segments": segments,
@@ -872,6 +1469,11 @@ def translate_audio(
             "translation_batch_size": translation_batch_size if enable_translation else None,
             "translation_max_workers": translation_max_workers if enable_translation else None,
             "timestamp_source": timestamp_source,
+            "duration_seconds": duration,
+            "raw_vad_spans": raw_vad_spans,
+            "merged_vad_spans": speech_spans,
+            "silence_gaps": silence_gaps,
+            "asr_chunks": chunk_records,
         }
         cache_path = _write_cache(cache_key, cache_record)
         if cache_path:
