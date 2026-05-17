@@ -19,6 +19,7 @@ import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,9 +30,10 @@ except ImportError:
     torch = None  # type: ignore[assignment]
 
 try:
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import hf_hub_download, snapshot_download
 except ImportError:
     snapshot_download = None  # type: ignore[assignment]
+    hf_hub_download = None  # type: ignore[assignment]
 
 try:
     from pydub import AudioSegment
@@ -71,6 +73,24 @@ QWEN_OMNIVAD_MODEL_DIR = os.getenv(
 QWEN_OMNIVAD_HF_CACHE_DIR = os.path.join(QWEN_OMNIVAD_MODEL_DIR, ".cache", "huggingface")
 QWEN_OMNIVAD_PYANNOTE_CACHE = os.path.join(QWEN_OMNIVAD_MODEL_DIR, "pyannote")
 QWEN_OMNIVAD_HF_TOKEN = os.getenv("QWEN_OMNIVAD_HF_TOKEN", os.getenv("WHISPERX_HF_TOKEN", os.getenv("HF_TOKEN", "")))
+QWEN_OMNIVAD_DIARIZATION_BACKENDS = {"auto", "pyannote", "diarizen"}
+QWEN_OMNIVAD_DIARIZATION_BACKEND = os.getenv("QWEN_OMNIVAD_DIARIZATION_BACKEND", "auto").strip().lower()
+if QWEN_OMNIVAD_DIARIZATION_BACKEND not in QWEN_OMNIVAD_DIARIZATION_BACKENDS:
+    QWEN_OMNIVAD_DIARIZATION_BACKEND = "auto"
+QWEN_OMNIVAD_DIARIZEN_MODEL = os.getenv(
+    "QWEN_OMNIVAD_DIARIZEN_MODEL",
+    "BUT-FIT/diarizen-wavlm-large-s80-md-v2",
+).strip()
+QWEN_OMNIVAD_DIARIZEN_EMBEDDING_MODEL = os.getenv(
+    "QWEN_OMNIVAD_DIARIZEN_EMBEDDING_MODEL",
+    "pyannote/wespeaker-voxceleb-resnet34-LM",
+).strip()
+QWEN_OMNIVAD_DIARIZEN_CACHE = os.path.join(QWEN_OMNIVAD_MODEL_DIR, "diarizen")
+QWEN_OMNIVAD_DIARIZEN_LOCAL_DIR = os.getenv("QWEN_OMNIVAD_DIARIZEN_LOCAL_DIR", "").strip()
+QWEN_OMNIVAD_DIARIZEN_EMBEDDING_LOCAL_PATH = os.getenv(
+    "QWEN_OMNIVAD_DIARIZEN_EMBEDDING_LOCAL_PATH",
+    "",
+).strip()
 
 QWEN_ASR_LOCAL_DIR = os.getenv("QWEN_ASR_LOCAL_DIR", "").strip()
 QWEN_ASR_FORCED_ALIGNER_LOCAL_DIR = os.getenv("QWEN_ASR_FORCED_ALIGNER_LOCAL_DIR", "").strip()
@@ -190,6 +210,9 @@ _ASR_MODEL: Any = None
 _ASR_MODEL_LOAD_PATH: Optional[str] = None
 _FORCED_ALIGNER_LOAD_PATH: Optional[str] = None
 _OMNIVAD_MODEL_LOAD_PATH: Optional[str] = None
+_DIARIZEN_PIPELINE: Any = None
+_DIARIZEN_MODEL_LOAD_PATH: Optional[str] = None
+_DIARIZEN_EMBEDDING_LOAD_PATH: Optional[str] = None
 
 
 def _safe_model_dir_name(model_ref: str) -> str:
@@ -249,6 +272,110 @@ def _resolve_hf_model_path(
         force_download=QWEN_OMNIVAD_MODEL_FORCE_DOWNLOAD,
         local_files_only=QWEN_OMNIVAD_MODEL_LOCAL_FILES_ONLY,
     )
+
+
+def _normalize_diarization_backend(backend: Any = None) -> str:
+    value = str(backend or QWEN_OMNIVAD_DIARIZATION_BACKEND or "auto").strip().lower()
+    value = value.replace("-", "_")
+    aliases = {
+        "diarizen_large_v2": "diarizen",
+        "large_v2": "diarizen",
+        "largev2": "diarizen",
+        "diarizen_v2": "diarizen",
+        "diarizen-large-v2": "diarizen",
+        "pyannote_audio": "pyannote",
+    }
+    return aliases.get(value, value if value in QWEN_OMNIVAD_DIARIZATION_BACKENDS else "auto")
+
+
+def _effective_diarization_backend(backend: Any = None) -> str:
+    requested = _normalize_diarization_backend(backend)
+    if requested == "diarizen":
+        return "diarizen"
+    if requested in {"auto", "pyannote"}:
+        if QWEN_OMNIVAD_HF_TOKEN and DiarizationPipeline is not None:
+            return "pyannote"
+        return "diarizen"
+    return "diarizen"
+
+
+def _resolve_diarizen_model_path() -> str:
+    if QWEN_OMNIVAD_DIARIZEN_LOCAL_DIR:
+        return os.path.abspath(os.path.expanduser(QWEN_OMNIVAD_DIARIZEN_LOCAL_DIR))
+    if not QWEN_OMNIVAD_DIARIZEN_MODEL:
+        raise RuntimeError("QWEN_OMNIVAD_DIARIZEN_MODEL is empty.")
+    if snapshot_download is None:
+        raise RuntimeError(
+            "huggingface_hub is required to download the DiariZen diarization model."
+        )
+
+    os.makedirs(QWEN_OMNIVAD_DIARIZEN_CACHE, exist_ok=True)
+    os.makedirs(QWEN_OMNIVAD_HF_CACHE_DIR, exist_ok=True)
+    local_dir = os.path.join(
+        QWEN_OMNIVAD_DIARIZEN_CACHE,
+        _safe_model_dir_name(QWEN_OMNIVAD_DIARIZEN_MODEL),
+    )
+    print(
+        f"Downloading/loading DiariZen model '{QWEN_OMNIVAD_DIARIZEN_MODEL}' "
+        f"in {local_dir}"
+    )
+    return snapshot_download(
+        repo_id=QWEN_OMNIVAD_DIARIZEN_MODEL,
+        local_dir=local_dir,
+        cache_dir=QWEN_OMNIVAD_HF_CACHE_DIR,
+        force_download=QWEN_OMNIVAD_MODEL_FORCE_DOWNLOAD,
+        local_files_only=QWEN_OMNIVAD_MODEL_LOCAL_FILES_ONLY,
+    )
+
+
+def _resolve_diarizen_embedding_path() -> str:
+    if QWEN_OMNIVAD_DIARIZEN_EMBEDDING_LOCAL_PATH:
+        return os.path.abspath(
+            os.path.expanduser(QWEN_OMNIVAD_DIARIZEN_EMBEDDING_LOCAL_PATH)
+        )
+    if not QWEN_OMNIVAD_DIARIZEN_EMBEDDING_MODEL:
+        raise RuntimeError("QWEN_OMNIVAD_DIARIZEN_EMBEDDING_MODEL is empty.")
+    if hf_hub_download is None:
+        raise RuntimeError(
+            "huggingface_hub is required to download the DiariZen embedding model."
+        )
+
+    os.makedirs(QWEN_OMNIVAD_DIARIZEN_CACHE, exist_ok=True)
+    os.makedirs(QWEN_OMNIVAD_HF_CACHE_DIR, exist_ok=True)
+    local_dir = os.path.join(
+        QWEN_OMNIVAD_DIARIZEN_CACHE,
+        _safe_model_dir_name(QWEN_OMNIVAD_DIARIZEN_EMBEDDING_MODEL),
+    )
+    return hf_hub_download(
+        repo_id=QWEN_OMNIVAD_DIARIZEN_EMBEDDING_MODEL,
+        filename="pytorch_model.bin",
+        local_dir=local_dir,
+        cache_dir=QWEN_OMNIVAD_HF_CACHE_DIR,
+        force_download=QWEN_OMNIVAD_MODEL_FORCE_DOWNLOAD,
+        local_files_only=QWEN_OMNIVAD_MODEL_LOCAL_FILES_ONLY,
+    )
+
+
+def _load_diarizen_pipeline() -> Any:
+    global _DIARIZEN_PIPELINE, _DIARIZEN_MODEL_LOAD_PATH, _DIARIZEN_EMBEDDING_LOAD_PATH
+    if _DIARIZEN_PIPELINE is not None:
+        return _DIARIZEN_PIPELINE
+
+    try:
+        from diarizen.pipelines.inference import DiariZenPipeline
+    except ImportError as exc:
+        raise RuntimeError(
+            "DiariZen diarization is not installed. Install DiariZen and its "
+            "pyannote-audio dependency to use Qwen OmniVAD DiariZen fallback."
+        ) from exc
+
+    _DIARIZEN_MODEL_LOAD_PATH = _resolve_diarizen_model_path()
+    _DIARIZEN_EMBEDDING_LOAD_PATH = _resolve_diarizen_embedding_path()
+    _DIARIZEN_PIPELINE = DiariZenPipeline(
+        diarizen_hub=Path(_DIARIZEN_MODEL_LOAD_PATH),
+        embedding_model=_DIARIZEN_EMBEDDING_LOAD_PATH,
+    )
+    return _DIARIZEN_PIPELINE
 
 
 def _resolve_omnivad_model_path() -> Optional[str]:
@@ -439,9 +566,14 @@ def _cache_key(
     translation_llm_model: Optional[str],
     input_mime_type: Optional[str],
     enable_diarization: bool,
+    diarization_backend: Any,
     diarization_min_seconds: float,
     enable_forced_aligner: bool,
 ) -> str:
+    normalized_diarization_backend = _normalize_diarization_backend(diarization_backend)
+    effective_diarization_backend = _effective_diarization_backend(
+        normalized_diarization_backend
+    )
     raw = "|".join(
         [
             f"v{QWEN_OMNIVAD_CACHE_VERSION}",
@@ -455,6 +587,9 @@ def _cache_key(
             f"forced_aligner_enabled={enable_forced_aligner}",
             f"aligner={QWEN_ASR_FORCED_ALIGNER or 'none'}",
             f"diarization={enable_diarization}",
+            f"diarization_backend={effective_diarization_backend}",
+            f"diarization_backend_requested={normalized_diarization_backend}",
+            f"diarizen_model={QWEN_OMNIVAD_DIARIZEN_MODEL}",
             f"diarization_min={diarization_min_seconds:.2f}",
             f"vad_slice_pipeline=1",
             f"timeline=full_diarization_plus_omnivad_v1",
@@ -772,49 +907,50 @@ def _coerce_diarization_enabled(enable_diarization: Any) -> bool:
     return bool(enable_diarization)
 
 
-def _run_full_audio_diarization(
-    audio_path: str,
+def _normalize_diarization_output(
+    diarization_output: Any,
     *,
-    enable_diarization: bool = True,
     duration_seconds: float = 0.0,
 ) -> List[DiarizationSegment]:
-    enable_diarization = _coerce_diarization_enabled(enable_diarization)
-    if not enable_diarization:
-        print("Qwen-OmniVAD: Pyannote diarization skipped (disabled).")
-        return []
-    if DiarizationPipeline is None:
-        print("Qwen-OmniVAD: Pyannote diarization skipped (whisperx.diarize is unavailable).")
-        return []
-    if not QWEN_OMNIVAD_HF_TOKEN:
-        print("Qwen-OmniVAD: Pyannote diarization skipped (missing QWEN_OMNIVAD_HF_TOKEN/WHISPERX_HF_TOKEN/HF_TOKEN).")
+    records: List[Dict[str, Any]] = []
+
+    if diarization_output is None:
         return []
 
-    print("Qwen-OmniVAD: Running full-audio Pyannote diarization...")
-    try:
-        import whisperx
-        audio = whisperx.load_audio(audio_path)
-        diarize_model = DiarizationPipeline(
-            token=QWEN_OMNIVAD_HF_TOKEN,
-            device=QWEN_ASR_DEVICE,
-            cache_dir=QWEN_OMNIVAD_PYANNOTE_CACHE,
-        )
-        diarize_df = diarize_model(audio)
-    except Exception as exc:
-        print(f"Warning: Diarization failed: {exc}")
-        return []
-    finally:
-        _release_memory()
-
-    try:
-        diarize_segments = diarize_df.to_dict('records')
-    except AttributeError:
+    if hasattr(diarization_output, "itertracks"):
+        try:
+            for segment, _track, label in diarization_output.itertracks(yield_label=True):
+                records.append(
+                    {
+                        "start": getattr(segment, "start", 0.0),
+                        "end": getattr(segment, "end", 0.0),
+                        "speaker": label,
+                    }
+                )
+        except Exception as exc:
+            print(f"Warning: failed to read diarization annotation tracks: {exc}")
+            return []
+    elif hasattr(diarization_output, "to_dict"):
+        try:
+            records_raw = diarization_output.to_dict("records")
+        except TypeError:
+            records_raw = diarization_output.to_dict()
+        if isinstance(records_raw, list):
+            records = [record for record in records_raw if isinstance(record, dict)]
+        elif isinstance(records_raw, dict):
+            maybe_records = records_raw.get("records") or records_raw.get("segments")
+            if isinstance(maybe_records, list):
+                records = [
+                    record for record in maybe_records if isinstance(record, dict)
+                ]
+    elif isinstance(diarization_output, list):
+        records = [record for record in diarization_output if isinstance(record, dict)]
+    else:
         print("Warning: Diarization returned unexpected format. Fallback to speaker1.")
         return []
 
     normalized: List[DiarizationSegment] = []
-    for record in diarize_segments:
-        if not isinstance(record, dict):
-            continue
+    for record in records:
         try:
             start = float(record.get("start", 0.0) or 0.0)
             end = float(record.get("end", 0.0) or 0.0)
@@ -823,16 +959,115 @@ def _run_full_audio_diarization(
         if duration_seconds > 0:
             start = max(0.0, min(start, duration_seconds))
             end = max(0.0, min(end, duration_seconds))
-        speaker = str(record.get("speaker", "") or "").strip() or "speaker1"
+        speaker = (
+            str(record.get("speaker") or record.get("label") or "").strip()
+            or "speaker1"
+        )
         if end > start:
             normalized.append(DiarizationSegment(start=start, end=end, speaker=speaker))
 
     normalized.sort(key=lambda item: (item.start, item.end, item.speaker))
+    return normalized
+
+
+def _run_pyannote_diarization(audio_path: str) -> Any:
+    if DiarizationPipeline is None:
+        raise RuntimeError("whisperx.diarize is unavailable.")
+    if not QWEN_OMNIVAD_HF_TOKEN:
+        raise RuntimeError(
+            "missing QWEN_OMNIVAD_HF_TOKEN/WHISPERX_HF_TOKEN/HF_TOKEN."
+        )
+
+    import whisperx
+
+    audio = whisperx.load_audio(audio_path)
+    diarize_model = DiarizationPipeline(
+        token=QWEN_OMNIVAD_HF_TOKEN,
+        device=QWEN_ASR_DEVICE,
+        cache_dir=QWEN_OMNIVAD_PYANNOTE_CACHE,
+    )
+    try:
+        return diarize_model(audio)
+    finally:
+        del diarize_model
+
+
+def _run_diarizen_diarization(audio_path: str) -> Any:
+    diarizen_model = _load_diarizen_pipeline()
+    session_name = os.path.splitext(os.path.basename(audio_path))[0] or "audio"
+    return diarizen_model(audio_path, sess_name=session_name)
+
+
+def _run_full_audio_diarization(
+    audio_path: str,
+    *,
+    enable_diarization: bool = True,
+    duration_seconds: float = 0.0,
+    diarization_backend: Any = None,
+    diarization_info: Optional[Dict[str, Any]] = None,
+) -> List[DiarizationSegment]:
+    enable_diarization = _coerce_diarization_enabled(enable_diarization)
+    requested_backend = _normalize_diarization_backend(diarization_backend)
+    effective_backend = _effective_diarization_backend(requested_backend)
+    if diarization_info is not None:
+        diarization_info["diarization_backend"] = effective_backend
+        diarization_info["diarization_backend_requested"] = requested_backend
+        diarization_info["diarization_hf_token_present"] = bool(QWEN_OMNIVAD_HF_TOKEN)
+        if effective_backend == "diarizen":
+            diarization_info["diarization_model"] = QWEN_OMNIVAD_DIARIZEN_MODEL
+
+    if not enable_diarization:
+        print("Qwen-OmniVAD: Diarization skipped (disabled).")
+        return []
+
+    if effective_backend == "diarizen" and requested_backend in {"auto", "pyannote"}:
+        if not QWEN_OMNIVAD_HF_TOKEN:
+            print(
+                "Qwen-OmniVAD: Pyannote HF token not set; falling back to "
+                "DiariZen Large-v2 diarization."
+            )
+        elif DiarizationPipeline is None:
+            print(
+                "Qwen-OmniVAD: Pyannote diarization unavailable; falling back to "
+                "DiariZen Large-v2 diarization."
+            )
+
+    print(
+        "Qwen-OmniVAD: Running full-audio "
+        f"{'Pyannote' if effective_backend == 'pyannote' else 'DiariZen Large-v2'} "
+        "diarization..."
+    )
+    try:
+        if effective_backend == "pyannote":
+            diarization_output = _run_pyannote_diarization(audio_path)
+        else:
+            diarization_output = _run_diarizen_diarization(audio_path)
+    except Exception as exc:
+        print(f"Warning: Diarization failed: {exc}")
+        if diarization_info is not None:
+            diarization_info["diarization_error"] = str(exc)
+        return []
+    finally:
+        _release_memory()
+
+    normalized = _normalize_diarization_output(
+        diarization_output,
+        duration_seconds=duration_seconds,
+    )
     print(
         f"Qwen-OmniVAD: Full diarization produced "
         f"{len(normalized)} speaker turn(s) across "
         f"{len(_speaker_ids_from_diarization(normalized))} speaker(s)."
     )
+    if diarization_info is not None:
+        diarization_info["diarization_turns"] = len(normalized)
+        diarization_info["diarization_speaker_count"] = len(
+            _speaker_ids_from_diarization(normalized)
+        )
+        if _DIARIZEN_MODEL_LOAD_PATH:
+            diarization_info["diarizen_model_path"] = _DIARIZEN_MODEL_LOAD_PATH
+        if _DIARIZEN_EMBEDDING_LOAD_PATH:
+            diarization_info["diarizen_embedding_path"] = _DIARIZEN_EMBEDDING_LOAD_PATH
     return normalized
 
 
@@ -1403,6 +1638,7 @@ def translate_audio(
     translation_max_workers: int = QWEN_OMNIVAD_TRANSLATION_MAX_WORKERS,
     force_refresh: bool = False,
     enable_diarization: bool = QWEN_OMNIVAD_ENABLE_DIARIZATION,
+    diarization_backend: str = QWEN_OMNIVAD_DIARIZATION_BACKEND,
     diarization_min_seconds: float = QWEN_OMNIVAD_DIARIZATION_MIN_SECONDS,
     enable_forced_aligner: bool = QWEN_OMNIVAD_ENABLE_FORCED_ALIGNER,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str, Dict[str, Any]]:
@@ -1430,6 +1666,10 @@ def translate_audio(
         translation_max_workers = QWEN_OMNIVAD_TRANSLATION_MAX_WORKERS
     translation_max_workers = max(1, min(10, translation_max_workers))
     llm_model = translation_llm_model or QWEN_OMNIVAD_TRANSLATION_LLM
+    resolved_diarization_backend = _normalize_diarization_backend(diarization_backend)
+    effective_diarization_backend = _effective_diarization_backend(
+        resolved_diarization_backend
+    )
     audio_hash = hashlib.md5(audio_bytes).hexdigest()
     cache_key = _cache_key(
         audio_hash,
@@ -1439,6 +1679,7 @@ def translate_audio(
         translation_llm_model=llm_model,
         input_mime_type=input_mime_type,
         enable_diarization=enable_diarization,
+        diarization_backend=resolved_diarization_backend,
         diarization_min_seconds=diarization_min_seconds,
         enable_forced_aligner=enable_forced_aligner,
     )
@@ -1456,6 +1697,13 @@ def translate_audio(
         "vad_asr_segment_workers": QWEN_OMNIVAD_ASR_SEGMENT_WORKERS,
         "vad_min_segment_seconds": QWEN_OMNIVAD_MIN_SEGMENT_SECONDS,
         "timeline_authority": "full_diarization_plus_omnivad",
+        "diarization_backend_requested": resolved_diarization_backend,
+        "diarization_backend": effective_diarization_backend,
+        "diarization_model": (
+            QWEN_OMNIVAD_DIARIZEN_MODEL
+            if effective_diarization_backend == "diarizen"
+            else "pyannote"
+        ),
         "forced_aligner_enabled": bool(enable_forced_aligner),
         "forced_aligner_model": QWEN_ASR_FORCED_ALIGNER if enable_forced_aligner else None,
         "asr_timestamps": "forced_aligner" if enable_forced_aligner else "ignored",
@@ -1516,6 +1764,8 @@ def translate_audio(
             audio_path,
             enable_diarization=enable_diarization,
             duration_seconds=duration,
+            diarization_backend=resolved_diarization_backend,
+            diarization_info=cache_info,
         )
         cache_info["diarization_speakers"] = _speaker_ids_from_diarization(
             diarization_segments
@@ -1658,6 +1908,9 @@ def translate_audio(
             "source_language": detected_language,
             "timeline_source": timeline_source,
             "asr_timestamps": "forced_aligner" if effective_enable_forced_aligner else "ignored",
+            "diarization_backend_requested": cache_info.get("diarization_backend_requested"),
+            "diarization_backend": cache_info.get("diarization_backend"),
+            "diarization_model": cache_info.get("diarization_model"),
             "text": text,
             "speakers": speaker_profiles,
             "segments": segments,
@@ -1690,6 +1943,9 @@ def translate_audio(
             "translation_batch_size": translation_batch_size if enable_translation else None,
             "translation_max_workers": translation_max_workers if enable_translation else None,
             "timeline_source": timeline_source,
+            "diarization_backend_requested": cache_info.get("diarization_backend_requested"),
+            "diarization_backend": cache_info.get("diarization_backend"),
+            "diarization_model": cache_info.get("diarization_model"),
         }
         cache_path = _write_cache(cache_key, cache_record)
         if cache_path:
