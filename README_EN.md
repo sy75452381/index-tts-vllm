@@ -13,6 +13,7 @@ conda install -c conda-forge libstdcxx-ng
 conda install -c conda-forge sox
 pip install whisperx
 pip install "nemo_toolkit[asr]"
+pip install git+https://github.com/BUTSpeechFIT/DiariZen
 pip install json-repair
 git clone https://github.com/garyswansrs/index-tts-vllm
 cd index-tts-vllm
