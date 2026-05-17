@@ -6396,9 +6396,13 @@ def _resolve_qwen_omnivad_diarization_backend_option(
         "largev2": "diarizen",
         "diarizen_v2": "diarizen",
         "pyannote_audio": "pyannote",
+        "nvidia_sortformer": "sortformer",
+        "sortformer_4spk": "sortformer",
+        "sortformer_v2_1": "sortformer",
+        "sortformer_v2.1": "sortformer",
     }
     value = aliases.get(value, value)
-    return value if value in {"auto", "pyannote", "diarizen"} else "auto"
+    return value if value in {"auto", "pyannote", "diarizen", "sortformer"} else "auto"
 
 
 def _resolve_qwen_omnivad_forced_aligner_option(
@@ -8899,9 +8903,9 @@ class TranslateRequest(BaseModel):
         default=True,
         description="When using transcription_pipeline='qwen_omnivad', enable diarization.",
     )
-    qwen_omnivad_diarization_backend: Optional[Literal["auto", "pyannote", "diarizen"]] = Field(
+    qwen_omnivad_diarization_backend: Optional[Literal["auto", "pyannote", "diarizen", "sortformer"]] = Field(
         default="auto",
-        description="Diarization backend for Qwen OmniVAD: auto, pyannote, or diarizen.",
+        description="Diarization backend for Qwen OmniVAD: auto, pyannote, diarizen, or sortformer.",
     )
     qwen_omnivad_enable_forced_aligner: Optional[bool] = Field(
         default=True,
@@ -9074,9 +9078,9 @@ class ChunkBatchGenerateRequest(BaseModel):
         default=None,
         description="When using transcription_pipeline='qwen_omnivad', enable diarization.",
     )
-    qwen_omnivad_diarization_backend: Optional[Literal["auto", "pyannote", "diarizen"]] = Field(
+    qwen_omnivad_diarization_backend: Optional[Literal["auto", "pyannote", "diarizen", "sortformer"]] = Field(
         default=None,
-        description="Diarization backend for Qwen OmniVAD: auto, pyannote, or diarizen.",
+        description="Diarization backend for Qwen OmniVAD: auto, pyannote, diarizen, or sortformer.",
     )
     qwen_omnivad_enable_forced_aligner: Optional[bool] = Field(
         default=None,
@@ -10957,7 +10961,7 @@ async def api_translate_segments(
     transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), or 'qwen_omnivad' (Qwen3-ASR + OmniVAD)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
     qwen_omnivad_enable_diarization: Optional[bool] = Form(True, description="Enable diarization for Qwen OmniVAD pipeline."),
-    qwen_omnivad_diarization_backend: Optional[str] = Form("auto", description="Qwen OmniVAD diarization backend: auto, pyannote, or diarizen."),
+    qwen_omnivad_diarization_backend: Optional[str] = Form("auto", description="Qwen OmniVAD diarization backend: auto, pyannote, diarizen, or sortformer."),
     qwen_omnivad_enable_forced_aligner: Optional[bool] = Form(True, description="Enable Qwen3 ForcedAligner timestamps for Qwen OmniVAD pipeline."),
     qwen_omnivad_diarization_min_seconds: Optional[float] = Form(0.0, description="Minimum span duration to split by diarization."),
 ):
@@ -12419,7 +12423,7 @@ async def api_translate_audio(
     transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), or 'qwen_omnivad' (Qwen3-ASR + OmniVAD)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
     qwen_omnivad_enable_diarization: Optional[bool] = Form(True, description="Enable diarization for Qwen OmniVAD pipeline."),
-    qwen_omnivad_diarization_backend: Optional[str] = Form("auto", description="Qwen OmniVAD diarization backend: auto, pyannote, or diarizen."),
+    qwen_omnivad_diarization_backend: Optional[str] = Form("auto", description="Qwen OmniVAD diarization backend: auto, pyannote, diarizen, or sortformer."),
     qwen_omnivad_enable_forced_aligner: Optional[bool] = Form(True, description="Enable Qwen3 ForcedAligner timestamps for Qwen OmniVAD pipeline."),
     qwen_omnivad_diarization_min_seconds: Optional[float] = Form(0.0, description="Minimum span duration to split by diarization."),
 ):

@@ -1760,9 +1760,10 @@
                                                     <option value="auto" selected>Auto (Pyannote, DiariZen fallback)</option>
                                                     <option value="pyannote">Pyannote</option>
                                                     <option value="diarizen">DiariZen Large-v2</option>
+                                                    <option value="sortformer">NVIDIA Sortformer 4spk v2.1</option>
                                                 </select>
                                                 <small style="color: var(--text-muted); display: block; margin-top: 4px; font-size: 0.75rem;">
-                                                    Auto uses Pyannote when an HF token is set, otherwise DiariZen Large-v2.
+                                                    Auto uses Pyannote when an HF token is set, otherwise DiariZen Large-v2. Pick Sortformer to compare NVIDIA's 4-speaker streaming model.
                                                 </small>
                                             </div>
                                             <div class="checkbox-group" style="margin-bottom: 8px;">
@@ -2355,7 +2356,7 @@ Status: CONTINUE (more chunks) or LAST (final chunk)</div>
                                                 <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (default true)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_diarization</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable diarization for Qwen OmniVAD (default true)</span></div>
-                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_diarization_backend</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'auto', 'pyannote', or 'diarizen' (DiariZen Large-v2 fallback when no HF token)</span></div>
+                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_diarization_backend</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'auto', 'pyannote', 'diarizen', or 'sortformer' (DiariZen fallback when no HF token)</span></div>
                                                 <div class="api-param"><span class="api-param-name">segments_json</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Pre-generated Gemini segments (skip inference)</span></div>
                                                 <div class="api-param"><span class="api-param-name">min_speech_ms</span> / <span class="api-param-name">max_merge_ms</span> <span class="api-param-type">int</span> <span class="api-param-desc">— Segment merging heuristics</span></div>
                                             </div>
@@ -2388,7 +2389,7 @@ Content-Type: audio/mpeg</div>
                                                 <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (default true)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_diarization</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable diarization for Qwen OmniVAD (default true)</span></div>
-                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_diarization_backend</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'auto', 'pyannote', or 'diarizen' (DiariZen Large-v2 fallback when no HF token)</span></div>
+                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_diarization_backend</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'auto', 'pyannote', 'diarizen', or 'sortformer' (DiariZen fallback when no HF token)</span></div>
                                                 <div class="api-param"><span class="api-param-name">gemini_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Model selection (flash/pro)</span></div>
                                                 <div class="api-param"><span class="api-param-name">reuse_session_id</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Reuse audio from previous session</span></div>
                                                 <div class="api-param"><span class="api-param-name">default_speaker_preset</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Default voice for all speakers</span></div>
@@ -2497,7 +2498,7 @@ Content-Type: audio/mpeg</div>
                                                 <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (inherits session; default true)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_diarization</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable diarization for Qwen OmniVAD</span></div>
-                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_diarization_backend</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'auto', 'pyannote', or 'diarizen'</span></div>
+                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_diarization_backend</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'auto', 'pyannote', 'diarizen', or 'sortformer'</span></div>
                                             </div>
                                         </div>
                                     </div>

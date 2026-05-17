@@ -73,7 +73,7 @@ QWEN_OMNIVAD_MODEL_DIR = os.getenv(
 QWEN_OMNIVAD_HF_CACHE_DIR = os.path.join(QWEN_OMNIVAD_MODEL_DIR, ".cache", "huggingface")
 QWEN_OMNIVAD_PYANNOTE_CACHE = os.path.join(QWEN_OMNIVAD_MODEL_DIR, "pyannote")
 QWEN_OMNIVAD_HF_TOKEN = os.getenv("QWEN_OMNIVAD_HF_TOKEN", os.getenv("WHISPERX_HF_TOKEN", os.getenv("HF_TOKEN", "")))
-QWEN_OMNIVAD_DIARIZATION_BACKENDS = {"auto", "pyannote", "diarizen"}
+QWEN_OMNIVAD_DIARIZATION_BACKENDS = {"auto", "pyannote", "diarizen", "sortformer"}
 QWEN_OMNIVAD_DIARIZATION_BACKEND = os.getenv("QWEN_OMNIVAD_DIARIZATION_BACKEND", "auto").strip().lower()
 if QWEN_OMNIVAD_DIARIZATION_BACKEND not in QWEN_OMNIVAD_DIARIZATION_BACKENDS:
     QWEN_OMNIVAD_DIARIZATION_BACKEND = "auto"
@@ -91,6 +91,20 @@ QWEN_OMNIVAD_DIARIZEN_EMBEDDING_LOCAL_PATH = os.getenv(
     "QWEN_OMNIVAD_DIARIZEN_EMBEDDING_LOCAL_PATH",
     "",
 ).strip()
+QWEN_OMNIVAD_SORTFORMER_MODEL = os.getenv(
+    "QWEN_OMNIVAD_SORTFORMER_MODEL",
+    "nvidia/diar_streaming_sortformer_4spk-v2.1",
+).strip()
+QWEN_OMNIVAD_SORTFORMER_LOCAL_PATH = os.getenv(
+    "QWEN_OMNIVAD_SORTFORMER_LOCAL_PATH",
+    "",
+).strip()
+QWEN_OMNIVAD_SORTFORMER_CHUNK_LEN = int(os.getenv("QWEN_OMNIVAD_SORTFORMER_CHUNK_LEN", "340"))
+QWEN_OMNIVAD_SORTFORMER_RIGHT_CONTEXT = int(os.getenv("QWEN_OMNIVAD_SORTFORMER_RIGHT_CONTEXT", "40"))
+QWEN_OMNIVAD_SORTFORMER_FIFO_LEN = int(os.getenv("QWEN_OMNIVAD_SORTFORMER_FIFO_LEN", "40"))
+QWEN_OMNIVAD_SORTFORMER_CACHE_UPDATE_PERIOD = int(os.getenv("QWEN_OMNIVAD_SORTFORMER_CACHE_UPDATE_PERIOD", "300"))
+QWEN_OMNIVAD_SORTFORMER_SPKCACHE_LEN = int(os.getenv("QWEN_OMNIVAD_SORTFORMER_SPKCACHE_LEN", "188"))
+QWEN_OMNIVAD_SORTFORMER_BATCH_SIZE = int(os.getenv("QWEN_OMNIVAD_SORTFORMER_BATCH_SIZE", "1"))
 
 QWEN_ASR_LOCAL_DIR = os.getenv("QWEN_ASR_LOCAL_DIR", "").strip()
 QWEN_ASR_FORCED_ALIGNER_LOCAL_DIR = os.getenv("QWEN_ASR_FORCED_ALIGNER_LOCAL_DIR", "").strip()
@@ -213,6 +227,8 @@ _OMNIVAD_MODEL_LOAD_PATH: Optional[str] = None
 _DIARIZEN_PIPELINE: Any = None
 _DIARIZEN_MODEL_LOAD_PATH: Optional[str] = None
 _DIARIZEN_EMBEDDING_LOAD_PATH: Optional[str] = None
+_SORTFORMER_MODEL: Any = None
+_SORTFORMER_MODEL_LOAD_PATH: Optional[str] = None
 
 
 def _safe_model_dir_name(model_ref: str) -> str:
@@ -284,6 +300,10 @@ def _normalize_diarization_backend(backend: Any = None) -> str:
         "diarizen_v2": "diarizen",
         "diarizen-large-v2": "diarizen",
         "pyannote_audio": "pyannote",
+        "nvidia_sortformer": "sortformer",
+        "sortformer_4spk": "sortformer",
+        "sortformer_v2_1": "sortformer",
+        "sortformer_v2.1": "sortformer",
     }
     return aliases.get(value, value if value in QWEN_OMNIVAD_DIARIZATION_BACKENDS else "auto")
 
@@ -292,6 +312,8 @@ def _effective_diarization_backend(backend: Any = None) -> str:
     requested = _normalize_diarization_backend(backend)
     if requested == "diarizen":
         return "diarizen"
+    if requested == "sortformer":
+        return "sortformer"
     if requested in {"auto", "pyannote"}:
         if QWEN_OMNIVAD_HF_TOKEN and DiarizationPipeline is not None:
             return "pyannote"
@@ -376,6 +398,54 @@ def _load_diarizen_pipeline() -> Any:
         embedding_model=_DIARIZEN_EMBEDDING_LOAD_PATH,
     )
     return _DIARIZEN_PIPELINE
+
+
+def _load_sortformer_model() -> Any:
+    global _SORTFORMER_MODEL, _SORTFORMER_MODEL_LOAD_PATH
+    if _SORTFORMER_MODEL is not None:
+        return _SORTFORMER_MODEL
+
+    try:
+        from nemo.collections.asr.models import SortformerEncLabelModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "NVIDIA NeMo ASR is not installed. Install nemo_toolkit[asr] to use "
+            "the Sortformer diarization backend."
+        ) from exc
+
+    if QWEN_OMNIVAD_SORTFORMER_LOCAL_PATH:
+        _SORTFORMER_MODEL_LOAD_PATH = os.path.abspath(
+            os.path.expanduser(QWEN_OMNIVAD_SORTFORMER_LOCAL_PATH)
+        )
+        _SORTFORMER_MODEL = SortformerEncLabelModel.restore_from(
+            restore_path=_SORTFORMER_MODEL_LOAD_PATH,
+            map_location=QWEN_ASR_DEVICE,
+            strict=False,
+        )
+    else:
+        _SORTFORMER_MODEL_LOAD_PATH = QWEN_OMNIVAD_SORTFORMER_MODEL
+        _SORTFORMER_MODEL = SortformerEncLabelModel.from_pretrained(
+            QWEN_OMNIVAD_SORTFORMER_MODEL
+        )
+
+    move_to = getattr(_SORTFORMER_MODEL, "to", None)
+    if callable(move_to):
+        try:
+            _SORTFORMER_MODEL = move_to(QWEN_ASR_DEVICE)
+        except Exception as exc:
+            print(f"Warning: could not move Sortformer model to {QWEN_ASR_DEVICE}: {exc}")
+    _SORTFORMER_MODEL.eval()
+    modules = getattr(_SORTFORMER_MODEL, "sortformer_modules", None)
+    if modules is not None:
+        modules.chunk_len = QWEN_OMNIVAD_SORTFORMER_CHUNK_LEN
+        modules.chunk_right_context = QWEN_OMNIVAD_SORTFORMER_RIGHT_CONTEXT
+        modules.fifo_len = QWEN_OMNIVAD_SORTFORMER_FIFO_LEN
+        modules.spkcache_update_period = QWEN_OMNIVAD_SORTFORMER_CACHE_UPDATE_PERIOD
+        modules.spkcache_len = QWEN_OMNIVAD_SORTFORMER_SPKCACHE_LEN
+        check_params = getattr(modules, "_check_streaming_parameters", None)
+        if callable(check_params):
+            check_params()
+    return _SORTFORMER_MODEL
 
 
 def _resolve_omnivad_model_path() -> Optional[str]:
@@ -590,6 +660,8 @@ def _cache_key(
             f"diarization_backend={effective_diarization_backend}",
             f"diarization_backend_requested={normalized_diarization_backend}",
             f"diarizen_model={QWEN_OMNIVAD_DIARIZEN_MODEL}",
+            f"sortformer_model={QWEN_OMNIVAD_SORTFORMER_MODEL}",
+            f"sortformer_cfg={QWEN_OMNIVAD_SORTFORMER_CHUNK_LEN}:{QWEN_OMNIVAD_SORTFORMER_RIGHT_CONTEXT}:{QWEN_OMNIVAD_SORTFORMER_FIFO_LEN}:{QWEN_OMNIVAD_SORTFORMER_CACHE_UPDATE_PERIOD}:{QWEN_OMNIVAD_SORTFORMER_SPKCACHE_LEN}",
             f"diarization_min={diarization_min_seconds:.2f}",
             f"vad_slice_pipeline=1",
             f"timeline=full_diarization_plus_omnivad_v1",
@@ -943,8 +1015,30 @@ def _normalize_diarization_output(
                 records = [
                     record for record in maybe_records if isinstance(record, dict)
                 ]
-    elif isinstance(diarization_output, list):
-        records = [record for record in diarization_output if isinstance(record, dict)]
+    elif isinstance(diarization_output, (list, tuple)):
+        for item in diarization_output:
+            if isinstance(item, dict):
+                records.append(item)
+                continue
+            if isinstance(item, str):
+                parts = re.split(r"[\s,]+", item.strip())
+                if len(parts) >= 3:
+                    records.append(
+                        {
+                            "start": parts[0],
+                            "end": parts[1],
+                            "speaker": parts[2],
+                        }
+                    )
+                continue
+            if isinstance(item, (list, tuple)) and len(item) >= 3:
+                records.append(
+                    {
+                        "start": item[0],
+                        "end": item[1],
+                        "speaker": item[2],
+                    }
+                )
     else:
         print("Warning: Diarization returned unexpected format. Fallback to speaker1.")
         return []
@@ -998,6 +1092,25 @@ def _run_diarizen_diarization(audio_path: str) -> Any:
     return diarizen_model(audio_path, sess_name=session_name)
 
 
+def _run_sortformer_diarization(audio_path: str) -> Any:
+    sortformer_model = _load_sortformer_model()
+    sortformer_audio_path = _write_omnivad_input(audio_path) or audio_path
+    try:
+        predicted_segments = sortformer_model.diarize(
+            audio=[sortformer_audio_path],
+            batch_size=max(1, QWEN_OMNIVAD_SORTFORMER_BATCH_SIZE),
+        )
+        if isinstance(predicted_segments, (list, tuple)) and predicted_segments:
+            return predicted_segments[0]
+        return predicted_segments
+    finally:
+        if sortformer_audio_path != audio_path:
+            try:
+                os.remove(sortformer_audio_path)
+            except OSError:
+                pass
+
+
 def _run_full_audio_diarization(
     audio_path: str,
     *,
@@ -1015,6 +1128,8 @@ def _run_full_audio_diarization(
         diarization_info["diarization_hf_token_present"] = bool(QWEN_OMNIVAD_HF_TOKEN)
         if effective_backend == "diarizen":
             diarization_info["diarization_model"] = QWEN_OMNIVAD_DIARIZEN_MODEL
+        elif effective_backend == "sortformer":
+            diarization_info["diarization_model"] = QWEN_OMNIVAD_SORTFORMER_MODEL
 
     if not enable_diarization:
         print("Qwen-OmniVAD: Diarization skipped (disabled).")
@@ -1034,12 +1149,14 @@ def _run_full_audio_diarization(
 
     print(
         "Qwen-OmniVAD: Running full-audio "
-        f"{'Pyannote' if effective_backend == 'pyannote' else 'DiariZen Large-v2'} "
+        f"{'Pyannote' if effective_backend == 'pyannote' else 'NVIDIA Sortformer 4spk v2.1' if effective_backend == 'sortformer' else 'DiariZen Large-v2'} "
         "diarization..."
     )
     try:
         if effective_backend == "pyannote":
             diarization_output = _run_pyannote_diarization(audio_path)
+        elif effective_backend == "sortformer":
+            diarization_output = _run_sortformer_diarization(audio_path)
         else:
             diarization_output = _run_diarizen_diarization(audio_path)
     except Exception as exc:
@@ -1068,6 +1185,8 @@ def _run_full_audio_diarization(
             diarization_info["diarizen_model_path"] = _DIARIZEN_MODEL_LOAD_PATH
         if _DIARIZEN_EMBEDDING_LOAD_PATH:
             diarization_info["diarizen_embedding_path"] = _DIARIZEN_EMBEDDING_LOAD_PATH
+        if _SORTFORMER_MODEL_LOAD_PATH:
+            diarization_info["sortformer_model_path"] = _SORTFORMER_MODEL_LOAD_PATH
     return normalized
 
 
@@ -1702,6 +1821,8 @@ def translate_audio(
         "diarization_model": (
             QWEN_OMNIVAD_DIARIZEN_MODEL
             if effective_diarization_backend == "diarizen"
+            else QWEN_OMNIVAD_SORTFORMER_MODEL
+            if effective_diarization_backend == "sortformer"
             else "pyannote"
         ),
         "forced_aligner_enabled": bool(enable_forced_aligner),
