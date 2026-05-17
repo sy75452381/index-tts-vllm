@@ -1754,6 +1754,9 @@
                                             <div class="checkbox-group" style="margin-bottom: 8px;">
                                                 <label><input type="checkbox" id="translateQwenOmniVadEnableDiarization" checked> Enable Pyannote Diarization Split</label>
                                             </div>
+                                            <div class="checkbox-group" style="margin-bottom: 8px;">
+                                                <label><input type="checkbox" id="translateQwenOmniVadEnableForcedAligner" checked> Enable Qwen ForcedAligner Timestamps</label>
+                                            </div>
                                             <div class="form-group" style="margin-bottom: 0;">
                                                 <label for="translateQwenOmniVadDiarizationMinSeconds">Min Span Duration to Split (sec):</label>
                                                 <input type="number" id="translateQwenOmniVadDiarizationMinSeconds" value="0.0" min="0.0" step="0.5" style="max-width: 120px;">
@@ -2339,6 +2342,8 @@ Status: CONTINUE (more chunks) or LAST (final chunk)</div>
                                                 <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini', 'whisperx', or 'qwen_omnivad'</span></div>
                                                 <div class="api-param"><span class="api-param-name">translation_llm_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— LitAI model: 'lightning-ai/gemma-4-31B-it' (default), 'lightning-ai/gpt-oss-20b', 'lightning-ai/gpt-oss-120b', or 'lightning-ai/minimax-m2.5'</span></div>
                                                 <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
+                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (default true)</span></div>
+                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_diarization</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable pyannote diarization for Qwen OmniVAD (default true)</span></div>
                                                 <div class="api-param"><span class="api-param-name">segments_json</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Pre-generated Gemini segments (skip inference)</span></div>
                                                 <div class="api-param"><span class="api-param-name">min_speech_ms</span> / <span class="api-param-name">max_merge_ms</span> <span class="api-param-type">int</span> <span class="api-param-desc">— Segment merging heuristics</span></div>
                                             </div>
@@ -2369,6 +2374,8 @@ Content-Type: audio/mpeg</div>
                                                 <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini', 'whisperx', or 'qwen_omnivad'</span></div>
                                                 <div class="api-param"><span class="api-param-name">translation_llm_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— LitAI model: 'lightning-ai/gemma-4-31B-it' (default), 'lightning-ai/gpt-oss-20b', 'lightning-ai/gpt-oss-120b', or 'lightning-ai/minimax-m2.5'</span></div>
                                                 <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
+                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (default true)</span></div>
+                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_diarization</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable pyannote diarization for Qwen OmniVAD (default true)</span></div>
                                                 <div class="api-param"><span class="api-param-name">gemini_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Model selection (flash/pro)</span></div>
                                                 <div class="api-param"><span class="api-param-name">reuse_session_id</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Reuse audio from previous session</span></div>
                                                 <div class="api-param"><span class="api-param-name">default_speaker_preset</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Default voice for all speakers</span></div>
@@ -2475,6 +2482,8 @@ Content-Type: audio/mpeg</div>
                                                 <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini', 'whisperx', or 'qwen_omnivad'</span></div>
                                                 <div class="api-param"><span class="api-param-name">translation_llm_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— LitAI model: 'lightning-ai/gemma-4-31B-it' (default), 'lightning-ai/gpt-oss-20b', 'lightning-ai/gpt-oss-120b', or 'lightning-ai/minimax-m2.5'</span></div>
                                                 <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
+                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (inherits session; default true)</span></div>
+                                                <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_diarization</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable pyannote diarization for Qwen OmniVAD</span></div>
                                             </div>
                                         </div>
                                     </div>
@@ -3577,6 +3586,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             const translateWhisperXProxyRefiner = document.getElementById('translateWhisperXProxyRefiner');
             const translateQwenOmniVadSettingsDiv = document.getElementById('translateQwenOmniVadSettings');
             const translateQwenOmniVadEnableDiarization = document.getElementById('translateQwenOmniVadEnableDiarization');
+            const translateQwenOmniVadEnableForcedAligner = document.getElementById('translateQwenOmniVadEnableForcedAligner');
             const translateQwenOmniVadDiarizationMinSeconds = document.getElementById('translateQwenOmniVadDiarizationMinSeconds');
             const translateLitAiSettingsDiv = document.getElementById('translateLitAiSettings');
             const translateTranslationLlmModel = document.getElementById('translateTranslationLlmModel');
@@ -3666,6 +3676,12 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     translateQwenOmniVadEnableDiarization.checked = settings.qwen_omnivad_enable_diarization;
                 }
                 if (
+                    translateQwenOmniVadEnableForcedAligner &&
+                    typeof settings.qwen_omnivad_enable_forced_aligner === 'boolean'
+                ) {
+                    translateQwenOmniVadEnableForcedAligner.checked = settings.qwen_omnivad_enable_forced_aligner;
+                }
+                if (
                     translateQwenOmniVadDiarizationMinSeconds &&
                     typeof settings.qwen_omnivad_diarization_min_seconds === 'number'
                 ) {
@@ -3689,6 +3705,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         : false,
                     qwen_omnivad_enable_diarization: translateQwenOmniVadEnableDiarization
                         ? translateQwenOmniVadEnableDiarization.checked
+                        : true,
+                    qwen_omnivad_enable_forced_aligner: translateQwenOmniVadEnableForcedAligner
+                        ? translateQwenOmniVadEnableForcedAligner.checked
                         : true,
                     qwen_omnivad_diarization_min_seconds: getQwenOmniVadDiarizationMinSeconds(),
                     gemini_model: translateGeminiModel ? translateGeminiModel.value : '',
@@ -3756,6 +3775,12 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             }
             if (translateQwenOmniVadEnableDiarization) {
                 translateQwenOmniVadEnableDiarization.addEventListener('change', () => {
+                    saveTranslatePersistentSettings();
+                    updateAiConfigSummary();
+                });
+            }
+            if (translateQwenOmniVadEnableForcedAligner) {
+                translateQwenOmniVadEnableForcedAligner.addEventListener('change', () => {
                     saveTranslatePersistentSettings();
                     updateAiConfigSummary();
                 });
@@ -3973,7 +3998,11 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     });
                     items.push({
                         label: 'Timeline',
-                        value: 'OmniVAD',
+                        value:
+                            translateQwenOmniVadEnableForcedAligner &&
+                            translateQwenOmniVadEnableForcedAligner.checked
+                                ? 'Aligner'
+                                : 'OmniVAD',
                     });
                 } else {
                     items.push({
@@ -4579,6 +4608,12 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     translateTranscriptionPipeline.value === 'qwen_omnivad' &&
                     translateQwenOmniVadEnableDiarization &&
                     translateQwenOmniVadEnableDiarization.checked
+                );
+                payload.qwen_omnivad_enable_forced_aligner = !!(
+                    translateTranscriptionPipeline &&
+                    translateTranscriptionPipeline.value === 'qwen_omnivad' &&
+                    translateQwenOmniVadEnableForcedAligner &&
+                    translateQwenOmniVadEnableForcedAligner.checked
                 );
                 payload.qwen_omnivad_diarization_min_seconds = getQwenOmniVadDiarizationMinSeconds();
                 payload.merge_backing_track = translateMergeBackEl && translateMergeBackEl.checked ? true : false;
@@ -7187,6 +7222,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         }
                         if (translateTranscriptionPipeline && translateTranscriptionPipeline.value === 'qwen_omnivad') {
                             formData.append('qwen_omnivad_enable_diarization', translateQwenOmniVadEnableDiarization && translateQwenOmniVadEnableDiarization.checked ? 'true' : 'false');
+                            formData.append('qwen_omnivad_enable_forced_aligner', translateQwenOmniVadEnableForcedAligner && translateQwenOmniVadEnableForcedAligner.checked ? 'true' : 'false');
                             formData.append('qwen_omnivad_diarization_min_seconds', String(getQwenOmniVadDiarizationMinSeconds()));
                         }
                         if (translateForceGeminiRefresh && translateForceGeminiRefresh.checked) {
@@ -7270,6 +7306,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     }
                     if (translateTranscriptionPipeline && translateTranscriptionPipeline.value === 'qwen_omnivad') {
                         formData.append('qwen_omnivad_enable_diarization', translateQwenOmniVadEnableDiarization && translateQwenOmniVadEnableDiarization.checked ? 'true' : 'false');
+                        formData.append('qwen_omnivad_enable_forced_aligner', translateQwenOmniVadEnableForcedAligner && translateQwenOmniVadEnableForcedAligner.checked ? 'true' : 'false');
                         formData.append('qwen_omnivad_diarization_min_seconds', String(getQwenOmniVadDiarizationMinSeconds()));
                     }
                     if (translateForceGeminiRefresh && translateForceGeminiRefresh.checked) {

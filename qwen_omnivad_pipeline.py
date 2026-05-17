@@ -90,7 +90,7 @@ QWEN_OMNIVAD_OMNIVAD_MODEL_PATH = os.getenv(
     os.path.join(QWEN_OMNIVAD_MODEL_DIR, "omnivad", "vad.omnivad"),
 ).strip()
 QWEN_OMNIVAD_CACHE_DIR = os.path.join(_SCRIPT_DIR, "qwen_omnivad_cache")
-QWEN_OMNIVAD_CACHE_VERSION = 7
+QWEN_OMNIVAD_CACHE_VERSION = 8
 
 QWEN_ASR_MODEL = os.getenv("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
 QWEN_ASR_BACKEND = os.getenv("QWEN_ASR_BACKEND", "transformers").strip().lower()
@@ -98,7 +98,11 @@ QWEN_ASR_DEVICE = os.getenv("QWEN_ASR_DEVICE", "cuda:0")
 QWEN_ASR_DTYPE = os.getenv("QWEN_ASR_DTYPE", "bfloat16")
 QWEN_ASR_MAX_BATCH_SIZE = int(os.getenv("QWEN_ASR_MAX_BATCH_SIZE", "20"))
 QWEN_ASR_MAX_NEW_TOKENS = int(os.getenv("QWEN_ASR_MAX_NEW_TOKENS", "4096"))
-QWEN_ASR_FORCED_ALIGNER = os.getenv("QWEN_ASR_FORCED_ALIGNER", "").strip()
+QWEN_ASR_DEFAULT_FORCED_ALIGNER = "Qwen/Qwen3-ForcedAligner-0.6B"
+QWEN_ASR_FORCED_ALIGNER = (
+    os.getenv("QWEN_ASR_FORCED_ALIGNER", QWEN_ASR_DEFAULT_FORCED_ALIGNER).strip()
+    or QWEN_ASR_DEFAULT_FORCED_ALIGNER
+)
 
 QWEN_OMNIVAD_TRANSLATION_LLM = os.getenv(
     "QWEN_OMNIVAD_TRANSLATION_LLM",
@@ -108,6 +112,10 @@ QWEN_OMNIVAD_TRANSLATION_BATCH_SIZE = int(os.getenv("QWEN_OMNIVAD_TRANSLATION_BA
 QWEN_OMNIVAD_TRANSLATION_MAX_WORKERS = int(os.getenv("QWEN_OMNIVAD_TRANSLATION_MAX_WORKERS", "10"))
 QWEN_OMNIVAD_USE_OMNIVAD = os.getenv("QWEN_OMNIVAD_USE_OMNIVAD", "1").strip().lower() not in {"0", "false", "no"}
 QWEN_OMNIVAD_ENABLE_DIARIZATION = os.getenv("QWEN_OMNIVAD_ENABLE_DIARIZATION", "1").strip().lower() not in {"0", "false", "no"}
+QWEN_OMNIVAD_ENABLE_FORCED_ALIGNER = os.getenv(
+    "QWEN_OMNIVAD_ENABLE_FORCED_ALIGNER",
+    "1",
+).strip().lower() not in {"0", "false", "no"}
 QWEN_OMNIVAD_DIARIZATION_MIN_SECONDS = float(os.getenv("QWEN_OMNIVAD_DIARIZATION_MIN_SECONDS", "0.0"))
 QWEN_OMNIVAD_REQUIRE_VAD_TIMELINE = os.getenv(
     "QWEN_OMNIVAD_REQUIRE_VAD_TIMELINE",
@@ -289,8 +297,17 @@ def _torch_dtype() -> Any:
     return torch.bfloat16
 
 
-def _load_qwen_model() -> Any:
+def _load_qwen_model(
+    *,
+    enable_forced_aligner: bool = QWEN_OMNIVAD_ENABLE_FORCED_ALIGNER,
+) -> Any:
     global _ASR_MODEL, _ASR_MODEL_LOAD_PATH, _FORCED_ALIGNER_LOAD_PATH
+    if _ASR_MODEL is not None:
+        if not enable_forced_aligner or _FORCED_ALIGNER_LOAD_PATH:
+            return _ASR_MODEL
+        print("Reloading Qwen3-ASR with forced aligner enabled...")
+        _ASR_MODEL = None
+        _release_memory()
     if _ASR_MODEL is not None:
         return _ASR_MODEL
     if not is_qwen_omnivad_available():
@@ -302,9 +319,7 @@ def _load_qwen_model() -> Any:
 
     dtype = _torch_dtype()
     _FORCED_ALIGNER_LOAD_PATH = None
-    # Qwen3-ASR timestamp output has proven unreliable for this workflow.
-    # The timeline is owned by full-audio diarization + OmniVAD instead.
-    forced_aligner = None
+    forced_aligner = QWEN_ASR_FORCED_ALIGNER if enable_forced_aligner else None
     model_path = _resolve_hf_model_path(
         QWEN_ASR_MODEL,
         local_dir_override=QWEN_ASR_LOCAL_DIR,
@@ -327,7 +342,8 @@ def _load_qwen_model() -> Any:
         "max_inference_batch_size": QWEN_ASR_MAX_BATCH_SIZE,
         "max_new_tokens": QWEN_ASR_MAX_NEW_TOKENS,
     }
-    print(f"Loading Qwen3-ASR model: {model_path} ({QWEN_ASR_BACKEND})")
+    aligner_label = f", forced_aligner={forced_aligner}" if forced_aligner else ""
+    print(f"Loading Qwen3-ASR model: {model_path} ({QWEN_ASR_BACKEND}{aligner_label})")
     if QWEN_ASR_BACKEND == "vllm":
         raise RuntimeError(
             "In-process Qwen3-ASR vLLM is disabled for this app. "
@@ -424,6 +440,7 @@ def _cache_key(
     input_mime_type: Optional[str],
     enable_diarization: bool,
     diarization_min_seconds: float,
+    enable_forced_aligner: bool,
 ) -> str:
     raw = "|".join(
         [
@@ -435,12 +452,13 @@ def _cache_key(
             f"translate={enable_translation}",
             f"model={QWEN_ASR_MODEL}",
             f"backend={QWEN_ASR_BACKEND}",
+            f"forced_aligner_enabled={enable_forced_aligner}",
             f"aligner={QWEN_ASR_FORCED_ALIGNER or 'none'}",
             f"diarization={enable_diarization}",
             f"diarization_min={diarization_min_seconds:.2f}",
             f"vad_slice_pipeline=1",
             f"timeline=full_diarization_plus_omnivad_v1",
-            f"asr_timestamps=ignored",
+            f"asr_timestamps={'forced_aligner' if enable_forced_aligner else 'ignored'}",
             f"vad_chunk={QWEN_OMNIVAD_CHUNK_SECONDS:.3f}",
             f"vad_overlap={QWEN_OMNIVAD_OVERLAP_SECONDS:.3f}",
             f"vad_merge_gap={QWEN_OMNIVAD_MERGE_GAP_SECONDS:.4f}",
@@ -488,10 +506,69 @@ def _split_sentences(text: str) -> List[str]:
     return cleaned or [text]
 
 
-def _time_stamps_to_timeline(time_stamps: Optional[Sequence[Any]], fallback_text: str) -> List[TimelineItem]:
+def _stamp_attr(stamp: Any, *names: str) -> Any:
+    for name in names:
+        if isinstance(stamp, dict) and name in stamp:
+            return stamp.get(name)
+        value = getattr(stamp, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _time_stamp_items(time_stamps: Any) -> List[Any]:
+    if time_stamps is None:
+        return []
+    if isinstance(time_stamps, dict):
+        embedded = time_stamps.get("items") or time_stamps.get("time_stamps")
+        if embedded is not None:
+            return list(embedded)
+        return [time_stamps]
+    embedded_items = getattr(time_stamps, "items", None)
+    if embedded_items is not None and not callable(embedded_items):
+        return list(embedded_items)
+    try:
+        return list(time_stamps)
+    except TypeError:
+        return []
+
+
+def _join_stamp_texts(words: Sequence[str]) -> str:
+    pieces: List[str] = []
+    for raw_word in words:
+        word = str(raw_word or "").strip()
+        if not word:
+            continue
+        if not pieces:
+            pieces.append(word)
+            continue
+        previous = pieces[-1]
+        attaches_to_previous = bool(
+            re.match(r"^[,.;:!?%)}\]\u3002\uff01\uff1f\uff1b\uff0c\uff1a]", word)
+            or re.search(r"[\u4e00-\u9fff]$", previous)
+            or re.match(r"^[\u4e00-\u9fff]", word)
+        )
+        pieces.append(word if attaches_to_previous else f" {word}")
+    return "".join(pieces).strip()
+
+
+def _time_stamps_to_timeline(
+    time_stamps: Optional[Sequence[Any]],
+    fallback_text: str,
+    *,
+    start_offset: float = 0.0,
+    end_limit: Optional[float] = None,
+    speaker: str = "speaker1",
+) -> List[TimelineItem]:
     if not time_stamps:
         return []
 
+    stamps = _time_stamp_items(time_stamps)
+    if not stamps:
+        return []
+
+    start_offset = max(0.0, float(start_offset or 0.0))
+    max_end = float(end_limit) if end_limit is not None else None
     items: List[TimelineItem] = []
     current_words: List[str] = []
     current_start: Optional[float] = None
@@ -499,35 +576,61 @@ def _time_stamps_to_timeline(time_stamps: Optional[Sequence[Any]], fallback_text
 
     def flush() -> None:
         nonlocal current_words, current_start, current_end
-        text = "".join(current_words).strip()
+        text = _join_stamp_texts(current_words)
         if text and current_start is not None and current_end is not None and current_end > current_start:
-            items.append(TimelineItem(start=current_start, end=current_end, text=text))
+            items.append(
+                TimelineItem(
+                    start=current_start,
+                    end=current_end,
+                    text=text,
+                    speaker=speaker or "speaker1",
+                )
+            )
         current_words = []
         current_start = None
         current_end = None
 
-    for stamp in time_stamps:
-        word = str(getattr(stamp, "text", "") or "").strip()
-        start = getattr(stamp, "start_time", None)
-        end = getattr(stamp, "end_time", None)
+    last_end = start_offset
+    for stamp in stamps:
+        word = str(_stamp_attr(stamp, "text", "word", "token") or "").strip()
+        start = _stamp_attr(stamp, "start_time", "start")
+        end = _stamp_attr(stamp, "end_time", "end")
         if not word or start is None or end is None:
             continue
-        start_f = float(start)
-        end_f = float(end)
+        start_f = start_offset + float(start)
+        end_f = start_offset + float(end)
+        if max_end is not None:
+            start_f = min(max(start_offset, start_f), max_end)
+            end_f = min(max(start_offset, end_f), max_end)
+        if end_f <= start_f:
+            continue
+        last_end = max(last_end, end_f)
         if current_start is None:
             current_start = start_f
         current_words.append(word)
         current_end = end_f
-        if re.search(r"[.!?。！？；;]$", word) or len("".join(current_words)) >= 80:
+        if re.search(r"[.!?\u3002\uff01\uff1f\uff1b;]$", word) or len(_join_stamp_texts(current_words)) >= 80:
             flush()
     flush()
 
     if items:
         return items
-    return _proportional_timeline(fallback_text, 0.0, max(float(getattr(time_stamps[-1], "end_time", 0.0) or 0.0), 0.0))
+    fallback_end = max_end if max_end is not None else last_end
+    return _proportional_timeline(
+        fallback_text,
+        start_offset,
+        max(fallback_end, start_offset + 0.1),
+        speaker=speaker,
+    )
 
 
-def _proportional_timeline(text: str, start: float, end: float) -> List[TimelineItem]:
+def _proportional_timeline(
+    text: str,
+    start: float,
+    end: float,
+    *,
+    speaker: str = "speaker1",
+) -> List[TimelineItem]:
     sentences = _split_sentences(text)
     if not sentences:
         return []
@@ -541,7 +644,14 @@ def _proportional_timeline(text: str, start: float, end: float) -> List[Timeline
             next_end = end
         else:
             next_end = cursor + duration * (weights[idx] / total)
-        items.append(TimelineItem(start=cursor, end=max(cursor + 0.1, next_end), text=sentence))
+        items.append(
+            TimelineItem(
+                start=cursor,
+                end=max(cursor + 0.1, next_end),
+                text=sentence,
+                speaker=speaker or "speaker1",
+            )
+        )
         cursor = next_end
     return items
 
@@ -943,6 +1053,7 @@ def _transcribe_vad_slices(
     duration_seconds: float,
     *,
     language: Optional[str],
+    enable_forced_aligner: bool = False,
 ) -> Tuple[List[TimelineItem], str, Optional[str]]:
     """
     Crop each OmniVAD speech interval and run Qwen3-ASR on that clip alone.
@@ -1008,7 +1119,7 @@ def _transcribe_vad_slices(
         return [], "", None
 
     results_list = []
-    want_timestamps = False
+    want_timestamps = bool(enable_forced_aligner)
 
     for i in range(0, len(jobs), batch_size):
         batch_jobs = jobs[i : i + batch_size]
@@ -1018,11 +1129,25 @@ def _transcribe_vad_slices(
         batch_paths = [job[4] for job in batch_jobs]
         
         try:
-            batch_results = asr.transcribe(
-                audio=batch_paths,
-                language=language,
-                return_time_stamps=want_timestamps,
-            )
+            try:
+                batch_results = asr.transcribe(
+                    audio=batch_paths,
+                    language=language,
+                    return_time_stamps=want_timestamps,
+                )
+            except Exception as exc:
+                if not want_timestamps:
+                    raise
+                print(
+                    f"  Batch {i//batch_size + 1} forced alignment failed: {exc}; "
+                    "retrying text-only ASR."
+                )
+                want_timestamps = False
+                batch_results = asr.transcribe(
+                    audio=batch_paths,
+                    language=language,
+                    return_time_stamps=False,
+                )
         except Exception as exc:
             print(f"  Batch {i//batch_size + 1} transcription failed: {exc}")
             for job in batch_jobs:
@@ -1052,7 +1177,16 @@ def _transcribe_vad_slices(
             cut = preview if len(preview) <= 80 else preview[:77] + "..."
             print(f"  Segment {disp_idx}/{total}: [{ts_out:.2f}s → {te_out:.2f}s] [{speaker}] {cut}")
             
-            clip_items = [TimelineItem(start=ts_out, end=te_out, text=seg_text, speaker=speaker)]
+            time_stamps = getattr(clip_result, "time_stamps", None)
+            clip_items = _time_stamps_to_timeline(
+                time_stamps,
+                seg_text,
+                start_offset=ts_out,
+                end_limit=te_out,
+                speaker=speaker,
+            )
+            if not clip_items:
+                clip_items = [TimelineItem(start=ts_out, end=te_out, text=seg_text, speaker=speaker)]
             results_list.append((oi, clip_items, seg_text, lang_guess))
             
     # Cleanup audio clips
@@ -1270,6 +1404,7 @@ def translate_audio(
     force_refresh: bool = False,
     enable_diarization: bool = QWEN_OMNIVAD_ENABLE_DIARIZATION,
     diarization_min_seconds: float = QWEN_OMNIVAD_DIARIZATION_MIN_SECONDS,
+    enable_forced_aligner: bool = QWEN_OMNIVAD_ENABLE_FORCED_ALIGNER,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str, Dict[str, Any]]:
     """
     Full-audio diarization + OmniVAD define timestamped ASR windows; Qwen3-ASR
@@ -1305,6 +1440,7 @@ def translate_audio(
         input_mime_type=input_mime_type,
         enable_diarization=enable_diarization,
         diarization_min_seconds=diarization_min_seconds,
+        enable_forced_aligner=enable_forced_aligner,
     )
     cache_info: Dict[str, Any] = {
         "audio_md5": audio_hash,
@@ -1320,7 +1456,9 @@ def translate_audio(
         "vad_asr_segment_workers": QWEN_OMNIVAD_ASR_SEGMENT_WORKERS,
         "vad_min_segment_seconds": QWEN_OMNIVAD_MIN_SEGMENT_SECONDS,
         "timeline_authority": "full_diarization_plus_omnivad",
-        "asr_timestamps": "ignored",
+        "forced_aligner_enabled": bool(enable_forced_aligner),
+        "forced_aligner_model": QWEN_ASR_FORCED_ALIGNER if enable_forced_aligner else None,
+        "asr_timestamps": "forced_aligner" if enable_forced_aligner else "ignored",
         "combined_asr_windows": 0,
     }
 
@@ -1348,11 +1486,27 @@ def translate_audio(
         text = ""
         detected_language: Optional[str] = source_language
         asr: Any = None
+        effective_enable_forced_aligner = bool(enable_forced_aligner)
 
         def _get_asr_model() -> Any:
-            nonlocal asr
+            nonlocal asr, effective_enable_forced_aligner
             if asr is None:
-                asr = _load_qwen_model()
+                try:
+                    asr = _load_qwen_model(
+                        enable_forced_aligner=effective_enable_forced_aligner,
+                    )
+                except Exception as exc:
+                    if not effective_enable_forced_aligner:
+                        raise
+                    print(
+                        f"Warning: failed to load Qwen forced aligner: {exc}; "
+                        "falling back to text-only ASR timestamps."
+                    )
+                    cache_info["forced_aligner_load_error"] = str(exc)
+                    effective_enable_forced_aligner = False
+                    cache_info["forced_aligner_enabled"] = False
+                    cache_info["asr_timestamps"] = "ignored"
+                    asr = _load_qwen_model(enable_forced_aligner=False)
                 cache_info["qwen_model_path"] = _ASR_MODEL_LOAD_PATH
                 if _FORCED_ALIGNER_LOAD_PATH:
                     cache_info["forced_aligner_path"] = _FORCED_ALIGNER_LOAD_PATH
@@ -1392,11 +1546,16 @@ def translate_audio(
                 combined_asr_spans,
                 duration,
                 language=source_language,
+                enable_forced_aligner=effective_enable_forced_aligner,
             )
             if items:
                 used_vad_asr_branch = True
                 text = agg_text
-                timeline_source = "full_diarization_plus_omnivad"
+                timeline_source = (
+                    "full_diarization_plus_omnivad_forced_aligner"
+                    if effective_enable_forced_aligner
+                    else "full_diarization_plus_omnivad"
+                )
                 if isinstance(det_lang, str) and det_lang.strip():
                     raw = det_lang.strip()
                     detected_language = _normalize_language(raw) or raw
@@ -1415,13 +1574,30 @@ def translate_audio(
                     "QWEN_OMNIVAD_REQUIRE_VAD_TIMELINE=0 to transcribe the full clip."
                 )
 
-            want_qwen_timestamps = False
+            want_qwen_timestamps = bool(effective_enable_forced_aligner)
             print("Running Qwen3-ASR transcription (full audio)...")
-            results = _get_asr_model().transcribe(
-                audio=audio_path,
-                language=source_language,
-                return_time_stamps=want_qwen_timestamps,
-            )
+            try:
+                results = _get_asr_model().transcribe(
+                    audio=audio_path,
+                    language=source_language,
+                    return_time_stamps=want_qwen_timestamps,
+                )
+            except Exception as exc:
+                if not want_qwen_timestamps:
+                    raise
+                print(
+                    f"Warning: full-audio forced alignment failed: {exc}; "
+                    "retrying text-only ASR."
+                )
+                effective_enable_forced_aligner = False
+                cache_info["forced_aligner_enabled"] = False
+                cache_info["forced_aligner_runtime_error"] = str(exc)
+                cache_info["asr_timestamps"] = "ignored"
+                results = _get_asr_model().transcribe(
+                    audio=audio_path,
+                    language=source_language,
+                    return_time_stamps=False,
+                )
             if not results:
                 raise RuntimeError("Qwen3-ASR returned no transcription results.")
             result = results[0]
@@ -1433,8 +1609,18 @@ def translate_audio(
             if not text:
                 raise RuntimeError("Qwen3-ASR returned an empty transcription.")
 
-            items = _proportional_timeline(text, 0.0, duration or 0.1)
-            timeline_source = "proportional_full_asr"
+            items = _time_stamps_to_timeline(
+                getattr(result, "time_stamps", None),
+                text,
+                start_offset=0.0,
+                end_limit=duration or 0.1,
+                speaker="speaker1",
+            )
+            if items:
+                timeline_source = "qwen_forced_aligner_full_asr"
+            else:
+                items = _proportional_timeline(text, 0.0, duration or 0.1)
+                timeline_source = "proportional_full_asr"
 
         cache_info["timeline_source"] = timeline_source
         cache_info["source_language"] = detected_language
@@ -1465,10 +1651,13 @@ def translate_audio(
             "qwen_model": QWEN_ASR_MODEL,
             "qwen_backend": QWEN_ASR_BACKEND,
             "qwen_model_path": _ASR_MODEL_LOAD_PATH,
+            "forced_aligner_enabled": bool(effective_enable_forced_aligner),
+            "forced_aligner_model": QWEN_ASR_FORCED_ALIGNER if effective_enable_forced_aligner else None,
             "forced_aligner_path": _FORCED_ALIGNER_LOAD_PATH,
             "omnivad_model_path": _OMNIVAD_MODEL_LOAD_PATH,
             "source_language": detected_language,
             "timeline_source": timeline_source,
+            "asr_timestamps": "forced_aligner" if effective_enable_forced_aligner else "ignored",
             "text": text,
             "speakers": speaker_profiles,
             "segments": segments,
