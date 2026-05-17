@@ -116,8 +116,27 @@ except ImportError:
         return False
     _run_qwen_omnivad_pipeline_sync = None  # type: ignore[assignment]
 
+# NVIDIA Parakeet NeMo transcription pipeline (optional)
+try:
+    from parakeet_pipeline import (
+        is_parakeet_available,
+        _run_parakeet_pipeline_sync,
+    )
+except ImportError:
+    def is_parakeet_available() -> bool:
+        return False
+    _run_parakeet_pipeline_sync = None  # type: ignore[assignment]
+
 # Configuration
 import argparse
+
+
+ALLOWED_TRANSCRIPTION_PIPELINES = {"gemini", "whisperx", "qwen_omnivad", "parakeet"}
+
+
+def _normalize_transcription_pipeline(value: Any, default: str = "gemini") -> str:
+    pipeline = (str(value or "")).strip().lower()
+    return pipeline if pipeline in ALLOWED_TRANSCRIPTION_PIPELINES else default
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -2202,9 +2221,7 @@ async def _build_translation_segments(
                 {"status": "error", "message": str(exc)},
             ) from exc
 
-    transcription_pipeline = (transcription_pipeline or "").strip().lower()
-    if transcription_pipeline not in ("gemini", "whisperx", "qwen_omnivad"):
-        transcription_pipeline = "gemini"
+    transcription_pipeline = _normalize_transcription_pipeline(transcription_pipeline)
     whisperx_proxy_refiner = (
         _coerce_to_bool(whisperx_proxy_refiner)
         and transcription_pipeline == "whisperx"
@@ -2216,6 +2233,7 @@ async def _build_translation_segments(
     # Resolve pipeline label
     use_whisperx = transcription_pipeline == "whisperx"
     use_qwen_omnivad = transcription_pipeline == "qwen_omnivad"
+    use_parakeet = transcription_pipeline == "parakeet"
     (
         qwen_omnivad_enable_diarization,
         qwen_omnivad_diarization_min_seconds,
@@ -2236,6 +2254,8 @@ async def _build_translation_segments(
         pipeline_label = "WhisperX"
     elif use_qwen_omnivad:
         pipeline_label = "Qwen3-ASR + OmniVAD"
+    elif use_parakeet:
+        pipeline_label = "NVIDIA Parakeet"
     else:
         pipeline_label = f"Gemini model '{resolved_gemini_model}'"
 
@@ -2310,6 +2330,32 @@ async def _build_translation_segments(
                 diarization_backend=qwen_omnivad_diarization_backend,
                 diarization_min_seconds=qwen_omnivad_diarization_min_seconds,
                 enable_forced_aligner=qwen_omnivad_enable_forced_aligner,
+            ),
+        )
+    elif use_parakeet:
+        # --- NVIDIA Parakeet NeMo pipeline ---
+        if _run_parakeet_pipeline_sync is None:
+            raise TranslateWorkflowHttpError(
+                500,
+                {"status": "error", "message": "NVIDIA Parakeet pipeline is not installed. Install nemo_toolkit[asr]."},
+            )
+        print(f"[translate] Using NVIDIA Parakeet pipeline for transcription/translation")
+        loop = asyncio.get_event_loop()
+        (
+            gemini_chunks,
+            speaker_profiles,
+            raw_gemini_response_text,
+            gemini_cache_info,
+        ) = await loop.run_in_executor(
+            executor,
+            functools.partial(
+                _run_parakeet_pipeline_sync,
+                processed_audio_bytes,
+                input_mime_type=gemini_mime_type,
+                dest_language=dest_language,
+                enable_translation=translate_enabled,
+                translation_llm_model=resolved_translation_llm_model,
+                force_refresh=force_gemini_regenerate,
             ),
         )
     else:
@@ -4706,8 +4752,7 @@ async def _generate_chunk_audio_from_session(
         or getattr(chunk_session, "transcription_pipeline", None)
         or "qwen_omnivad"
     ).strip().lower()
-    if transcription_pipeline not in ("gemini", "whisperx", "qwen_omnivad"):
-        transcription_pipeline = "gemini"
+    transcription_pipeline = _normalize_transcription_pipeline(transcription_pipeline)
     whisperx_proxy_refiner = (
         _coerce_to_bool(
             whisperx_proxy_refiner
@@ -6864,9 +6909,7 @@ async def _create_translate_session(
         default_emotion_weight,
         DEFAULT_EMOTION_WEIGHT,
     )
-    resolved_transcription_pipeline = (transcription_pipeline or "").strip().lower()
-    if resolved_transcription_pipeline not in ("gemini", "whisperx", "qwen_omnivad"):
-        resolved_transcription_pipeline = "gemini"
+    resolved_transcription_pipeline = _normalize_transcription_pipeline(transcription_pipeline)
     resolved_whisperx_proxy_refiner = (
         _coerce_to_bool(whisperx_proxy_refiner)
         and resolved_transcription_pipeline == "whisperx"
@@ -8891,7 +8934,7 @@ class TranslateRequest(BaseModel):
     )
     transcription_pipeline: Optional[str] = Field(
         default="qwen_omnivad",
-        description="Transcription pipeline to use: 'gemini' (default), 'whisperx', or 'qwen_omnivad' (Qwen3-ASR + OmniVAD).",
+        description="Transcription pipeline to use: 'gemini' (default), 'whisperx', 'qwen_omnivad' (Qwen3-ASR + OmniVAD), or 'parakeet' (NVIDIA Parakeet).",
     )
     whisperx_proxy_refiner: Optional[bool] = Field(
         default=False,
@@ -9066,7 +9109,7 @@ class ChunkBatchGenerateRequest(BaseModel):
     )
     transcription_pipeline: Optional[str] = Field(
         default=None,
-        description="Transcription pipeline to use for selected chunk generation: 'gemini' (default), 'whisperx', or 'qwen_omnivad'.",
+        description="Transcription pipeline to use for selected chunk generation: 'gemini' (default), 'whisperx', 'qwen_omnivad', or 'parakeet'.",
     )
     whisperx_proxy_refiner: Optional[bool] = Field(
         default=None,
@@ -10662,9 +10705,10 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
             payload.transcription_pipeline
             or getattr(config_template, "transcription_pipeline", None)
             or "qwen_omnivad"
-        ).strip().lower()
-        if transcription_pipeline_value not in ("gemini", "whisperx", "qwen_omnivad"):
-            transcription_pipeline_value = "gemini"
+        )
+        transcription_pipeline_value = _normalize_transcription_pipeline(
+            transcription_pipeline_value
+        )
         whisperx_proxy_refiner_flag = (
             _coerce_to_bool(
                 payload.whisperx_proxy_refiner
@@ -10956,7 +11000,7 @@ async def api_translate_segments(
     default_emotion_weight: Optional[float] = Form(None),
     original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
     translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
-    transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), or 'qwen_omnivad' (Qwen3-ASR + OmniVAD)"),
+    transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), 'qwen_omnivad' (Qwen3-ASR + OmniVAD), or 'parakeet' (NVIDIA Parakeet)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
     qwen_omnivad_enable_diarization: Optional[bool] = Form(True, description="Enable diarization for Qwen OmniVAD pipeline."),
     qwen_omnivad_diarization_backend: Optional[str] = Form("auto", description="Qwen OmniVAD diarization backend: auto, pyannote, or sortformer."),
@@ -11175,9 +11219,9 @@ async def api_translate_segments(
             default_emotion_weight_value,
             DEFAULT_EMOTION_WEIGHT,
         )
-        resolved_transcription_pipeline = (transcription_pipeline_value or "").strip().lower()
-        if resolved_transcription_pipeline not in ("gemini", "whisperx", "qwen_omnivad"):
-            resolved_transcription_pipeline = "gemini"
+        resolved_transcription_pipeline = _normalize_transcription_pipeline(
+            transcription_pipeline_value
+        )
         whisperx_proxy_refiner_flag = (
             _coerce_to_bool(whisperx_proxy_refiner_value)
             and resolved_transcription_pipeline == "whisperx"
@@ -12418,7 +12462,7 @@ async def api_translate_audio(
     default_emotion_weight: Optional[float] = Form(None),
     original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
     translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
-    transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), or 'qwen_omnivad' (Qwen3-ASR + OmniVAD)"),
+    transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), 'qwen_omnivad' (Qwen3-ASR + OmniVAD), or 'parakeet' (NVIDIA Parakeet)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
     qwen_omnivad_enable_diarization: Optional[bool] = Form(True, description="Enable diarization for Qwen OmniVAD pipeline."),
     qwen_omnivad_diarization_backend: Optional[str] = Form("auto", description="Qwen OmniVAD diarization backend: auto, pyannote, or sortformer."),
@@ -12579,9 +12623,9 @@ async def api_translate_audio(
             default_emotion_weight_value,
             DEFAULT_EMOTION_WEIGHT,
         )
-        resolved_transcription_pipeline = (transcription_pipeline_value or "").strip().lower()
-        if resolved_transcription_pipeline not in ("gemini", "whisperx", "qwen_omnivad"):
-            resolved_transcription_pipeline = "gemini"
+        resolved_transcription_pipeline = _normalize_transcription_pipeline(
+            transcription_pipeline_value
+        )
         whisperx_proxy_refiner_flag = (
             _coerce_to_bool(whisperx_proxy_refiner_value)
             and resolved_transcription_pipeline == "whisperx"
@@ -13758,6 +13802,7 @@ async def server_info():
                 "speaker_manager": "SpeakerPresetManager",
                 "whisperx_available": is_whisperx_available(),
                 "qwen_omnivad_available": is_qwen_omnivad_available(),
+                "parakeet_available": is_parakeet_available(),
                 "translation_llm_default": DEFAULT_TRANSLATION_LLM_MODEL,
                 "translation_llm_models": list(ALLOWED_TRANSLATION_LLM_MODELS),
             }

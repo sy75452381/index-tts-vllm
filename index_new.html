@@ -1733,9 +1733,10 @@
                                                     <option value="gemini">☁️ Gemini (Cloud)</option>
                                                     <option value="whisperx">🖥️ WhisperX (Local)</option>
                                                     <option value="qwen_omnivad" selected>🎙️ Qwen3-ASR + OmniVAD</option>
+                                                    <option value="parakeet">NVIDIA Parakeet (Local)</option>
                                                 </select>
                                                 <small style="color: var(--text-muted); display: block; margin-top: 4px; font-size: 0.75rem;">
-                                                    Gemini uses Google's API. WhisperX is local. Qwen3-ASR uses long-context ASR with OmniVAD timeline support.
+                                                    Gemini uses Google's API. WhisperX is local. Qwen3-ASR uses long-context ASR with OmniVAD timeline support. Parakeet is fast local NeMo ASR for English and European languages.
                                                 </small>
                                             </div>
                                             <div class="form-group">
@@ -1787,7 +1788,7 @@
                                                     <option value="tencent/HY-MT1.5-1.8B">HY-MT 1.5 1.8B (Local)</option>
                                                 </select>
                                                 <small style="color: var(--text-muted); display: block; margin-top: 4px; font-size: 0.75rem;">
-                                                    Used by WhisperX and Qwen3-ASR local transcription pipelines for batched translation.
+                                                    Used by WhisperX, Qwen3-ASR, and Parakeet local transcription pipelines for batched translation.
                                                 </small>
                                             </div>
                                         </div>
@@ -2351,7 +2352,7 @@ Status: CONTINUE (more chunks) or LAST (final chunk)</div>
                                             <div class="api-param-group">
                                                 <div class="api-param-group-title">Advanced Options</div>
                                                 <div class="api-param"><span class="api-param-name">prompt</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Custom Gemini instructions</span></div>
-                                                <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini', 'whisperx', or 'qwen_omnivad'</span></div>
+                                                <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini', 'whisperx', 'qwen_omnivad', or 'parakeet'</span></div>
                                                 <div class="api-param"><span class="api-param-name">translation_llm_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Translation model: 'lightning-ai/gemma-4-31B-it' (default), 'lightning-ai/gpt-oss-20b', 'lightning-ai/gpt-oss-120b', 'lightning-ai/minimax-m2.5', or 'tencent/HY-MT1.5-1.8B'</span></div>
                                                 <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (default true)</span></div>
@@ -2384,7 +2385,7 @@ Content-Type: audio/mpeg</div>
                                                 <div class="api-param"><span class="api-param-name">audio_file</span> <span class="api-param-type">file</span> <span class="api-param-desc">— Source audio</span></div>
                                                 <div class="api-param"><span class="api-param-name">dest_language</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Target language (required)</span></div>
                                                 <div class="api-param"><span class="api-param-name">translate_text</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— true=translate, false=transcribe only</span></div>
-                                                <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini', 'whisperx', or 'qwen_omnivad'</span></div>
+                                                <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini', 'whisperx', 'qwen_omnivad', or 'parakeet'</span></div>
                                                 <div class="api-param"><span class="api-param-name">translation_llm_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Translation model: 'lightning-ai/gemma-4-31B-it' (default), 'lightning-ai/gpt-oss-20b', 'lightning-ai/gpt-oss-120b', 'lightning-ai/minimax-m2.5', or 'tencent/HY-MT1.5-1.8B'</span></div>
                                                 <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (default true)</span></div>
@@ -2493,7 +2494,7 @@ Content-Type: audio/mpeg</div>
                                                 <div class="api-param-group-title">JSON Body</div>
                                                 <div class="api-param"><span class="api-param-name">chunk_session_ids</span> <span class="api-param-type">array</span> <span class="api-param-desc">— Array of session IDs to process</span></div>
                                                 <div class="api-param"><span class="api-param-name">dest_language</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Target language</span></div>
-                                                <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini', 'whisperx', or 'qwen_omnivad'</span></div>
+                                                <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini', 'whisperx', 'qwen_omnivad', or 'parakeet'</span></div>
                                                 <div class="api-param"><span class="api-param-name">translation_llm_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Translation model: 'lightning-ai/gemma-4-31B-it' (default), 'lightning-ai/gpt-oss-20b', 'lightning-ai/gpt-oss-120b', 'lightning-ai/minimax-m2.5', or 'tencent/HY-MT1.5-1.8B'</span></div>
                                                 <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (inherits session; default true)</span></div>
@@ -3762,7 +3763,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             function updatePipelineVisibility() {
                 const pipelineValue = translateTranscriptionPipeline ? translateTranscriptionPipeline.value : 'gemini';
                 const isWhisperX = pipelineValue === 'whisperx';
-                const isLocalTranslationPipeline = isWhisperX || pipelineValue === 'qwen_omnivad';
+                const isParakeet = pipelineValue === 'parakeet';
+                const isLocalTranslationPipeline = isWhisperX || pipelineValue === 'qwen_omnivad' || isParakeet;
                 const isGemini = pipelineValue === 'gemini';
                 if (translateGeminiSettingsDiv) {
                     translateGeminiSettingsDiv.style.opacity = isGemini ? '1' : '0.4';
@@ -3782,6 +3784,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         ? '🖥️ WhisperX local pipeline — Gemini settings do not apply'
                         : pipelineValue === 'qwen_omnivad'
                             ? '🎙️ Qwen3-ASR + OmniVAD pipeline — Gemini settings do not apply'
+                        : isParakeet
+                            ? 'NVIDIA Parakeet local pipeline - Gemini settings do not apply'
                         : '';
                 }
             }
@@ -3992,6 +3996,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         ? 'WhisperX'
                         : pipelineValue === 'qwen_omnivad'
                             ? 'Qwen3'
+                            : pipelineValue === 'parakeet'
+                                ? 'Parakeet'
                             : 'Gemini';
                 const items = [
                     { label: 'Pipeline', value: pipelineLabel },
@@ -4043,6 +4049,15 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             translateQwenOmniVadEnableForcedAligner.checked
                                 ? 'Aligner'
                                 : 'OmniVAD',
+                    });
+                } else if (pipelineValue === 'parakeet') {
+                    items.push({
+                        label: 'Model',
+                        value: 'Parakeet 0.6B v3',
+                    });
+                    items.push({
+                        label: 'Translate',
+                        value: selectedOptionLabel(translateTranslationLlmModel, 'Gemma 4'),
                     });
                 } else {
                     items.push({
