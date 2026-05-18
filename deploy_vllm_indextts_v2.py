@@ -762,6 +762,7 @@ class IndexTTSVllmServer:
             str(VLLM_PORT),
             "--model_dir",
             "checkpoints",
+            "--use_torch_compile",
         ]
         print(f"Starting FastAPI server: {' '.join(cmd)}")
         self.server_proc = subprocess.Popen(cmd, cwd=str(persistent_app_path))
