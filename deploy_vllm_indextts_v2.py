@@ -1,6 +1,13 @@
 import modal
 import os
 import asyncio
+import json
+import socket
+import subprocess
+import time
+import urllib.error
+import urllib.request
+import uuid
 from typing import List, Dict, Optional
 
 # Use CUDA 12.8.1 as requested
@@ -21,8 +28,9 @@ image = (
         "CXX": "g++",
         "CC": "gcc",
         
-        # PyTorch Memory Optimizations for v2 batch processing
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,expandable_segments:True",
+        # vLLM sleep mode uses its CUDA memory pool; PyTorch expandable
+        # segments are incompatible with that allocator.
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512",
         "TORCH_CUDNN_BENCHMARK": "1",  # Enable cuDNN autotuning
         "TORCH_COMPILE_MODE": "reduce-overhead",  # Optimize for TTS workloads
 
@@ -32,17 +40,15 @@ image = (
         "TRANSFORMERS_CACHE": "/persistent_cache/transformers",
         "CUDA_CACHE_PATH": "/persistent_cache/cuda_cache",
         "VLLM_CACHE": "/persistent_cache/vllm_cache",
-        # vLLM 0.10.x enables FlashInfer sampling by default in the V1 engine.
-        # RTX PRO 6000 Blackwell reports SM 12.x, and FlashInfer's CUDA 12.8
-        # JIT capability check fails there. Keep FlashAttention, but use the
-        # native vLLM sampler.
-        "VLLM_USE_FLASHINFER_SAMPLER": "0",
+        "VLLM_SERVER_DEV_MODE": "1",
+        "TORCHINDUCTOR_COMPILE_THREADS": "1",
+        "TORCH_NCCL_ENABLE_MONITORING": "0"
     })
     .run_commands("pip install --upgrade pip setuptools wheel")
     .pip_install(
         "torch", 
         "torchaudio",
-        extra_options="--index-url https://download.pytorch.org/whl/cu128"
+        extra_options="--index-url https://download.pytorch.org/whl/cu130"
     )
     .pip_install(
         "litai",
@@ -76,6 +82,10 @@ cache_storage = modal.Volume.from_name("indextts-v2-cache", create_if_missing=Tr
 # Configuration
 PERSISTENT_APP_DIR = "/persistent_app"
 PERSISTENT_CACHE_DIR = "/persistent_cache"
+VLLM_PORT = 8000
+SNAPSHOT_STARTUP_TIMEOUT = 1800
+SNAPSHOT_REQUEST_TIMEOUT = 900
+INTERNAL_TOKEN_ENV = "INDEXTTS_INTERNAL_TOKEN"
 
 @app.function(
     image=image,
@@ -446,24 +456,7 @@ def clear_cache():
         "space_freed_mb": total_size_before / (1024 * 1024)
     }
 
-@app.function(
-    image=image,
-    gpu="RTX-PRO-6000",  # 96GB Blackwell; use "L40S" if you want Ada/L40S instead.
-    cpu=4.0,
-    memory=8192,
-    timeout=3600,
-    scaledown_window=600,
-    volumes={
-        PERSISTENT_APP_DIR: app_storage,
-        PERSISTENT_CACHE_DIR: cache_storage
-    },
-    min_containers=0,
-    max_containers=1,
-    secrets=[modal.Secret.from_name("custom-secret")],
-)
-@modal.concurrent(max_inputs=100)  # 100 concurrent requests
-@modal.web_server(port=8000, startup_timeout=600)
-def serve():
+def legacy_serve_without_snapshot():
     """
     Serve the IndexTTS v2 FastAPI application by running python fastapi_webui_v2.py directly.
     """
@@ -492,7 +485,6 @@ def serve():
         "XDG_CACHE_HOME": "/persistent_cache",
         "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
         "TORCHINDUCTOR_AUTOGRAD_CACHE": "1",
-        "VLLM_USE_FLASHINFER_SAMPLER": "0",
     }
     
     print("   Setting environment variables:")
@@ -597,3 +589,222 @@ def serve():
     
     # Start the FastAPI server (this will keep running)
     subprocess.Popen(" ".join(cmd), shell=True, cwd=str(persistent_app_path))
+
+
+def _local_url(path: str) -> str:
+    return f"http://127.0.0.1:{VLLM_PORT}{path}"
+
+
+def _call_local_json(
+    path: str,
+    *,
+    method: str = "GET",
+    timeout: int = 30,
+    payload: Optional[Dict] = None,
+    internal: bool = False,
+) -> Dict:
+    body = None
+    headers = {}
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if internal:
+        headers["X-IndexTTS-Internal-Token"] = os.environ[INTERNAL_TOKEN_ENV]
+
+    request = urllib.request.Request(
+        _local_url(path),
+        data=body,
+        headers=headers,
+        method=method,
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        response_body = response.read().decode("utf-8")
+    return json.loads(response_body) if response_body else {}
+
+
+def _wait_ready(proc: subprocess.Popen, *, timeout_seconds: int) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_error = None
+
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"FastAPI server exited with code {proc.returncode}")
+
+        try:
+            socket.create_connection(("127.0.0.1", VLLM_PORT), timeout=1).close()
+            _call_local_json("/server_info", timeout=10)
+            print("FastAPI server is ready.")
+            return
+        except (OSError, urllib.error.URLError, TimeoutError) as exc:
+            last_error = exc
+            time.sleep(2)
+
+    raise TimeoutError(
+        f"Timed out waiting {timeout_seconds}s for FastAPI server readiness. "
+        f"Last error: {last_error}"
+    )
+
+
+def _configure_persistent_runtime():
+    from pathlib import Path
+
+    print("Starting IndexTTS v2 vLLM FastAPI WebUI with Modal snapshots...")
+
+    cache_env_vars = {
+        "HF_HOME": "/persistent_cache/huggingface",
+        "TORCH_HOME": "/persistent_cache/torch",
+        "TRANSFORMERS_CACHE": "/persistent_cache/transformers",
+        "CUDA_CACHE_PATH": "/persistent_cache/cuda_cache",
+        "VLLM_CACHE": "/persistent_cache/vllm_cache",
+        "TORCHINDUCTOR_CACHE_DIR": "/persistent_cache/torch_compile_cache",
+        "XDG_CACHE_HOME": "/persistent_cache",
+        "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
+        "TORCHINDUCTOR_AUTOGRAD_CACHE": "1",
+        "TORCHINDUCTOR_COMPILE_THREADS": "1",
+        "VLLM_SERVER_DEV_MODE": "1",
+        "INDEXTTS_ENABLE_VLLM_SLEEP_MODE": "1",
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512",
+        "TORCH_NCCL_ENABLE_MONITORING": "0"
+    }
+
+    print("Configuring persistent cache environment:")
+    for key, value in cache_env_vars.items():
+        os.environ[key] = value
+        print(f"  {key}={value}")
+
+    cache_dirs = [
+        "/persistent_cache/huggingface",
+        "/persistent_cache/torch",
+        "/persistent_cache/transformers",
+        "/persistent_cache/cuda_cache",
+        "/persistent_cache/vllm_cache",
+        "/persistent_cache/torch_compile_cache",
+    ]
+    for cache_dir in cache_dirs:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    local_cache_map = {
+        "/root/.cache/huggingface": "/persistent_cache/huggingface",
+        "/root/.cache/torch": "/persistent_cache/torch",
+        "/root/.cache/transformers": "/persistent_cache/transformers",
+        "/root/.cache/vllm": "/persistent_cache/vllm_cache",
+    }
+    for local_path, persistent_path in local_cache_map.items():
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        if os.path.exists(local_path):
+            if os.path.islink(local_path) or os.path.isfile(local_path):
+                os.unlink(local_path)
+            else:
+                import shutil
+
+                shutil.rmtree(local_path)
+        os.symlink(persistent_path, local_path)
+        print(f"  cache link: {local_path} -> {persistent_path}")
+
+    persistent_app_path = Path(PERSISTENT_APP_DIR)
+    if not persistent_app_path.exists():
+        raise FileNotFoundError(
+            f"Application not found at {persistent_app_path}. Run prepare_model first."
+        )
+
+    checkpoints_dir = persistent_app_path / "checkpoints"
+    if not checkpoints_dir.exists():
+        raise FileNotFoundError(f"Checkpoints missing at {checkpoints_dir}")
+
+    os.chdir(str(persistent_app_path))
+    os.environ["PYTHONPATH"] = str(persistent_app_path)
+
+    voice_design_model_path = checkpoints_dir / "Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    if voice_design_model_path.exists():
+        os.environ["QWEN3_VOICE_DESIGN_MODEL"] = str(voice_design_model_path)
+
+    if not os.environ.get(INTERNAL_TOKEN_ENV):
+        os.environ[INTERNAL_TOKEN_ENV] = uuid.uuid4().hex
+
+    print(f"Working directory: {os.getcwd()}")
+    print(f"PYTHONPATH: {os.environ['PYTHONPATH']}")
+    return persistent_app_path
+
+
+@app.cls(
+    image=image,
+    gpu="RTX-PRO-6000",  # 96GB Blackwell; use "L40S" if you want Ada/L40S instead.
+    cpu=4.0,
+    memory=32768,
+    timeout=3600,
+    scaledown_window=600,
+    volumes={
+        PERSISTENT_APP_DIR: app_storage,
+        PERSISTENT_CACHE_DIR: cache_storage,
+    },
+    min_containers=0,
+    max_containers=1,
+    secrets=[modal.Secret.from_name("custom-secret")],
+    enable_memory_snapshot=True,
+    experimental_options={"enable_gpu_snapshot": True},
+)
+@modal.concurrent(max_inputs=100)  # 100 concurrent requests
+class IndexTTSVllmServer:
+    """
+    Serve IndexTTS v2 through FastAPI, with Modal CPU+GPU memory snapshots.
+    """
+
+    @modal.enter(snap=True)
+    def start(self):
+        persistent_app_path = _configure_persistent_runtime()
+
+        cmd = [
+            "python",
+            "fastapi_webui_v2.py",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(VLLM_PORT),
+            "--model_dir",
+            "checkpoints",
+        ]
+        print(f"Starting FastAPI server: {' '.join(cmd)}")
+        self.server_proc = subprocess.Popen(cmd, cwd=str(persistent_app_path))
+
+        _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
+
+        print("Running snapshot warmup inference...")
+        _call_local_json(
+            "/internal/snapshot/warmup",
+            method="POST",
+            timeout=SNAPSHOT_REQUEST_TIMEOUT,
+            internal=True,
+        )
+
+        print("Putting vLLM engines into sleep mode before snapshot...")
+        _call_local_json(
+            "/internal/snapshot/sleep?level=1",
+            method="POST",
+            timeout=SNAPSHOT_REQUEST_TIMEOUT,
+            internal=True,
+        )
+
+    @modal.enter(snap=False)
+    def wake_up(self):
+        print("Waking vLLM engines after memory snapshot restore...")
+        _call_local_json(
+            "/internal/snapshot/wake",
+            method="POST",
+            timeout=SNAPSHOT_REQUEST_TIMEOUT,
+            internal=True,
+        )
+        _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
+
+    @modal.web_server(port=VLLM_PORT, startup_timeout=SNAPSHOT_STARTUP_TIMEOUT)
+    def serve(self):
+        pass
+
+    @modal.exit()
+    def stop(self):
+        proc = getattr(self, "server_proc", None)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()

@@ -8613,6 +8613,31 @@ class TTSManager:
         if not self._initialized or self.tts is None:
             raise Exception("IndexTTS2 not initialized")
         return self.tts
+
+    async def sleep_for_snapshot(self, level: int = 1):
+        tts = self.get_tts()
+        if not hasattr(tts, "sleep_vllm"):
+            raise RuntimeError("IndexTTS2 does not expose vLLM sleep hooks")
+        await tts.sleep_vllm(level=level)
+
+    async def wake_from_snapshot(self):
+        tts = self.get_tts()
+        if not hasattr(tts, "wake_vllm"):
+            raise RuntimeError("IndexTTS2 does not expose vLLM wake hooks")
+        await tts.wake_vllm()
+        self.refresh_post_snapshot_state()
+
+    def refresh_post_snapshot_state(self):
+        if self.tts is not None and hasattr(self.tts, "clear_runtime_caches"):
+            self.tts.clear_runtime_caches()
+
+        if self.speaker_manager is not None and hasattr(self.speaker_manager, "_load_presets"):
+            self.speaker_manager.presets = self.speaker_manager._load_presets()
+            if hasattr(self.speaker_manager, "_memory_cache"):
+                valid_names = set(self.speaker_manager.presets.keys())
+                for preset_name in list(self.speaker_manager._memory_cache.keys()):
+                    if preset_name not in valid_names:
+                        del self.speaker_manager._memory_cache[preset_name]
     
     def is_ready(self):
         return self._initialized and self.tts is not None
@@ -9406,6 +9431,37 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+
+def _require_internal_snapshot_token(request: Request) -> None:
+    expected_token = os.environ.get("INDEXTTS_INTERNAL_TOKEN")
+    provided_token = request.headers.get("X-IndexTTS-Internal-Token")
+    if not expected_token or provided_token != expected_token:
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+@app.post("/internal/snapshot/warmup")
+async def internal_snapshot_warmup(request: Request):
+    _require_internal_snapshot_token(request)
+    if not tts_manager.is_ready():
+        raise HTTPException(status_code=503, detail="IndexTTS2 is not initialized")
+    await warmup_model()
+    tts_manager.refresh_post_snapshot_state()
+    return JSONResponse(content={"status": "ok", "action": "warmup"})
+
+
+@app.post("/internal/snapshot/sleep")
+async def internal_snapshot_sleep(request: Request, level: int = Query(1, ge=1, le=2)):
+    _require_internal_snapshot_token(request)
+    await tts_manager.sleep_for_snapshot(level=level)
+    return JSONResponse(content={"status": "ok", "action": "sleep", "level": level})
+
+
+@app.post("/internal/snapshot/wake")
+async def internal_snapshot_wake(request: Request):
+    _require_internal_snapshot_token(request)
+    await tts_manager.wake_from_snapshot()
+    return JSONResponse(content={"status": "ok", "action": "wake"})
 
 # Web Interface - HTML file path for hot reload support
 _HTML_UI_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index_new.html")
