@@ -4,9 +4,9 @@ import asyncio
 from typing import List, Dict, Optional
 
 # Use CUDA 12.8.1 as requested
-cuda_version = "12.8.1"
+cuda_version = "13.0.0"
 flavor = "devel" 
-operating_sys = "ubuntu22.04"
+operating_sys = "ubuntu24.04"
 tag = f"{cuda_version}-{flavor}-{operating_sys}"
 
 # Create Modal image for IndexTTS v2 with vLLM optimization
@@ -16,7 +16,7 @@ image = (
     .env({
         "CUDA_HOME": "/usr/local/cuda",
         "CUDA_PATH": "/usr/local/cuda", 
-        "TORCH_CUDA_ARCH_LIST": "6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0",
+        "TORCH_CUDA_ARCH_LIST": "6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0;12.0",
         "FORCE_CUDA": "1",
         "CXX": "g++",
         "CC": "gcc",
@@ -31,7 +31,12 @@ image = (
         "TORCH_HOME": "/persistent_cache/torch", 
         "TRANSFORMERS_CACHE": "/persistent_cache/transformers",
         "CUDA_CACHE_PATH": "/persistent_cache/cuda_cache",
-        "VLLM_CACHE": "/persistent_cache/vllm_cache"
+        "VLLM_CACHE": "/persistent_cache/vllm_cache",
+        # vLLM 0.10.x enables FlashInfer sampling by default in the V1 engine.
+        # RTX PRO 6000 Blackwell reports SM 12.x, and FlashInfer's CUDA 12.8
+        # JIT capability check fails there. Keep FlashAttention, but use the
+        # native vLLM sampler.
+        "VLLM_USE_FLASHINFER_SAMPLER": "0",
     })
     .run_commands("pip install --upgrade pip setuptools wheel")
     .pip_install(
@@ -41,7 +46,8 @@ image = (
     )
     .pip_install(
         "litai",
-        "whisperx"
+        "whisperx",
+        "nemo_toolkit[asr]",
         "json-repair"
     )
     .run_commands(
@@ -57,6 +63,8 @@ image = (
     .run_commands("pip install flash-attn --no-build-isolation")
     .run_commands("pip install audio-separator")
     .run_commands("pip install clearvoice google-genai")
+    .run_commands("pip install qwen-asr omnivad")
+    .pip_install("numpy<2")
 )
 
 app = modal.App("vllm-indextts-v2", image=image)
@@ -440,7 +448,7 @@ def clear_cache():
 
 @app.function(
     image=image,
-    gpu="L40s",  # L40S as requested
+    gpu="RTX-PRO-6000",  # 96GB Blackwell; use "L40S" if you want Ada/L40S instead.
     cpu=4.0,
     memory=8192,
     timeout=3600,
@@ -483,7 +491,8 @@ def serve():
         "TORCHINDUCTOR_CACHE_DIR": "/persistent_cache/torch_compile_cache",
         "XDG_CACHE_HOME": "/persistent_cache",
         "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
-        "TORCHINDUCTOR_AUTOGRAD_CACHE": "1"
+        "TORCHINDUCTOR_AUTOGRAD_CACHE": "1",
+        "VLLM_USE_FLASHINFER_SAMPLER": "0",
     }
     
     print("   Setting environment variables:")
