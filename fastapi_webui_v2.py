@@ -2531,6 +2531,7 @@ async def _build_translation_segments(
         "gemini_model": resolved_gemini_model,
         "translation_llm_model": resolved_translation_llm_model,
         "transcription_pipeline": transcription_pipeline,
+        "transcription_pipeline_label": pipeline_label if transcription_pipeline != "gemini" else "Gemini",
         "whisperx_proxy_refiner": whisperx_proxy_refiner,
         "qwen_omnivad_enable_diarization": qwen_omnivad_enable_diarization,
         "qwen_omnivad_diarization_backend": qwen_omnivad_diarization_backend,
@@ -3460,8 +3461,18 @@ def _json_event_bytes(event: Dict[str, Any]) -> bytes:
     return (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+JSON_STREAM_RESPONSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "X-Accel-Buffering": "no",
+}
+
+
 def _json_stream_response(iterator: Any) -> StreamingResponse:
-    return StreamingResponse(iterator, media_type="application/json")
+    return StreamingResponse(
+        iterator,
+        media_type="application/x-ndjson",
+        headers=JSON_STREAM_RESPONSE_HEADERS,
+    )
 
 
 async def _read_optional_json_payload(

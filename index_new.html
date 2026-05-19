@@ -3998,6 +3998,45 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 return value || fallback;
             }
 
+            function getTranscriptionPipelineLabel(pipelineValue) {
+                switch (pipelineValue) {
+                    case 'whisperx':
+                        return 'WhisperX';
+                    case 'qwen_omnivad':
+                        return 'Qwen3-ASR + OmniVAD';
+                    case 'parakeet':
+                        return 'NVIDIA Parakeet';
+                    case 'gemini':
+                        return 'Gemini';
+                    default:
+                        return pipelineValue || 'Gemini';
+                }
+            }
+
+            function buildTranslationCompleteMessage(metadata = {}) {
+                let statusMessage = '✅ Translation complete!';
+                if (typeof metadata.segment_count === 'number') {
+                    statusMessage += ` (${metadata.segment_count} segments)`;
+                }
+
+                const pipelineValue =
+                    metadata.transcription_pipeline ||
+                    (translateTranscriptionPipeline ? translateTranscriptionPipeline.value : 'gemini');
+                if (pipelineValue && pipelineValue !== 'gemini') {
+                    const pipelineLabel =
+                        metadata.transcription_pipeline_label ||
+                        getTranscriptionPipelineLabel(pipelineValue);
+                    statusMessage += ` • Pipeline: ${pipelineLabel}`;
+                    if (metadata.translation_llm_model) {
+                        statusMessage += ` • Translation model: ${metadata.translation_llm_model}`;
+                    }
+                } else if (metadata.gemini_model) {
+                    statusMessage += ` • Gemini model: ${metadata.gemini_model}`;
+                }
+
+                return statusMessage;
+            }
+
             function renderStepSummary(container, items) {
                 if (!container) {
                     return;
@@ -7656,14 +7695,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                                 </div>
                             `;
 
-                            let statusMessage = '✅ Translation complete!';
                             const metadata = eventData.metadata || {};
-                            if (typeof metadata.segment_count === 'number') {
-                                statusMessage += ` (${metadata.segment_count} segments)`;
-                            }
-                            if (metadata.gemini_model) {
-                                statusMessage += ` • Gemini model: ${metadata.gemini_model}`;
-                            }
+                            const statusMessage = buildTranslationCompleteMessage(metadata);
                             showStatus(statusMessage, 'success', statusId);
                             applyChunkGenerationMetadata(metadata, audioUrl);
                             autoApplyTranslateMetadata(metadata, metadata.session_id || null);
