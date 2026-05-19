@@ -3457,8 +3457,19 @@ def _request_has_json_body(request: Request) -> bool:
     return "application/json" in request.headers.get("content-type", "").lower()
 
 
+JSON_STREAM_MIN_CHUNK_BYTES = 2048
+
+
 def _json_event_bytes(event: Dict[str, Any]) -> bytes:
-    return (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+    event_payload = event
+    encoded = json.dumps(event_payload, ensure_ascii=False)
+    if len(encoded.encode("utf-8")) < JSON_STREAM_MIN_CHUNK_BYTES:
+        event_payload = dict(event)
+        event_payload["_flush_padding"] = "0" * (
+            JSON_STREAM_MIN_CHUNK_BYTES - len(encoded.encode("utf-8"))
+        )
+        encoded = json.dumps(event_payload, ensure_ascii=False)
+    return (f"data: {encoded}\n\n").encode("utf-8")
 
 
 JSON_STREAM_RESPONSE_HEADERS = {
@@ -3467,10 +3478,21 @@ JSON_STREAM_RESPONSE_HEADERS = {
 }
 
 
+async def _json_stream_with_prelude(iterator: Any):
+    yield _json_event_bytes(
+        {
+            "event": "stream_open",
+            "timestamp": time.time(),
+        }
+    )
+    async for chunk in iterator:
+        yield chunk
+
+
 def _json_stream_response(iterator: Any) -> StreamingResponse:
     return StreamingResponse(
-        iterator,
-        media_type="application/x-ndjson",
+        _json_stream_with_prelude(iterator),
+        media_type="text/event-stream",
         headers=JSON_STREAM_RESPONSE_HEADERS,
     )
 

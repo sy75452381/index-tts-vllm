@@ -4013,6 +4013,20 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 }
             }
 
+            function parseJsonStreamEventLine(line) {
+                const trimmed = (line || '').trim();
+                if (!trimmed || trimmed.startsWith(':')) {
+                    return null;
+                }
+                const jsonText = trimmed.startsWith('data:')
+                    ? trimmed.slice(5).trimStart()
+                    : trimmed;
+                if (!jsonText || jsonText === '[DONE]') {
+                    return null;
+                }
+                return JSON.parse(jsonText);
+            }
+
             function buildTranslationCompleteMessage(metadata = {}) {
                 let statusMessage = '✅ Translation complete!';
                 if (typeof metadata.segment_count === 'number') {
@@ -4869,9 +4883,12 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             }
                             let eventData;
                             try {
-                                eventData = JSON.parse(line);
+                                eventData = parseJsonStreamEventLine(line);
                             } catch (parseError) {
                                 console.warn('Failed to parse chunk batch event:', parseError, line);
+                                continue;
+                            }
+                            if (!eventData) {
                                 continue;
                             }
                             const eventType = eventData.event || 'status';
@@ -5250,9 +5267,12 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         }
                         let eventData;
                         try {
-                            eventData = JSON.parse(line);
+                            eventData = parseJsonStreamEventLine(line);
                         } catch (parseError) {
                             console.warn('Failed to parse split event:', parseError, line);
+                            continue;
+                        }
+                        if (!eventData) {
                             continue;
                         }
                         const eventType = eventData.event || 'status';
@@ -7633,9 +7653,12 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
 
                         let eventData;
                         try {
-                            eventData = JSON.parse(line);
+                            eventData = parseJsonStreamEventLine(line);
                         } catch (parseError) {
                             console.warn('Failed to parse translate event:', parseError, line);
+                            continue;
+                        }
+                        if (!eventData) {
                             continue;
                         }
 
@@ -7841,9 +7864,12 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
 
                         let eventData;
                         try {
-                            eventData = JSON.parse(line);
+                            eventData = parseJsonStreamEventLine(line);
                         } catch (parseError) {
                             console.warn('Failed to parse segment stream event:', parseError, line);
+                            continue;
+                        }
+                        if (!eventData) {
                             continue;
                         }
 
@@ -8034,9 +8060,12 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
 
                         let eventData;
                         try {
-                            eventData = JSON.parse(line);
+                            eventData = parseJsonStreamEventLine(line);
                         } catch (parseError) {
                             console.warn('Failed to parse generate event:', parseError, line);
+                            continue;
+                        }
+                        if (!eventData) {
                             continue;
                         }
 
