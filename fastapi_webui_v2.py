@@ -54,6 +54,23 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 import copy
 from dataclasses import dataclass, field
 
+# yt_dlp is imported lazily via _ensure_yt_dlp() to prevent its compat_utils
+# module patching from interfering with torch.compile / torch._inductor code
+# hashing (causes ModuleNotFoundError: No module named 'no_Cryptodome').
+yt_dlp = None
+
+
+def _ensure_yt_dlp():
+    """Lazily import yt_dlp on first use and return the module (or None)."""
+    global yt_dlp
+    if yt_dlp is None:
+        try:
+            import yt_dlp as _yt_dlp  # type: ignore[import]
+            yt_dlp = _yt_dlp
+        except ImportError:
+            pass
+    return yt_dlp
+
 
 # Audio processing
 import numpy as np
@@ -89,6 +106,29 @@ from urllib.parse import quote
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
 sys.path.insert(0, os.path.join(current_dir, "indextts"))
+
+
+def _load_project_env_files() -> None:
+    """Load simple KEY=VALUE entries from project .env files without overriding env."""
+    for env_path in (Path(current_dir) / ".env", Path(current_dir) / ".env.local"):
+        if not env_path.exists():
+            continue
+        try:
+            with open(env_path, "r", encoding="utf-8") as fh:
+                for raw_line in fh:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+        except Exception as exc:
+            print(f"Warning: failed to load {env_path}: {exc}")
+
+
+_load_project_env_files()
 
 from indextts.infer_vllm_v2 import IndexTTS2
 from speaker_preset_manager import SpeakerPresetManager, initialize_preset_manager
@@ -2189,6 +2229,8 @@ async def _build_translation_segments(
     source_chunk_session: Optional[TranslateSessionData] = None,
     source_audio_filename: Optional[str] = None,
     source_base_name: Optional[str] = None,
+    source_video_path: Optional[str] = None,
+    source_video_filename: Optional[str] = None,
     force_gemini_regenerate: bool = False,
     initial_speaker_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     default_speaker_preset: Optional[str] = None,
@@ -2489,6 +2531,8 @@ async def _build_translation_segments(
         backing_track_source=backing_track_source,
         source_audio_filename=source_audio_filename,
         source_base_name=source_base_name,
+        source_video_path=source_video_path,
+        source_video_filename=source_video_filename,
         default_speaker_preset=normalized_default_speaker,
         default_emotion_weight=normalized_default_emotion,
         # Pass cached paths for fast session storage
@@ -2571,6 +2615,7 @@ async def _build_translation_segments(
         "manual_segments": manual_segments_used,
         "force_gemini_regenerate": force_gemini_regenerate,
     }
+    _apply_source_video_metadata(metadata, session)
     if gemini_cache_info:
         metadata["gemini_cache"] = gemini_cache_info
     chunk_reference = source_chunk_session if source_chunk_session else (session if session.chunk_parent_id else None)
@@ -2648,6 +2693,8 @@ class TranslateSessionData:
     qwen_omnivad_merge_gap_seconds: float = DEFAULT_QWEN_OMNIVAD_MERGE_GAP_SECONDS
     source_audio_filename: Optional[str] = None
     source_base_name: Optional[str] = None
+    source_video_path: Optional[str] = None
+    source_video_filename: Optional[str] = None
     original_audio_path: Optional[str] = None
     original_audio_info: Optional[AudioAssetInfo] = None
     backing_track_path: Optional[str] = None
@@ -3393,6 +3440,8 @@ _OUTPUT_SUBDIRS = (
     "clearvoice_cache",
     "translate_session_media",
     "split_audio_cache",
+    "downloaded_videos",
+    "downloaded_video_audio",
 )
 
 
@@ -3420,6 +3469,12 @@ TRANSLATE_OUTPUT_DIR = str((ROOT_OUTPUT_DIR / "translate_results").resolve())
 os.makedirs(TRANSLATE_OUTPUT_DIR, exist_ok=True)
 TRANSLATE_SESSION_MEDIA_DIR = str((ROOT_OUTPUT_DIR / "translate_session_media").resolve())
 os.makedirs(TRANSLATE_SESSION_MEDIA_DIR, exist_ok=True)
+VIDEO_DOWNLOAD_DIR = str((ROOT_OUTPUT_DIR / "downloaded_videos").resolve())
+os.makedirs(VIDEO_DOWNLOAD_DIR, exist_ok=True)
+VIDEO_AUDIO_CACHE_DIR = str((ROOT_OUTPUT_DIR / "downloaded_video_audio").resolve())
+os.makedirs(VIDEO_AUDIO_CACHE_DIR, exist_ok=True)
+COOKIES_DIR = str((ROOT_OUTPUT_DIR / "cookies").resolve())
+os.makedirs(COOKIES_DIR, exist_ok=True)
 CLEARVOICE_CACHE_DIR = str((ROOT_OUTPUT_DIR / "clearvoice_cache").resolve())
 os.makedirs(CLEARVOICE_CACHE_DIR, exist_ok=True)
 AUDIO_SEPARATOR_CACHE_DIR = str((ROOT_OUTPUT_DIR / "audio_separator_cache").resolve())
@@ -3437,8 +3492,24 @@ def _guess_media_type_from_extension(filename: str) -> str:
     mapping = {
         **AUDIO_MEDIA_TYPES,
         "srt": "application/x-subrip",
+        "mp4": "video/mp4",
+        "m4v": "video/mp4",
+        "mov": "video/quicktime",
+        "webm": "video/webm",
+        "mkv": "video/x-matroska",
     }
     return mapping.get(ext, "application/octet-stream")
+
+
+def _clean_ytdl_error(exc: Exception) -> str:
+    msg = str(exc)
+    msg = re.sub(r'\x1b\[[0-9;]*m', '', msg)  # Remove ANSI codes
+    msg = msg.replace('ERROR:', '').strip()
+    return msg
+
+
+def _is_ytdl_format_unavailable_error(exc: Exception) -> bool:
+    return "requested format is not available" in _clean_ytdl_error(exc).lower()
 
 
 def _status_error(message: str, status_code: int = 400, **extra: Any) -> JSONResponse:
@@ -4567,6 +4638,8 @@ def _session_to_manifest(session: TranslateSessionData) -> Dict[str, Any]:
         "qwen_omnivad_merge_gap_seconds": session.qwen_omnivad_merge_gap_seconds,
         "source_audio_filename": session.source_audio_filename,
         "source_base_name": session.source_base_name,
+        "source_video_path": session.source_video_path,
+        "source_video_filename": session.source_video_filename,
         "original_audio_path": session.original_audio_path,
         "original_audio_info": session.original_audio_info.to_dict() if session.original_audio_info else None,
         "backing_track_path": session.backing_track_path,
@@ -4647,6 +4720,8 @@ async def _rehydrate_session_from_manifest(manifest: Dict[str, Any]) -> Translat
         chunk_silence_midpoint_ms=manifest.get("chunk_silence_midpoint_ms"),
         source_audio_filename=manifest.get("source_audio_filename"),
         source_base_name=manifest.get("source_base_name"),
+        source_video_path=manifest.get("source_video_path"),
+        source_video_filename=manifest.get("source_video_filename"),
         default_speaker_preset=manifest.get("default_speaker_preset"),
         default_emotion_weight=manifest.get("default_emotion_weight"),
         original_audio_path=manifest.get("original_audio_path"),
@@ -6981,6 +7056,8 @@ async def _create_translate_session(
     media_format: str = "mp3",
     source_audio_filename: Optional[str] = None,
     source_base_name: Optional[str] = None,
+    source_video_path: Optional[str] = None,
+    source_video_filename: Optional[str] = None,
     default_speaker_preset: Optional[str] = None,
     default_emotion_weight: Optional[float] = None,
     original_audio_path: Optional[str] = None,
@@ -7109,6 +7186,8 @@ async def _create_translate_session(
         qwen_omnivad_merge_gap_seconds=resolved_qwen_omnivad_merge_gap_seconds,
         source_audio_filename=source_audio_filename,
         source_base_name=resolved_base_name,
+        source_video_path=source_video_path,
+        source_video_filename=source_video_filename,
         original_audio_path=audio_path,
         original_audio_info=audio_info,
         backing_track_path=backing_path,
@@ -7579,6 +7658,729 @@ def _run_ffmpeg_command(cmd: List[str]) -> None:
             f"ffmpeg failed (code {process.returncode})\ncmd: {cmd_str}\n"
             f"stderr: {stderr or '<empty>'}\nstdout: {stdout or '<empty>'}"
         )
+
+
+VIDEO_DOWNLOAD_EXTENSIONS = {"mp4", "mkv", "webm", "mov", "m4v"}
+VIDEO_DOWNLOAD_FORMATS = {
+    "best": "bestvideo*+bestaudio/bestvideo+bestaudio/best",
+    "2160p": "bestvideo*[height<=2160]+bestaudio/bestvideo[height<=2160]+bestaudio/best[height<=2160]/best",
+    "1440p": "bestvideo*[height<=1440]+bestaudio/bestvideo[height<=1440]+bestaudio/best[height<=1440]/best",
+    "1080p": "bestvideo*[height<=1080]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+    "720p": "bestvideo*[height<=720]+bestaudio/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+    "480p": "bestvideo*[height<=480]+bestaudio/bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+    "360p": "bestvideo*[height<=360]+bestaudio/bestvideo[height<=360]+bestaudio/best[height<=360]/best",
+    "worst": "worstvideo*+worstaudio/worst",
+}
+
+
+def _dedupe_preserving_order(values: List[Optional[str]]) -> List[Optional[str]]:
+    seen: Set[Optional[str]] = set()
+    result: List[Optional[str]] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _video_download_format_fallbacks(format_selector: str, quality_key: str) -> List[Optional[str]]:
+    """Return format selectors from most-specific to safest."""
+    candidates: List[Optional[str]] = [format_selector]
+    if quality_key in VIDEO_DOWNLOAD_FORMATS:
+        height_match = re.fullmatch(r"(\d+)p", quality_key)
+        if height_match:
+            height = height_match.group(1)
+            candidates.extend(
+                [
+                    f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best",
+                    f"bestvideo*[height<={height}]/best[height<={height}]/best",
+                ]
+            )
+        elif quality_key == "best":
+            candidates.extend(["bestvideo+bestaudio/best", "bestvideo*/best"])
+        elif quality_key == "worst":
+            candidates.extend(["worstvideo+worstaudio/worst", "worstvideo*/worst"])
+    else:
+        candidates.append("bestvideo+bestaudio/best")
+    candidates.extend(["best", None])
+    return _dedupe_preserving_order(candidates)
+
+
+def _ytdlp_setup_hint() -> str:
+    return (
+        "YouTube currently requires yt-dlp's external JavaScript challenge solver setup. "
+        "Upgrade with `pip install -U \"yt-dlp[default]\"`, install a supported JS runtime "
+        "such as Deno or Node, enable that runtime for the yt-dlp Python API, and use a "
+        "running PO Token provider for affected YouTube videos."
+    )
+
+
+def _ytdlp_auth_hint() -> str:
+    return (
+        "YouTube is asking this server to sign in. Import fresh youtube.com cookies exported from "
+        "a private/incognito YouTube session, then retry. For CLI verification, pass the same file "
+        "with `--cookies /path/to/youtube_com_cookies.txt`."
+    )
+
+
+def _yt_dlp_common_opts() -> Dict[str, Any]:
+    opts: Dict[str, Any] = {}
+    js_runtimes: Dict[str, Dict[str, str]] = {}
+    configured_runtimes = (os.environ.get("YTDLP_JS_RUNTIMES") or "").strip()
+    configured_node = (os.environ.get("YTDLP_NODE_PATH") or os.environ.get("NODE_BINARY") or "").strip()
+
+    def find_executable(name: str) -> Optional[str]:
+        found = shutil.which(name)
+        if found:
+            return found
+        # Uvicorn services often have a thinner PATH than an interactive shell.
+        # Ask a login shell as a last resort so it can see nvm/homebrew setup.
+        try:
+            process = subprocess.run(
+                ["bash", "-lc", f"command -v {name}"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            candidate = (process.stdout or "").strip().splitlines()[0] if process.stdout.strip() else ""
+            if candidate and os.path.exists(candidate):
+                return candidate
+        except Exception:
+            pass
+        if name == "node":
+            try:
+                process = subprocess.run(
+                    ["bash", "-lc", "node -p 'process.execPath'"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                candidate = (process.stdout or "").strip().splitlines()[0] if process.stdout.strip() else ""
+                if candidate and os.path.exists(candidate):
+                    return candidate
+            except Exception:
+                pass
+        if name == "node":
+            node_candidates: List[str] = []
+            home = Path.home()
+            node_candidates.extend(str(path) for path in (home / ".nvm" / "versions" / "node").glob("*/bin/node"))
+            node_candidates.extend(str(path) for path in Path("/home").glob("*/.nvm/versions/node/*/bin/node"))
+            node_candidates.extend(
+                [
+                    "/usr/local/bin/node",
+                    "/usr/bin/node",
+                    "/snap/bin/node",
+                    "/opt/node/bin/node",
+                    "/home/linuxbrew/.linuxbrew/bin/node",
+                ]
+            )
+            existing = [path for path in node_candidates if os.path.exists(path)]
+            if existing:
+                existing.sort(reverse=True)
+                return existing[0]
+        return None
+
+    runtime_paths = {
+        "node": configured_node if configured_node and os.path.exists(configured_node) else find_executable("node"),
+        "deno": find_executable("deno"),
+        "bun": find_executable("bun"),
+        "quickjs": find_executable("qjs") or find_executable("quickjs"),
+    }
+    if configured_runtimes:
+        runtime_items: List[Tuple[str, Optional[str]]] = []
+        for item in configured_runtimes.split(","):
+            runtime_spec = item.strip()
+            if not runtime_spec:
+                continue
+            name, _, explicit_path = runtime_spec.partition(":")
+            runtime_items.append((name.strip(), explicit_path.strip() or runtime_paths.get(name.strip())))
+    elif runtime_paths.get("node"):
+        # Mirror the known-good CLI path: --js-runtimes node.
+        runtime_items = [("node", runtime_paths["node"])]
+    else:
+        runtime_items = [(name, path) for name, path in runtime_paths.items()]
+
+    for runtime, executable in runtime_items:
+        if runtime and executable:
+            js_runtimes[runtime] = {"executable": executable}
+    if js_runtimes:
+        opts["js_runtimes"] = js_runtimes
+
+    remote_components = [
+        item.strip()
+        for item in (os.environ.get("YTDLP_REMOTE_COMPONENTS") or "").split(",")
+        if item.strip()
+    ]
+    if remote_components:
+        opts["remote_components"] = set(remote_components)
+    return opts
+
+
+def _raw_format_is_direct(fmt: Dict[str, Any]) -> bool:
+    protocol = str(fmt.get("protocol") or "").lower()
+    ext = str(fmt.get("ext") or "").lower()
+    if not fmt.get("url") or fmt.get("has_drm"):
+        return False
+    if protocol in {"mhtml", "storyboard"} or ext in {"mhtml", "json"}:
+        return False
+    return True
+
+
+def _raw_format_score(fmt: Dict[str, Any]) -> Tuple[int, float, float, int]:
+    height = int(fmt.get("height") or 0)
+    tbr = float(fmt.get("tbr") or 0)
+    fps = float(fmt.get("fps") or 0)
+    size = int(fmt.get("filesize") or fmt.get("filesize_approx") or 0)
+    return (height, tbr, fps, size)
+
+
+def _extract_format_ids_from_selector(selector: str) -> List[str]:
+    tokens = re.split(r"[+/]", selector or "")
+    ids: List[str] = []
+    for token in tokens:
+        token = token.strip()
+        if not token or token.startswith("best") or token.startswith("worst"):
+            continue
+        token = re.sub(r"\[.*$", "", token).strip()
+        if token:
+            ids.append(token)
+    return ids
+
+
+def _select_raw_video_formats(
+    raw_info: Dict[str, Any],
+    quality_key: str,
+    format_selector: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    raw_formats = [fmt for fmt in (raw_info.get("formats") or []) if isinstance(fmt, dict) and _raw_format_is_direct(fmt)]
+    by_id = {str(fmt.get("format_id")): fmt for fmt in raw_formats if fmt.get("format_id") is not None}
+    audio_formats = [
+        fmt for fmt in raw_formats
+        if (fmt.get("acodec") or "none") != "none" and (fmt.get("vcodec") or "none") == "none"
+    ]
+    audio_formats.sort(key=_raw_format_score, reverse=True)
+
+    for format_id in _extract_format_ids_from_selector(format_selector):
+        fmt = by_id.get(format_id)
+        if not fmt or (fmt.get("vcodec") or "none") == "none":
+            continue
+        if (fmt.get("acodec") or "none") != "none":
+            return fmt, None
+        return fmt, audio_formats[0] if audio_formats else None
+
+    height_limit: Optional[int] = None
+    height_match = re.fullmatch(r"(\d+)p", quality_key)
+    if height_match:
+        height_limit = int(height_match.group(1))
+
+    video_formats = [fmt for fmt in raw_formats if (fmt.get("vcodec") or "none") != "none"]
+    if height_limit:
+        limited = [fmt for fmt in video_formats if int(fmt.get("height") or 0) <= height_limit]
+        if limited:
+            video_formats = limited
+    reverse = quality_key != "worst"
+    combined_formats = [fmt for fmt in video_formats if (fmt.get("acodec") or "none") != "none"]
+    video_only_formats = [fmt for fmt in video_formats if (fmt.get("acodec") or "none") == "none"]
+    combined_formats.sort(key=_raw_format_score, reverse=reverse)
+    video_only_formats.sort(key=_raw_format_score, reverse=reverse)
+
+    if video_only_formats and audio_formats and _ffmpeg_available():
+        return video_only_formats[0], audio_formats[0]
+    if combined_formats:
+        return combined_formats[0], None
+    if video_only_formats:
+        return video_only_formats[0], None
+    return None, None
+
+
+def _safe_video_output_path(raw_info: Dict[str, Any], ext: str) -> str:
+    title = _sanitize_base_filename(str(raw_info.get("title") or raw_info.get("id") or "downloaded_video"))
+    video_id = _sanitize_base_filename(str(raw_info.get("id") or "")) or uuid.uuid4().hex[:8]
+    base = (title or "downloaded_video")[:160].strip()
+    safe_ext = re.sub(r"[^A-Za-z0-9]", "", ext or "").lower() or "mp4"
+    if safe_ext not in VIDEO_DOWNLOAD_EXTENSIONS:
+        safe_ext = "mp4"
+    filename = f"{base} [{video_id}].{safe_ext}"
+    path = os.path.join(VIDEO_DOWNLOAD_DIR, filename)
+    if not os.path.exists(path):
+        return path
+    for index in range(2, 1000):
+        candidate = os.path.join(VIDEO_DOWNLOAD_DIR, f"{base} [{video_id}] ({index}).{safe_ext}")
+        if not os.path.exists(candidate):
+            return candidate
+    return os.path.join(VIDEO_DOWNLOAD_DIR, f"{base} [{video_id}] {uuid.uuid4().hex[:6]}.{safe_ext}")
+
+
+def _download_direct_format(
+    fmt: Dict[str, Any],
+    output_path: str,
+    emit: Callable[..., None],
+    message: str,
+) -> None:
+    headers = dict(fmt.get("http_headers") or {})
+    headers.setdefault("User-Agent", "Mozilla/5.0")
+    request = urllib.request.Request(str(fmt["url"]), headers=headers)
+    downloaded = 0
+    with urllib.request.urlopen(request, timeout=60) as response, open(output_path, "wb") as fh:
+        total_header = response.headers.get("Content-Length")
+        total = int(total_header) if total_header and total_header.isdigit() else 0
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            fh.write(chunk)
+            downloaded += len(chunk)
+            percent = round((downloaded / total) * 100, 2) if total else None
+            emit(
+                "progress",
+                message=message,
+                percent=percent,
+                downloaded_bytes=downloaded,
+                total_bytes=total,
+                speed=None,
+                eta=None,
+            )
+
+
+def _manual_video_download_from_raw_info(
+    url: str,
+    quality_key: str,
+    format_selector: str,
+    emit: Callable[..., None],
+) -> str:
+    raw_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": False,
+        "noplaylist": True,
+        "check_formats": False,
+        "format": None,
+        **_yt_dlp_common_opts(),
+        **_get_cookie_opts_for_url(url),
+    }
+    with yt_dlp.YoutubeDL(raw_opts) as ydl:
+        raw_info = ydl.extract_info(url, download=False, process=False)
+    if not isinstance(raw_info, dict):
+        raise RuntimeError("yt-dlp returned no raw video metadata for manual fallback.")
+
+    video_fmt, audio_fmt = _select_raw_video_formats(raw_info, quality_key, format_selector)
+    if not video_fmt:
+        raise RuntimeError(
+            "yt-dlp could fetch metadata, but did not expose a direct downloadable video stream. "
+            f"{_ytdlp_setup_hint()}"
+        )
+
+    if audio_fmt:
+        if not _ffmpeg_available():
+            raise RuntimeError("ffmpeg is required to merge separate video and audio streams.")
+        output_path = _safe_video_output_path(raw_info, "mkv")
+        with tempfile.TemporaryDirectory(prefix="video_stream_", dir=VIDEO_DOWNLOAD_DIR) as tmp_dir:
+            video_ext = str(video_fmt.get("ext") or "video")
+            audio_ext = str(audio_fmt.get("ext") or "audio")
+            video_path = os.path.join(tmp_dir, f"video.{video_ext}")
+            audio_path = os.path.join(tmp_dir, f"audio.{audio_ext}")
+            _download_direct_format(video_fmt, video_path, emit, "Downloading video stream...")
+            _download_direct_format(audio_fmt, audio_path, emit, "Downloading audio stream...")
+            emit("status", message="Merging video and audio streams...")
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                video_path,
+                "-i",
+                audio_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c",
+                "copy",
+                output_path,
+            ]
+            _run_ffmpeg_command(cmd)
+        return output_path
+
+    output_ext = str(video_fmt.get("ext") or "mp4").lower()
+    output_path = _safe_video_output_path(raw_info, output_ext)
+    _download_direct_format(video_fmt, output_path, emit, "Downloading video stream...")
+    return output_path
+
+
+# ---------------------------------------------------------------------------
+# Cookie helpers (ported from downloader.py CookieSettings)
+# ---------------------------------------------------------------------------
+
+def _extract_domain_from_url(url: str) -> str:
+    """Extract the main domain from a video URL."""
+    match = re.search(r"https?://(?:www\.)?([^/]+)", url)
+    if match:
+        domain = match.group(1)
+        parts = domain.split(".")
+        if len(parts) > 2:
+            domain = ".".join(parts[-2:])
+        if domain == "youtu.be":
+            domain = "youtube.com"
+        return domain
+    return "unknown"
+
+
+def _extract_domain_from_curl(curl_text: str) -> str:
+    """Extract the main domain from a cURL command."""
+    url_match = re.search(r"curl\s+['\"]?(https?://[^'\"\s]+)", curl_text)
+    if not url_match:
+        url_match = re.search(r"https?://([^\s/'\"]+)", curl_text)
+    if url_match:
+        url = url_match.group(1) if "://" in url_match.group(1) else url_match.group(0)
+        domain_match = re.search(r"https?://(?:www\.)?([^/]+)", url)
+        if domain_match:
+            domain = domain_match.group(1)
+            parts = domain.split(".")
+            if len(parts) > 2:
+                domain = ".".join(parts[-2:])
+            if domain == "youtu.be":
+                domain = "youtube.com"
+            return domain
+    return "unknown"
+
+
+def _parse_curl_cookies(curl_text: str) -> Dict[str, str]:
+    """Parse cookies from a cURL command string."""
+    cookies: Dict[str, str] = {}
+    patterns = [
+        r"-H\s+['\"]Cookie:\s*([^'\"]+)['\"]",
+        r"--header\s+['\"]Cookie:\s*([^'\"]+)['\"]",
+        r"-b\s+['\"]([^'\"]+)['\"]",
+        r"--cookie\s+['\"]([^'\"]+)['\"]",
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, curl_text, re.IGNORECASE)
+        for match in matches:
+            pairs = match.split(";")
+            for pair in pairs:
+                pair = pair.strip()
+                if "=" in pair:
+                    name, value = pair.split("=", 1)
+                    cookies[name.strip()] = value.strip()
+    return cookies
+
+
+def _get_saved_cookie_sites() -> Dict[str, int]:
+    """Get list of saved cookie sites with cookie counts."""
+    sites: Dict[str, int] = {}
+    for cookies_dir in _candidate_cookie_dirs():
+        if not os.path.exists(cookies_dir):
+            continue
+        for f in os.listdir(cookies_dir):
+            if f.endswith("_cookies.txt"):
+                domain = f.replace("_cookies.txt", "").replace("_", ".")
+                filepath = os.path.join(cookies_dir, f)
+                try:
+                    with open(filepath, "r", encoding="utf-8") as fh:
+                        lines = [line for line in fh.readlines() if line.strip() and not line.startswith("#")]
+                        sites[domain] = max(sites.get(domain, 0), len(lines))
+                except Exception:
+                    sites.setdefault(domain, 0)
+    return sites
+
+
+def _candidate_cookie_dirs() -> List[str]:
+    """Cookie directories from both possible output roots, deduped."""
+    candidates = [
+        COOKIES_DIR,
+        str((APP_DIR / "outputs" / "cookies").resolve()),
+        str((APP_DIR.parent / "outputs" / "cookies").resolve()),
+    ]
+    result: List[str] = []
+    seen: Set[str] = set()
+    for candidate in candidates:
+        normalized = os.path.abspath(candidate)
+        if normalized not in seen:
+            result.append(normalized)
+            seen.add(normalized)
+    return result
+
+
+def _get_cookie_file_for_url(url: str) -> Optional[str]:
+    """Get the appropriate cookie file for a given video URL."""
+    domain = _extract_domain_from_url(url)
+    # Try exact match first
+    filename = domain.replace(".", "_") + "_cookies.txt"
+    for cookies_dir in _candidate_cookie_dirs():
+        filepath = os.path.join(cookies_dir, filename)
+        if os.path.exists(filepath):
+            return filepath
+    # Try partial matches (e.g., for subdomains)
+    for cookies_dir in _candidate_cookie_dirs():
+        if not os.path.exists(cookies_dir):
+            continue
+        for f in os.listdir(cookies_dir):
+            if f.endswith("_cookies.txt"):
+                saved_domain = f.replace("_cookies.txt", "").replace("_", ".")
+                if saved_domain in domain or domain in saved_domain:
+                    return os.path.join(cookies_dir, f)
+    return None
+
+
+def _get_cookie_opts_for_url(url: str) -> Dict[str, Any]:
+    """Return yt-dlp cookie options dict for a URL, or empty dict."""
+    cookie_file = _get_cookie_file_for_url(url)
+    if cookie_file:
+        return {"cookiefile": cookie_file}
+    return {}
+
+
+def _get_cookie_path_for_url(url: str) -> Optional[str]:
+    """Return the saved cookie file path for diagnostics."""
+    return _get_cookie_file_for_url(url)
+
+
+def _safe_video_download_filename(filename: str) -> str:
+    safe_name = os.path.basename(filename or "")
+    if not safe_name or safe_name != filename:
+        raise ValueError("Invalid video filename.")
+    return safe_name
+
+
+def _downloaded_video_path(filename: str) -> str:
+    safe_name = _safe_video_download_filename(filename)
+    path = os.path.abspath(os.path.join(VIDEO_DOWNLOAD_DIR, safe_name))
+    root = os.path.abspath(VIDEO_DOWNLOAD_DIR)
+    if os.path.commonpath([root, path]) != root:
+        raise ValueError("Invalid video path.")
+    return path
+
+
+def _ffprobe_duration_seconds(path: str) -> Optional[float]:
+    if shutil.which("ffprobe") is None or not os.path.exists(path):
+        return None
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    try:
+        process = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if process.returncode != 0:
+            return None
+        value = (process.stdout or "").strip()
+        return float(value) if value else None
+    except Exception:
+        return None
+
+
+def _format_video_duration(seconds: Optional[float]) -> str:
+    if not seconds or seconds <= 0:
+        return ""
+    whole = int(round(seconds))
+    minutes, secs = divmod(whole, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _format_size_mb(size_bytes: int) -> float:
+    return round(max(0, int(size_bytes or 0)) / (1024 * 1024), 2)
+
+
+def _downloaded_video_entry(path: str) -> Dict[str, Any]:
+    safe_name = os.path.basename(path)
+    stat = os.stat(path)
+    duration_seconds = _ffprobe_duration_seconds(path)
+    return {
+        "id": safe_name,
+        "filename": safe_name,
+        "title": os.path.splitext(safe_name)[0],
+        "extension": os.path.splitext(safe_name)[1].lstrip(".").lower(),
+        "size_bytes": int(stat.st_size),
+        "size_mb": _format_size_mb(stat.st_size),
+        "mtime": stat.st_mtime,
+        "duration_seconds": duration_seconds,
+        "duration_label": _format_video_duration(duration_seconds),
+        "url": f"/api/downloaded_videos/{quote(safe_name)}",
+    }
+
+
+def _list_downloaded_video_entries() -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    if not os.path.exists(VIDEO_DOWNLOAD_DIR):
+        return entries
+    for entry in os.scandir(VIDEO_DOWNLOAD_DIR):
+        if not entry.is_file():
+            continue
+        ext = os.path.splitext(entry.name)[1].lstrip(".").lower()
+        if ext not in VIDEO_DOWNLOAD_EXTENSIONS:
+            continue
+        try:
+            entries.append(_downloaded_video_entry(entry.path))
+        except Exception as exc:
+            print(f"⚠️ Failed to inspect downloaded video '{entry.name}': {exc}")
+    entries.sort(key=lambda item: item.get("mtime") or 0, reverse=True)
+    return entries
+
+
+def _find_recent_downloaded_video(start_time: float, info: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    candidates: List[str] = []
+    video_id = str((info or {}).get("id") or "").strip()
+    for entry in os.scandir(VIDEO_DOWNLOAD_DIR):
+        if not entry.is_file():
+            continue
+        ext = os.path.splitext(entry.name)[1].lstrip(".").lower()
+        if ext not in VIDEO_DOWNLOAD_EXTENSIONS:
+            continue
+        try:
+            stat = entry.stat()
+        except OSError:
+            continue
+        if video_id and video_id not in entry.name:
+            continue
+        if stat.st_mtime >= start_time - 5:
+            candidates.append(entry.path)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: os.path.getmtime(item), reverse=True)
+    return candidates[0]
+
+
+def _downloaded_video_audio_cache_path(video_path: str) -> str:
+    stat = os.stat(video_path)
+    cache_key = hashlib.md5(
+        f"{os.path.abspath(video_path)}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")
+    ).hexdigest()[:16]
+    stem = _sanitize_base_filename(os.path.basename(video_path)) or "downloaded_video"
+    return os.path.join(VIDEO_AUDIO_CACHE_DIR, f"{stem}_{cache_key}.mp3")
+
+
+def _extract_audio_from_downloaded_video_sync(video_path: str) -> str:
+    if not _ffmpeg_available():
+        raise RuntimeError("ffmpeg is required to extract audio from downloaded videos.")
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Downloaded video not found: {video_path}")
+    output_path = _downloaded_video_audio_cache_path(video_path)
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        return output_path
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        video_path,
+        "-vn",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+        output_path,
+    ]
+    _run_ffmpeg_command(cmd)
+    return output_path
+
+
+async def _prepare_downloaded_video_audio_request(
+    downloaded_video_id: Optional[str],
+) -> Tuple[Optional[Dict[str, Any]], Optional[bytes], Optional[str], Optional[JSONResponse]]:
+    video_id = (downloaded_video_id or "").strip()
+    if not video_id:
+        return None, None, None, None
+    try:
+        video_path = _downloaded_video_path(video_id)
+    except ValueError as exc:
+        return None, None, None, _status_error(str(exc), status_code=400)
+    if not os.path.exists(video_path):
+        return None, None, None, _status_error("Downloaded video not found.", status_code=404)
+    try:
+        audio_path = await _run_blocking(_extract_audio_from_downloaded_video_sync, video_path)
+        audio_bytes = await _run_blocking(lambda: _read_file_bytes(audio_path))
+        if not audio_bytes:
+            return None, None, None, _status_error("Failed to extract audio from downloaded video.", status_code=500)
+        source = _downloaded_video_entry(video_path)
+        source["path"] = video_path
+        source["audio_filename"] = os.path.basename(audio_path)
+        source["audio_path"] = audio_path
+        return source, audio_bytes, os.path.basename(audio_path), None
+    except Exception as exc:
+        traceback.print_exc()
+        return None, None, None, _status_error(
+            f"Failed to extract audio from downloaded video: {str(exc)}",
+            status_code=500,
+        )
+
+
+def _public_downloaded_video_source(source: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not source:
+        return None
+    return {
+        key: value
+        for key, value in source.items()
+        if key not in {"path", "audio_path"}
+    }
+
+
+def _replace_video_audio_sync(video_path: str, audio_path: str, output_path: str) -> None:
+    if not _ffmpeg_available():
+        raise RuntimeError("ffmpeg is required to replace the video audio track.")
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Source video not found: {video_path}")
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Translated audio not found: {audio_path}")
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        output_path,
+    ]
+    _run_ffmpeg_command(cmd)
+
+
+def _source_video_metadata_from_session(session: Optional[TranslateSessionData]) -> Optional[Dict[str, Any]]:
+    if not session or not session.source_video_filename:
+        return None
+    try:
+        video_path = session.source_video_path or _downloaded_video_path(session.source_video_filename)
+        if not os.path.exists(video_path):
+            return None
+        return _downloaded_video_entry(video_path)
+    except Exception:
+        return None
+
+
+def _apply_source_video_metadata(metadata: Dict[str, Any], session: Optional[TranslateSessionData]) -> None:
+    source_video = _source_video_metadata_from_session(session)
+    if source_video:
+        metadata["source_video"] = source_video
+        metadata["source_video_filename"] = source_video.get("filename")
 
 
 async def _log_overlay_progress(label: str, start_time: float, interval_seconds: float = 30.0) -> None:
@@ -8955,6 +9757,10 @@ speaker_api = None
 # API Models
 class TranslateRequest(BaseModel):
     audio: Optional[str] = Field(default=None, description="Base64-encoded audio or download URL.")
+    downloaded_video_id: Optional[str] = Field(
+        default=None,
+        description="Filename/id of a video downloaded through the WebUI video downloader.",
+    )
     dest_language: str = Field(..., description="Target language for translation, e.g., 'English'.")
     audio_mime_type: Optional[str] = Field(default=None, description="MIME type of the audio, e.g., 'audio/wav'.")
     base_filename: Optional[str] = Field(
@@ -9112,6 +9918,22 @@ class TranslateRequest(BaseModel):
         default=DEFAULT_QWEN_OMNIVAD_MERGE_GAP_SECONDS,
         description="When using transcription_pipeline='qwen_omnivad', merge adjacent OmniVAD spans separated by this many seconds or less.",
     )
+
+
+class VideoInfoRequest(BaseModel):
+    url: str = Field(..., description="Video URL supported by yt-dlp.")
+
+
+class VideoDownloadRequest(BaseModel):
+    url: str = Field(..., description="Video URL supported by yt-dlp.")
+    quality: Optional[str] = Field(default="best", description="Quality preset: best, 1080p, 720p, 480p, 360p, or worst.")
+
+
+class VideoReplaceAudioRequest(BaseModel):
+    downloaded_video_id: Optional[str] = Field(default=None, description="Downloaded video filename/id.")
+    session_id: Optional[str] = Field(default=None, description="Translate session id; used to resolve the source video when available.")
+    audio_file_name: Optional[str] = Field(default=None, description="Translated audio filename from /api/translate_outputs.")
+    output_filename: Optional[str] = Field(default=None, description="Optional output video base filename.")
 
 
 class SpeakerOverrideInput(BaseModel):
@@ -9660,11 +10482,610 @@ async def api_prompt_templates():
     }
 
 
+# ---------------------------------------------------------------------------
+# Cookie management API endpoints
+# ---------------------------------------------------------------------------
+
+class CookieImportCurlRequest(BaseModel):
+    curl_text: str = Field(..., description="cURL command string copied from browser DevTools.")
+    domain: Optional[str] = Field(default=None, description="Override auto-detected domain.")
+
+
+@app.get("/api/cookies")
+async def api_cookies_list():
+    """API: List all saved cookie domains with cookie counts."""
+    sites = _get_saved_cookie_sites()
+    return JSONResponse(content={
+        "status": "ok",
+        "sites": {domain: {"count": count} for domain, count in sites.items()},
+        "cookie_dirs": _candidate_cookie_dirs(),
+    })
+
+
+@app.get("/api/video_ytdlp_diagnostics")
+async def api_video_ytdlp_diagnostics(url: Optional[str] = Query(default=None)):
+    """API: Show what yt-dlp-related setup the running FastAPI process can see."""
+    _ensure_yt_dlp()
+
+    def shell_command_output(command: str) -> Dict[str, Any]:
+        try:
+            process = subprocess.run(
+                ["bash", "-lc", command],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return {
+                "returncode": process.returncode,
+                "stdout": (process.stdout or "").strip(),
+                "stderr": (process.stderr or "").strip(),
+            }
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def package_version(name: str) -> Optional[str]:
+        try:
+            import importlib.metadata as importlib_metadata
+
+            return importlib_metadata.version(name)
+        except Exception:
+            return None
+
+    def executable_version(executable: Optional[str]) -> Optional[str]:
+        if not executable:
+            return None
+        try:
+            process = subprocess.run(
+                [executable, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            version_text = (process.stdout or process.stderr or "").strip()
+            return version_text or None
+        except Exception as exc:
+            return f"error: {exc}"
+
+    def port_open(host: str, port: int) -> bool:
+        try:
+            import socket
+
+            with socket.create_connection((host, port), timeout=2):
+                return True
+        except Exception:
+            return False
+
+    cookie_file = _get_cookie_path_for_url(url or "") if url else None
+    cookie_count: Optional[int] = None
+    if cookie_file and os.path.exists(cookie_file):
+        try:
+            with open(cookie_file, "r", encoding="utf-8") as fh:
+                cookie_count = len([line for line in fh if line.strip() and not line.startswith("#")])
+        except Exception:
+            cookie_count = None
+
+    common_opts = _yt_dlp_common_opts()
+    common_opts_payload = dict(common_opts)
+    if isinstance(common_opts_payload.get("remote_components"), set):
+        common_opts_payload["remote_components"] = sorted(common_opts_payload["remote_components"])
+
+    js_runtime_opts = (common_opts.get("js_runtimes") or {}) if isinstance(common_opts.get("js_runtimes"), dict) else {}
+    node_path = (js_runtime_opts.get("node") or {}).get("executable") or shutil.which("node")
+    deno_path = (js_runtime_opts.get("deno") or {}).get("executable") or shutil.which("deno")
+    nvm_node_candidates = [str(path) for path in Path("/home").glob("*/.nvm/versions/node/*/bin/node")]
+    return JSONResponse(content={
+        "status": "ok",
+        "python": sys.executable,
+        "cwd": os.getcwd(),
+        "path": os.environ.get("PATH", ""),
+        "env": {
+            "YTDLP_NODE_PATH": os.environ.get("YTDLP_NODE_PATH"),
+            "NODE_BINARY": os.environ.get("NODE_BINARY"),
+            "YTDLP_JS_RUNTIMES": os.environ.get("YTDLP_JS_RUNTIMES"),
+        },
+        "shell": {
+            "command_v_node": shell_command_output("command -v node"),
+            "type_node": shell_command_output("type -a node"),
+            "node_exec_path": shell_command_output("node -p 'process.execPath'"),
+        },
+        "app_dir": str(APP_DIR),
+        "root_output_dir": str(ROOT_OUTPUT_DIR),
+        "cookies_dir": COOKIES_DIR,
+        "candidate_cookie_dirs": _candidate_cookie_dirs(),
+        "url_cookie_file": cookie_file,
+        "url_cookie_count": cookie_count,
+        "node": {
+            "path": node_path,
+            "version": executable_version(node_path),
+            "nvm_candidates": nvm_node_candidates,
+        },
+        "deno": {"path": deno_path, "version": executable_version(deno_path)},
+        "bgutil_http_provider": {"url": "http://127.0.0.1:4416", "port_open": port_open("127.0.0.1", 4416)},
+        "yt_dlp": {
+            "version": getattr(yt_dlp, "__version__", None) if yt_dlp is not None else None,
+            "yt_dlp_ejs_version": package_version("yt-dlp-ejs"),
+            "bgutil_provider_version": package_version("bgutil-ytdlp-pot-provider"),
+            "common_opts": common_opts_payload,
+        },
+    })
+
+
+@app.post("/api/cookies/import_curl")
+async def api_cookies_import_curl(payload: CookieImportCurlRequest):
+    """API: Import cookies from a cURL command and save for the detected domain."""
+    curl_text = (payload.curl_text or "").strip()
+    if not curl_text:
+        return _status_error("cURL text is required.")
+
+    domain = (payload.domain or "").strip()
+    if not domain:
+        domain = _extract_domain_from_curl(curl_text)
+    if domain == "unknown":
+        return _status_error("Could not detect domain. Please provide it explicitly.")
+
+    cookies = _parse_curl_cookies(curl_text)
+    if not cookies:
+        return _status_error("No cookies found in cURL command.")
+
+    try:
+        cookie_lines = [
+            "# Netscape HTTP Cookie File",
+            f"# Domain: {domain}",
+            "# This is a generated file! Do not edit.",
+            "",
+        ]
+        for name, value in cookies.items():
+            cookie_lines.append(f".{domain}\tTRUE\t/\tTRUE\t0\t{name}\t{value}")
+
+        filename = domain.replace(".", "_") + "_cookies.txt"
+        filepath = os.path.join(COOKIES_DIR, filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("\n".join(cookie_lines))
+
+        return JSONResponse(content={
+            "status": "ok",
+            "message": f"Imported {len(cookies)} cookies for {domain}.",
+            "domain": domain,
+            "cookie_count": len(cookies),
+            "cookie_file": filepath,
+        })
+    except Exception as exc:
+        traceback.print_exc()
+        return _status_error(f"Failed to save cookies: {str(exc)}", status_code=500)
+
+
+@app.post("/api/cookies/upload")
+async def api_cookies_upload(
+    file: UploadFile = File(...),
+    domain: str = Form(...),
+):
+    """API: Upload a cookies.txt file directly and save for the specified domain."""
+    domain = (domain or "").strip().lower()
+    if not domain:
+        return _status_error("Domain is required.")
+    if domain.startswith("www."):
+        domain = domain[4:]
+
+    try:
+        content_bytes = await file.read()
+        content = content_bytes.decode("utf-8", errors="ignore")
+    except Exception as exc:
+        return _status_error(f"Failed to read file: {str(exc)}")
+
+    if not content.strip():
+        return _status_error("Uploaded file is empty.")
+
+    try:
+        filename = domain.replace(".", "_") + "_cookies.txt"
+        filepath = os.path.join(COOKIES_DIR, filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        cookie_count = len([l for l in content.splitlines() if l.strip() and not l.startswith("#")])
+
+        return JSONResponse(content={
+            "status": "ok",
+            "message": f"Cookies saved for {domain}.",
+            "domain": domain,
+            "cookie_count": cookie_count,
+            "cookie_file": filepath,
+        })
+    except Exception as exc:
+        traceback.print_exc()
+        return _status_error(f"Failed to save cookies file: {str(exc)}", status_code=500)
+
+
+@app.delete("/api/cookies/{domain}")
+async def api_cookies_delete(domain: str):
+    """API: Delete saved cookies for a specific domain."""
+    domain = (domain or "").strip().lower()
+    if not domain:
+        return _status_error("Domain is required.")
+    filename = domain.replace(".", "_") + "_cookies.txt"
+    filepath = os.path.join(COOKIES_DIR, filename)
+    if not os.path.exists(filepath):
+        return _status_error(f"No cookies found for {domain}.", status_code=404)
+    try:
+        os.remove(filepath)
+        return JSONResponse(content={
+            "status": "ok",
+            "message": f"Cookies for {domain} deleted.",
+            "domain": domain,
+        })
+    except Exception as exc:
+        traceback.print_exc()
+        return _status_error(f"Failed to delete cookies: {str(exc)}", status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Downloaded video endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/downloaded_videos")
+async def api_downloaded_videos():
+    """API: List videos downloaded through the WebUI downloader."""
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "videos": _list_downloaded_video_entries(),
+            "download_dir": VIDEO_DOWNLOAD_DIR,
+        }
+    )
+
+
+@app.delete("/api/downloaded_videos/{filename}")
+async def api_delete_downloaded_video(filename: str):
+    """API: Delete a downloaded video file."""
+    try:
+        file_path = _downloaded_video_path(filename)
+    except ValueError as exc:
+        return _status_error(str(exc), status_code=400)
+    if not os.path.exists(file_path):
+        return _status_error("Downloaded video not found.", status_code=404)
+    try:
+        file_size = os.path.getsize(file_path)
+        os.remove(file_path)
+        # Also remove cached extracted audio if any
+        audio_cache = os.path.join(VIDEO_AUDIO_CACHE_DIR, os.path.splitext(filename)[0] + ".mp3")
+        if os.path.exists(audio_cache):
+            os.remove(audio_cache)
+        return JSONResponse(content={
+            "status": "ok",
+            "message": f"Deleted {filename}.",
+            "filename": filename,
+            "freed_mb": round(file_size / (1024 * 1024), 2),
+        })
+    except Exception as exc:
+        traceback.print_exc()
+        return _status_error(f"Failed to delete video: {str(exc)}", status_code=500)
+
+
+@app.get("/api/downloaded_videos/{filename}")
+async def api_downloaded_video_file(filename: str):
+    """API: Serve a downloaded video for preview/download."""
+    try:
+        file_path = _downloaded_video_path(filename)
+    except ValueError as exc:
+        return _status_error(str(exc), status_code=400)
+    if not os.path.exists(file_path):
+        return _status_error("Downloaded video not found.", status_code=404)
+    return FileResponse(
+        file_path,
+        media_type=_guess_media_type_from_extension(filename),
+        filename=filename,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/downloaded_videos/{filename}/audio")
+async def api_downloaded_video_audio(filename: str):
+    """API: Extract and serve MP3 audio from a downloaded video."""
+    try:
+        video_path = _downloaded_video_path(filename)
+    except ValueError as exc:
+        return _status_error(str(exc), status_code=400)
+    if not os.path.exists(video_path):
+        return _status_error("Downloaded video not found.", status_code=404)
+    try:
+        audio_path = await _run_blocking(_extract_audio_from_downloaded_video_sync, video_path)
+    except Exception as exc:
+        traceback.print_exc()
+        return _status_error(f"Failed to extract video audio: {str(exc)}", status_code=500)
+    return FileResponse(
+        audio_path,
+        media_type="audio/mpeg",
+        filename=os.path.basename(audio_path),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/video_info")
+async def api_video_info(payload: VideoInfoRequest):
+    """API: Fetch basic yt-dlp metadata before downloading."""
+    _ensure_yt_dlp()
+    if yt_dlp is None:
+        return _status_error("yt-dlp is not installed. Install it with `pip install yt-dlp`.", status_code=500)
+    url = (payload.url or "").strip()
+    if not url:
+        return _status_error("Video URL is required.")
+
+    def extract_info() -> Dict[str, Any]:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": False,
+            "noplaylist": True,
+            "check_formats": False,
+            **_yt_dlp_common_opts(),
+            **_get_cookie_opts_for_url(url),
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as exc:
+            if not _is_ytdl_format_unavailable_error(exc):
+                raise
+            # Metadata can still be useful when yt-dlp's default format picker
+            # cannot resolve a downloadable format. This mirrors downloader.py's
+            # broad info fetch, while skipping the processing step that raises.
+            raw_opts = {**opts, "format": None}
+            with yt_dlp.YoutubeDL(raw_opts) as ydl:
+                info = ydl.extract_info(url, download=False, process=False)
+        if not isinstance(info, dict):
+            raise RuntimeError("yt-dlp returned no video metadata.")
+        formats: List[Dict[str, Any]] = []
+        raw_format_count = 0
+        for fmt in info.get("formats") or []:
+            if not isinstance(fmt, dict):
+                continue
+            raw_format_count += 1
+            vcodec = fmt.get("vcodec") or "none"
+            acodec = fmt.get("acodec") or "none"
+            if vcodec == "none" or not fmt.get("format_id") or not _raw_format_is_direct(fmt):
+                continue
+            height = fmt.get("height")
+            formats.append(
+                {
+                    "format_id": fmt.get("format_id"),
+                    "ext": fmt.get("ext"),
+                    "resolution": fmt.get("resolution") or (f"{height}p" if height else ""),
+                    "height": height,
+                    "fps": fmt.get("fps"),
+                    "vcodec": vcodec,
+                    "acodec": acodec,
+                    "filesize": fmt.get("filesize") or fmt.get("filesize_approx") or 0,
+                    "tbr": fmt.get("tbr") or 0,
+                    "note": fmt.get("format_note") or "",
+                }
+            )
+        formats.sort(key=lambda item: (item.get("height") or 0, item.get("tbr") or 0), reverse=True)
+        return {
+            "status": "ok",
+            "title": info.get("title") or "Untitled",
+            "id": info.get("id"),
+            "webpage_url": info.get("webpage_url") or url,
+            "thumbnail": info.get("thumbnail"),
+            "duration_seconds": info.get("duration"),
+            "duration_label": _format_video_duration(info.get("duration")),
+            "formats": formats[:30],
+            "raw_format_count": raw_format_count,
+            "downloadable_format_count": len(formats),
+            "format_warning": (
+                f"Video metadata loaded, but yt-dlp did not expose downloadable stream URLs. {_ytdlp_setup_hint()}"
+                if raw_format_count and not formats else ""
+            ),
+        }
+
+    try:
+        return JSONResponse(content=await _run_blocking(extract_info))
+    except Exception as exc:
+        traceback.print_exc()
+        error_msg = _clean_ytdl_error(exc)
+        lower_error = error_msg.lower()
+        if "confirm you are not a bot" in lower_error or "sign in" in lower_error:
+            error_msg += f" ({_ytdlp_auth_hint()})"
+        elif "format" in lower_error:
+            error_msg += f" ({_ytdlp_setup_hint()})"
+        return _status_error(f"Failed to fetch video info: {error_msg}", status_code=400)
+
+
+@app.post("/api/video_download")
+async def api_video_download(payload: VideoDownloadRequest):
+    """API: Download a video through yt-dlp and stream progress events."""
+    _ensure_yt_dlp()
+    if yt_dlp is None:
+        return _status_error("yt-dlp is not installed. Install it with `pip install yt-dlp`.", status_code=500)
+    url = (payload.url or "").strip()
+    if not url:
+        return _status_error("Video URL is required.")
+    quality_raw = (payload.quality or "best").strip()
+    quality_key = quality_raw.lower()
+    if quality_key in VIDEO_DOWNLOAD_FORMATS:
+        format_selector = VIDEO_DOWNLOAD_FORMATS[quality_key]
+    else:
+        format_selector = quality_raw
+
+    async def download_stream():
+        queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def emit(event_type: str, **event_payload: Any) -> None:
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                {
+                    "event": event_type,
+                    "timestamp": time.time(),
+                    **event_payload,
+                },
+            )
+
+        def download_sync() -> None:
+            start_time = time.time()
+            info_result: Optional[Dict[str, Any]] = None
+            try:
+                emit("status", message="Starting video download...", quality=quality_key)
+
+                def progress_hook(data: Dict[str, Any]) -> None:
+                    status = data.get("status")
+                    if status == "downloading":
+                        total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+                        downloaded = data.get("downloaded_bytes") or 0
+                        percent = round((downloaded / total) * 100, 2) if total else None
+                        emit(
+                            "progress",
+                            message="Downloading video...",
+                            percent=percent,
+                            downloaded_bytes=downloaded,
+                            total_bytes=total,
+                            speed=data.get("speed"),
+                            eta=data.get("eta"),
+                        )
+                    elif status == "finished":
+                        emit("status", message="Download finished; post-processing...")
+
+                base_ydl_opts = {
+                    "outtmpl": os.path.join(VIDEO_DOWNLOAD_DIR, "%(title).180B [%(id)s].%(ext)s"),
+                    "merge_output_format": "mp4",
+                    "noplaylist": True,
+                    "quiet": True,
+                    "no_warnings": True,
+                    "progress_hooks": [progress_hook],
+                    **_yt_dlp_common_opts(),
+                    **_get_cookie_opts_for_url(url),
+                }
+                last_format_error: Optional[Exception] = None
+                manual_downloaded_path: Optional[str] = None
+                format_attempts = _video_download_format_fallbacks(format_selector, quality_key)
+                for attempt_index, candidate_format in enumerate(format_attempts):
+                    ydl_opts = dict(base_ydl_opts)
+                    if candidate_format:
+                        ydl_opts["format"] = candidate_format
+                    if attempt_index > 0:
+                        emit(
+                            "status",
+                            message=(
+                                "Requested format was unavailable; retrying with "
+                                f"{candidate_format or 'yt-dlp default'}..."
+                            ),
+                            quality=quality_key,
+                        )
+                    try:
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            info_result = ydl.extract_info(url, download=True)
+                        break
+                    except Exception as exc:
+                        if not _is_ytdl_format_unavailable_error(exc):
+                            raise
+                        last_format_error = exc
+                else:
+                    emit(
+                        "status",
+                        message="yt-dlp format selection failed; trying direct stream fallback...",
+                    )
+                    try:
+                        manual_downloaded_path = _manual_video_download_from_raw_info(
+                            url,
+                            quality_key,
+                            format_selector,
+                            emit,
+                        )
+                    except Exception as manual_exc:
+                        if last_format_error:
+                            raise RuntimeError(
+                                f"{manual_exc}; original yt-dlp format error: {_clean_ytdl_error(last_format_error)}"
+                            ) from manual_exc
+                        raise
+
+                downloaded_path = manual_downloaded_path or _find_recent_downloaded_video(start_time, info_result)
+                if not downloaded_path:
+                    raise RuntimeError("Download completed, but the output video could not be located.")
+                entry = _downloaded_video_entry(downloaded_path)
+                emit("complete", message="Video downloaded.", video=entry)
+            except Exception as exc:
+                traceback.print_exc()
+                error_msg = _clean_ytdl_error(exc)
+                lower_error = error_msg.lower()
+                if "confirm you are not a bot" in lower_error or "sign in" in lower_error:
+                    error_msg += f" ({_ytdlp_auth_hint()})"
+                elif "format" in lower_error:
+                    error_msg += f" ({_ytdlp_setup_hint()})"
+                emit("error", message=f"Video download failed: {error_msg}")
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        asyncio.create_task(asyncio.to_thread(download_sync))
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield _json_event_bytes(item)
+
+    return _json_stream_response(download_stream())
+
+
+@app.post("/api/video_replace_audio")
+async def api_video_replace_audio(payload: VideoReplaceAudioRequest):
+    """API: Replace a downloaded video's audio with a translated audio output."""
+    session: Optional[TranslateSessionData] = None
+    if payload.session_id:
+        session = await _get_translate_session(payload.session_id)
+
+    video_id = (payload.downloaded_video_id or "").strip()
+    if not video_id and session and session.source_video_filename:
+        video_id = session.source_video_filename
+    if not video_id:
+        return _status_error("Downloaded video id is required.")
+    try:
+        video_path = _downloaded_video_path(video_id)
+    except ValueError as exc:
+        return _status_error(str(exc), status_code=400)
+    if not os.path.exists(video_path):
+        return _status_error("Downloaded video not found.", status_code=404)
+
+    audio_name = os.path.basename((payload.audio_file_name or "").strip())
+    if not audio_name:
+        return _status_error("Translated audio filename is required.")
+    if audio_name != (payload.audio_file_name or "").strip():
+        return _status_error("Invalid translated audio filename.", status_code=400)
+    audio_path = os.path.join(TRANSLATE_OUTPUT_DIR, audio_name)
+    if not os.path.exists(audio_path):
+        return _status_error("Translated audio output not found.", status_code=404)
+
+    requested_base = _sanitize_base_filename(payload.output_filename)
+    if not requested_base:
+        video_base = _sanitize_base_filename(os.path.splitext(os.path.basename(video_path))[0]) or "video"
+        audio_base = _sanitize_base_filename(os.path.splitext(audio_name)[0]) or "translated"
+        requested_base = f"{video_base}_{audio_base}_video"
+    output_filename = f"{requested_base}.mp4"
+    output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
+    if os.path.exists(output_path):
+        requested_base = f"{requested_base}_{uuid.uuid4().hex[:6]}"
+        output_filename = f"{requested_base}.mp4"
+        output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
+
+    try:
+        await _run_blocking(_replace_video_audio_sync, video_path, audio_path, output_path)
+    except Exception as exc:
+        traceback.print_exc()
+        return _status_error(f"Failed to create translated video: {str(exc)}", status_code=500)
+
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "message": "Translated video created.",
+            "video_url": f"/api/translate_outputs/{output_filename}",
+            "file_name": output_filename,
+            "source_video": _downloaded_video_entry(video_path),
+        }
+    )
+
+
 @app.post("/api/translate_split_audio")
 async def api_translate_split_audio(
     request: Request,
     dest_language: Optional[str] = Form(None),
     audio: Optional[str] = Form(None),
+    downloaded_video_id: Optional[str] = Form(None),
     audio_mime_type: Optional[str] = Form(None),
     base_filename: Optional[str] = Form(None),
     chunk_min_minutes: Optional[float] = Form(None),
@@ -9699,6 +11120,7 @@ async def api_translate_split_audio(
             request,
             audio_file is None
             and (audio is None or not audio.strip())
+            and not (downloaded_video_id or "").strip()
             and _request_has_json_body(request),
         )
         if payload_error is not None:
@@ -9707,6 +11129,7 @@ async def api_translate_split_audio(
         if payload is not None:
             dest_language = payload.get("dest_language", dest_language)
             audio = payload.get("audio", audio)
+            downloaded_video_id = payload.get("downloaded_video_id", downloaded_video_id)
             audio_mime_type = payload.get("audio_mime_type", audio_mime_type)
             base_filename = payload.get("base_filename", base_filename)
             chunk_min_minutes = payload.get("chunk_min_minutes", chunk_min_minutes)
@@ -9746,7 +11169,8 @@ async def api_translate_split_audio(
         audio_separator_enabled_flag = preprocess_options.audio_separator_enabled
         audio_separator_model_key = preprocess_options.audio_separator_model
         audio_reference_value = (audio or "").strip()
-        if audio_file is None and not audio_reference_value:
+        downloaded_video_id_value = (downloaded_video_id or "").strip()
+        if audio_file is None and not audio_reference_value and not downloaded_video_id_value:
             return _status_error("Source audio is required for chunk splitting.")
 
         dest_language_value = (dest_language or "").strip() or "unspecified"
@@ -9790,8 +11214,24 @@ async def api_translate_split_audio(
         audio_mime_type_value = audio_mime_type
         audio_file_for_pipeline = audio_file
         base_filename_value = base_filename
+        downloaded_video_source: Optional[Dict[str, Any]] = None
 
-        if audio_file is not None:
+        if downloaded_video_id_value:
+            (
+                downloaded_video_source,
+                preloaded_audio_bytes,
+                downloaded_audio_filename,
+                downloaded_error,
+            ) = await _prepare_downloaded_video_audio_request(downloaded_video_id_value)
+            if downloaded_error is not None:
+                return downloaded_error
+            uploaded_filename = downloaded_audio_filename
+            audio_mime_type_value = "audio/mpeg"
+            audio_reference_value = ""
+            audio_file_for_pipeline = None
+            if not base_filename_value and downloaded_video_source:
+                base_filename_value = os.path.splitext(str(downloaded_video_source.get("filename") or ""))[0]
+        elif audio_file is not None:
             preloaded_audio_bytes, audio_error = await _read_audio_request_bytes(
                 audio_file,
                 None,
@@ -9827,6 +11267,7 @@ async def api_translate_split_audio(
             "super_resolution": apply_super_resolution,
             "clearvoice_parallel": parallel_config.to_metadata(),
             "base_output_name": resolved_base_name,
+            "downloaded_video": _public_downloaded_video_source(downloaded_video_source),
         }
 
         split_profiler = PerfLogger("split:pending")
@@ -10210,6 +11651,8 @@ async def api_translate_split_audio(
                                     persist_media=not path_exists,
                                     source_audio_filename=uploaded_filename,
                                     source_base_name=resolved_base_name,
+                                    source_video_path=downloaded_video_source.get("path") if downloaded_video_source else None,
+                                    source_video_filename=downloaded_video_source.get("filename") if downloaded_video_source else None,
                                     original_audio_path=chunk_audio_path if path_exists else None,
                                     original_audio_info=chunk_audio_info,
                                 )
@@ -10438,6 +11881,8 @@ async def api_translate_split_audio(
                             persist_media=True,
                             source_audio_filename=uploaded_filename,
                             source_base_name=resolved_base_name,
+                            source_video_path=downloaded_video_source.get("path") if downloaded_video_source else None,
+                            source_video_filename=downloaded_video_source.get("filename") if downloaded_video_source else None,
                         )
                         chunk_session_manifests.append(_session_to_manifest(fallback_session))
                         chunk_entries.append(_serialize_chunk_session(fallback_session))
@@ -10836,6 +12281,7 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
         )
         subtitle_url = subtitle_translated["url"] if subtitle_translated else None
         original_subtitle_url = subtitle_original["url"] if subtitle_original else None
+        source_video = _source_video_metadata_from_session(template_session)
 
         merge_profiler.summary()
         return JSONResponse(
@@ -10845,6 +12291,7 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
                 "message": f"Merged {len(chunk_results)} chunk(s).",
                 "audio_url": audio_url,
                 "file_name": output_filename,
+                "audio_file_name": output_filename,
                 "response_format": response_format_value,
                 "chunk_results": chunk_results,
                 "chunk_batch_id": chunk_batch_id or sessions[0].chunk_parent_id,
@@ -10857,6 +12304,8 @@ async def api_translate_merge_chunks(payload: MergeChunksRequest):
                 "subtitle_original": subtitle_original,
                 "base_output_name": resolved_base_name,
                 "language_code": language_code,
+                "source_video": source_video,
+                "source_video_filename": source_video.get("filename") if source_video else None,
             },
         )
     except Exception as exc:
@@ -11170,6 +12619,7 @@ async def api_translate_segments(
     response_format: Optional[str] = Form(None),
     bitrate: Optional[str] = Form(None),
     audio: Optional[str] = Form(None),
+    downloaded_video_id: Optional[str] = Form(None),
     audio_mime_type: Optional[str] = Form(None),
     base_filename: Optional[str] = Form(None),
     custom_backing_audio: Optional[str] = Form(None),
@@ -11221,6 +12671,7 @@ async def api_translate_segments(
         response_format_value = response_format
         bitrate_value = bitrate
         audio_reference = audio
+        downloaded_video_id_value = downloaded_video_id
         audio_mime_type_value = audio_mime_type
         base_filename_value = base_filename
         custom_backing_audio_value = custom_backing_audio
@@ -11262,6 +12713,7 @@ async def api_translate_segments(
             request,
             dest_language is None
             and not audio_reference
+            and not downloaded_video_id_value
             and audio_file is None
             and _request_has_json_body(request),
         )
@@ -11273,6 +12725,7 @@ async def api_translate_segments(
             response_format_value = payload.get("response_format", response_format_value)
             bitrate_value = payload.get("bitrate", bitrate_value)
             audio_reference = payload.get("audio", audio_reference)
+            downloaded_video_id_value = payload.get("downloaded_video_id", downloaded_video_id_value)
             audio_mime_type_value = payload.get("audio_mime_type", audio_mime_type_value)
             base_filename_value = payload.get("base_filename", base_filename_value)
             custom_backing_audio_value = payload.get("custom_backing_audio", custom_backing_audio_value)
@@ -11456,6 +12909,23 @@ async def api_translate_segments(
             qwen_omnivad_merge_gap_seconds_value,
         )
 
+        downloaded_video_source: Optional[Dict[str, Any]] = None
+        downloaded_audio_bytes: Optional[bytes] = None
+        downloaded_audio_filename: Optional[str] = None
+        if reuse_source_session is None and (downloaded_video_id_value or "").strip():
+            (
+                downloaded_video_source,
+                downloaded_audio_bytes,
+                downloaded_audio_filename,
+                downloaded_error,
+            ) = await _prepare_downloaded_video_audio_request(downloaded_video_id_value)
+            if downloaded_error is not None:
+                return downloaded_error
+            audio_reference = None
+            audio_file = None
+            audio_mime_type_value = "audio/mpeg"
+            uploaded_filename = downloaded_audio_filename or uploaded_filename
+
         reuse_session_for_segments = reuse_source_session
         session_source_filename = uploaded_filename or (
             reuse_session_for_segments.source_audio_filename if reuse_session_for_segments else None
@@ -11487,6 +12957,7 @@ async def api_translate_segments(
             "silence_volume_percent": silence_volume_percent_value,
             "translate_enabled": translate_enabled,
             "base_output_name": resolved_base_name,
+            "downloaded_video": _public_downloaded_video_source(downloaded_video_source),
             "force_gemini_regenerate": force_gemini_regenerate_flag,
             "translation_llm_model": resolved_translation_llm_model,
             "transcription_pipeline": resolved_transcription_pipeline,
@@ -11559,6 +13030,7 @@ async def api_translate_segments(
                         reuse_source_session=reuse_session_for_segments,
                         audio_file=audio_file,
                         audio_reference=audio_reference,
+                        preloaded_audio_bytes=downloaded_audio_bytes,
                         source_audio_filename=session_source_filename,
                         audio_mime_type_value=audio_mime_type_value,
                         apply_enhancement=apply_enhancement,
@@ -11612,6 +13084,8 @@ async def api_translate_segments(
                         source_chunk_session=reuse_session_for_segments,
                         source_audio_filename=session_source_filename,
                         source_base_name=resolved_base_name,
+                        source_video_path=downloaded_video_source.get("path") if downloaded_video_source else None,
+                        source_video_filename=downloaded_video_source.get("filename") if downloaded_video_source else None,
                         force_gemini_regenerate=force_gemini_regenerate_flag,
                         initial_speaker_overrides=getattr(reuse_session_for_segments, "speaker_overrides", None),
                         default_speaker_preset=default_speaker_value,
@@ -11991,6 +13465,7 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                     with open(output_path, "wb") as outfile:
                         outfile.write(audio_payload)
                     audio_url = f"/api/translate_outputs/{output_filename}"
+                    metadata["audio_file_name"] = output_filename
                     unmixed_audio_bytes = metadata.pop("_unmixed_audio_bytes", None)
                     if unmixed_audio_bytes:
                         unmixed_filename = f"{audio_stem}_vocals.{response_format_value}"
@@ -12019,6 +13494,7 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                     metadata["subtitle_translated"] = subtitle_translated
                     metadata["subtitle_original"] = subtitle_original
                     metadata["language_code"] = language_code
+                    _apply_source_video_metadata(metadata, session)
 
                     if chunk_session_for_generation and chunk_session_for_generation.chunk_parent_id:
                         _mark_chunk_generated(
@@ -12663,6 +14139,7 @@ async def api_translate_audio(
     response_format: Optional[str] = Form(None),
     bitrate: Optional[str] = Form(None),
     audio: Optional[str] = Form(None),
+    downloaded_video_id: Optional[str] = Form(None),
     audio_mime_type: Optional[str] = Form(None),
     base_filename: Optional[str] = Form(None),
     custom_backing_audio: Optional[str] = Form(None),
@@ -12711,6 +14188,7 @@ async def api_translate_audio(
         payload: Optional[Dict[str, Any]] = None
         dest_language_value = dest_language
         audio_reference = audio
+        downloaded_video_id_value = downloaded_video_id
         audio_mime_type_value = audio_mime_type
         base_filename_value = base_filename
         custom_backing_audio_value = custom_backing_audio
@@ -12752,6 +14230,7 @@ async def api_translate_audio(
             request,
             dest_language is None
             and not audio_reference
+            and not downloaded_video_id_value
             and audio_file is None
             and _request_has_json_body(request),
         )
@@ -12765,6 +14244,7 @@ async def api_translate_audio(
                 return _status_error(f"Invalid translate request: {str(exc)}")
             dest_language_value = translate_req.dest_language
             audio_reference = translate_req.audio or audio_reference
+            downloaded_video_id_value = translate_req.downloaded_video_id or downloaded_video_id_value
             audio_mime_type_value = translate_req.audio_mime_type or audio_mime_type_value
             base_filename_value = translate_req.base_filename or base_filename_value
             custom_backing_audio_value = translate_req.custom_backing_audio or custom_backing_audio_value
@@ -12969,15 +14449,30 @@ async def api_translate_audio(
 
         uploaded_filename = audio_file.filename if audio_file else None
         audio_bytes: Optional[bytes] = None
+        downloaded_video_source: Optional[Dict[str, Any]] = None
         if reuse_source_session is None:
-            audio_bytes, audio_error = await _read_audio_request_bytes(
-                audio_file,
-                audio_reference,
-                missing_message="No audio provided for translation.",
-                empty_message="Provided audio data is empty.",
-            )
-            if audio_error is not None:
-                return audio_error
+            if (downloaded_video_id_value or "").strip():
+                (
+                    downloaded_video_source,
+                    audio_bytes,
+                    downloaded_audio_filename,
+                    downloaded_error,
+                ) = await _prepare_downloaded_video_audio_request(downloaded_video_id_value)
+                if downloaded_error is not None:
+                    return downloaded_error
+                audio_file = None
+                audio_reference = None
+                audio_mime_type_value = "audio/mpeg"
+                uploaded_filename = downloaded_audio_filename or uploaded_filename
+            else:
+                audio_bytes, audio_error = await _read_audio_request_bytes(
+                    audio_file,
+                    audio_reference,
+                    missing_message="No audio provided for translation.",
+                    empty_message="Provided audio data is empty.",
+                )
+                if audio_error is not None:
+                    return audio_error
 
         input_mime_type = audio_mime_type_value or (audio_file.content_type if audio_file else None) or "audio/wav"
 
@@ -13012,6 +14507,7 @@ async def api_translate_audio(
             "silence_volume_percent": silence_volume_percent_value,
             "reuse_session": bool(reuse_source_session),
             "base_output_name": resolved_base_name,
+            "downloaded_video": _public_downloaded_video_source(downloaded_video_source),
             "force_gemini_regenerate": force_gemini_regenerate_flag,
             "translation_llm_model": resolved_translation_llm_model,
             "transcription_pipeline": resolved_transcription_pipeline,
@@ -13151,8 +14647,10 @@ async def api_translate_audio(
                         translation_llm_model=resolved_translation_llm_model,
                         emit_status=emit_status,
                         source_chunk_session=reuse_session_for_translate,
-                         source_audio_filename=session_source_filename,
-                         source_base_name=resolved_base_name,
+                        source_audio_filename=session_source_filename,
+                        source_base_name=resolved_base_name,
+                        source_video_path=downloaded_video_source.get("path") if downloaded_video_source else None,
+                        source_video_filename=downloaded_video_source.get("filename") if downloaded_video_source else None,
                         force_gemini_regenerate=force_gemini_regenerate_flag,
                         initial_speaker_overrides=getattr(reuse_session_for_translate, "speaker_overrides", None),
                         default_speaker_preset=default_speaker_value,
@@ -13280,6 +14778,7 @@ async def api_translate_audio(
                     with open(output_path, "wb") as outfile:
                         outfile.write(audio_payload)
                     audio_url = f"/api/translate_outputs/{output_filename}"
+                    metadata["audio_file_name"] = output_filename
                     unmixed_audio_bytes = metadata.pop("_unmixed_audio_bytes", None)
                     if unmixed_audio_bytes:
                         unmixed_filename = f"{audio_stem}_vocals.{response_format_value}"
@@ -13310,6 +14809,7 @@ async def api_translate_audio(
                     if subtitle_original:
                         metadata["subtitle_original"] = subtitle_original
                     metadata["language_code"] = language_code
+                    _apply_source_video_metadata(metadata, session)
 
                     if reuse_session_for_translate and reuse_session_for_translate.chunk_parent_id:
                         _mark_chunk_generated(

@@ -117,7 +117,7 @@
             .hero-highlights {
                 flex: 1 1 100%;
                 display: grid;
-                grid-template-columns: repeat(5, 1fr);
+                grid-template-columns: repeat(6, 1fr);
                 gap: 12px;
                 z-index: 1;
             }
@@ -1684,6 +1684,18 @@
                             <span class="hero-card-feature">📄 SRT Export</span>
                         </div>
                     </div>
+                    <div class="hero-card" data-tab="video-download" role="button" tabindex="0">
+                        <div class="hero-card-header">
+                            <span class="icon">DL</span>
+                            <strong>Video Download</strong>
+                        </div>
+                        <div class="hero-card-features">
+                            <span class="hero-card-feature highlight">yt-dlp</span>
+                            <span class="hero-card-feature">Source Video</span>
+                            <span class="hero-card-feature">Audio Extract</span>
+                            <span class="hero-card-feature">Video Output</span>
+                        </div>
+                    </div>
                     <div class="hero-card" data-tab="speakers" role="button" tabindex="0">
                         <div class="hero-card-header">
                             <span class="icon">🎭</span>
@@ -1834,6 +1846,97 @@
                     </div>
                 </div>
 
+                <!-- Video Download Tab -->
+                <div id="video-download" class="tab-content">
+                    <div class="form-section">
+                        <h3>Video Download</h3>
+                        <p style="color: var(--text-muted); margin-bottom: 20px;">
+                            Download a source video with yt-dlp, then use it directly in Translate/Edit.
+                        </p>
+                        <form id="videoDownloadForm">
+                            <div class="form-row-2">
+                                <div class="form-group">
+                                    <label for="videoDownloadUrl">Video URL:</label>
+                                    <input type="url" id="videoDownloadUrl" placeholder="https://..." required>
+                                </div>
+                                <div class="form-group">
+                                    <label for="videoDownloadQuality">Quality:</label>
+                                    <select id="videoDownloadQuality">
+                                        <option value="best" selected>Best available</option>
+                                        <option value="2160p">4K / 2160p</option>
+                                        <option value="1440p">1440p</option>
+                                        <option value="1080p">1080p</option>
+                                        <option value="720p">720p</option>
+                                        <option value="480p">480p</option>
+                                        <option value="360p">360p</option>
+                                        <option value="worst">Smallest</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div style="display:flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+                                <button type="submit" class="btn" id="videoDownloadBtn">Download Video</button>
+                                <button type="button" class="btn btn-secondary" id="videoInfoBtn">Fetch Info</button>
+                                <button type="button" class="btn btn-secondary" id="refreshDownloadedVideosBtn">Refresh Library</button>
+                            </div>
+                        </form>
+                        <div id="videoDownloadStatus" class="status"></div>
+                        <div id="videoDownloadInfo" style="margin-top: 16px;"></div>
+                    </div>
+                    <div class="form-section">
+                        <h3>🍪 Cookies (for authenticated downloads)</h3>
+                        <p style="color: var(--text-muted); margin-bottom: 16px; font-size: 0.88rem;">
+                            Import cookies from your browser to download age-restricted or login-required videos. Cookies are saved per-domain and auto-applied.
+                        </p>
+                        <div id="cookieSitesList" style="margin-bottom: 14px; padding: 12px; background: rgba(118,75,162,0.08); border-radius: 10px; min-height: 36px;">
+                            <span style="color: var(--text-muted); font-size: 0.85rem;">No cookies saved yet.</span>
+                        </div>
+                        <details id="cookieImportDetails" style="margin-bottom: 12px;">
+                            <summary style="cursor: pointer; color: var(--accent); font-weight: 600; font-size: 0.9rem; padding: 6px 0;">📋 Import Cookies from cURL (DevTools)</summary>
+                            <div style="margin-top: 10px; padding: 14px; background: rgba(0,0,0,0.15); border-radius: 10px;">
+                                <p style="color: var(--text-muted); font-size: 0.82rem; margin-bottom: 10px; line-height: 1.5;">
+                                    <strong>How to get it:</strong><br>
+                                    1. Open the website in your browser (logged in)<br>
+                                    2. Press F12 → Network tab<br>
+                                    3. Refresh the page, click any request<br>
+                                    4. Right-click → Copy → Copy as cURL
+                                </p>
+                                <textarea id="cookieCurlInput" rows="4" placeholder="Paste your cURL command here..." style="width: 100%; resize: vertical; font-family: monospace; font-size: 0.82rem;"></textarea>
+                                <div style="display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap;">
+                                    <label style="font-size: 0.85rem; color: var(--text-secondary);">Domain:</label>
+                                    <input type="text" id="cookieDomainInput" placeholder="Auto-detected" style="flex: 1; min-width: 140px; font-size: 0.85rem;">
+                                    <button type="button" class="btn btn-secondary" id="cookieDetectDomainBtn" style="padding: 6px 12px; font-size: 0.82rem;">Detect</button>
+                                    <button type="button" class="btn" id="cookieImportBtn" style="padding: 6px 14px; font-size: 0.85rem;">Import & Save</button>
+                                </div>
+                                <div id="cookieImportStatus" class="status" style="margin-top: 8px;"></div>
+                            </div>
+                        </details>
+                        <details id="cookieUploadDetails" style="margin-bottom: 12px;">
+                            <summary style="cursor: pointer; color: var(--accent); font-weight: 600; font-size: 0.9rem; padding: 6px 0;">📁 Import cookies.txt file</summary>
+                            <div style="margin-top: 10px; padding: 14px; background: rgba(0,0,0,0.15); border-radius: 10px;">
+                                <p style="color: var(--text-muted); font-size: 0.82rem; margin-bottom: 10px; line-height: 1.5;">
+                                    Upload a standard Netscape cookies.txt file exported from browser extensions (e.g. <em>Get cookies.txt LOCALLY</em>).
+                                </p>
+                                <div style="display: flex; flex-direction: column; gap: 10px;">
+                                    <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                                        <label style="font-size: 0.85rem; color: var(--text-secondary);">Cookies File:</label>
+                                        <input type="file" id="cookieFileInput" accept=".txt" style="flex: 1; font-size: 0.85rem; background: transparent; border: none; padding: 0;">
+                                    </div>
+                                    <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                                        <label style="font-size: 0.85rem; color: var(--text-secondary);">Domain:</label>
+                                        <input type="text" id="cookieUploadDomainInput" placeholder="e.g. youtube.com" style="flex: 1; min-width: 140px; font-size: 0.85rem;">
+                                        <button type="button" class="btn" id="cookieUploadBtn" style="padding: 6px 14px; font-size: 0.85rem;">Upload & Save</button>
+                                    </div>
+                                </div>
+                                <div id="cookieUploadStatus" class="status" style="margin-top: 8px;"></div>
+                            </div>
+                        </details>
+                    </div>
+                    <div class="form-section">
+                        <h3>Downloaded Videos</h3>
+                        <div id="downloadedVideoList" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px;"></div>
+                    </div>
+                </div>
+
                 <!-- Speech Translation Tab -->
                 <div id="translate" class="tab-content">
                     <div class="form-section">
@@ -1857,6 +1960,16 @@
                                                 <label for="translateAudioFile">Source Audio:</label>
                                                 <input type="file" id="translateAudioFile" name="audio_file" accept=".wav,.mp3,.m4a,.flac,.aac,.ogg,.opus" required>
                                                 <small style="color: var(--text-muted); display: block; margin-top: 4px; font-size: 0.75rem;">WAV, MP3, M4A, FLAC, AAC, OGG, OPUS</small>
+                                            </div>
+                                            <div class="form-group">
+                                                <label for="translateDownloadedVideo">Downloaded Video:</label>
+                                                <div style="display:flex; gap: 8px; align-items:center;">
+                                                    <select id="translateDownloadedVideo" style="flex: 1;">
+                                                        <option value="">Use uploaded audio</option>
+                                                    </select>
+                                                    <button type="button" class="btn btn-secondary" id="translateRefreshVideosBtn" style="padding: 8px 12px; font-size: 0.8rem;">Refresh</button>
+                                                </div>
+                                                <small id="translateDownloadedVideoHint" style="color: var(--text-muted); display: block; margin-top: 4px; font-size: 0.75rem;">Select a downloaded video to auto-extract MP3 with FFmpeg.</small>
                                             </div>
                                             <div class="form-group">
                                                 <label for="translateBaseFilename">Base Output Filename:</label>
@@ -3171,6 +3284,13 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 TRANSLATE_GENERATE_CHUNKS: '/api/translate_generate_chunks',
                 TRANSLATE_SPLIT_AUDIO: '/api/translate_split_audio',
                 TRANSLATE_SEGMENT_PREVIEW: '/api/translate_segment_preview',
+                DOWNLOADED_VIDEOS: '/api/downloaded_videos',
+                VIDEO_INFO: '/api/video_info',
+                VIDEO_DOWNLOAD: '/api/video_download',
+                VIDEO_REPLACE_AUDIO: '/api/video_replace_audio',
+                COOKIES_LIST: '/api/cookies',
+                COOKIES_IMPORT_CURL: '/api/cookies/import_curl',
+                COOKIES_UPLOAD: '/api/cookies/upload',
                 DESIGN_VOICE: '/api/design-voice',
                 DESIGN_VOICE_STATUS: '/api/design-voice/status',
                 DESIGN_VOICE_SAVE_PRESET: '/api/design-voice/save-preset',
@@ -3327,6 +3447,10 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 if (tabName === 'speakers') {
                     loadSpeakerList();
                 }
+                if (tabName === 'video-download') {
+                    loadDownloadedVideos();
+                    loadCookieSites();
+                }
                 
                 if (content && window.matchMedia('(max-width: 1024px)').matches) {
                     content.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -3401,6 +3525,462 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
 
             function hideStatus(elementId = 'status') {
                 document.getElementById(elementId).style.display = 'none';
+            }
+
+            function getSelectedDownloadedVideoId() {
+                return (selectedDownloadedVideoId || (translateDownloadedVideoSelect ? translateDownloadedVideoSelect.value : '') || '').trim();
+            }
+
+            function getSelectedDownloadedVideo() {
+                const id = getSelectedDownloadedVideoId();
+                if (!id) {
+                    return null;
+                }
+                return downloadedVideos.find(video => video.id === id) || null;
+            }
+
+            function renderDownloadedVideoList() {
+                const list = document.getElementById('downloadedVideoList');
+                if (!list) {
+                    return;
+                }
+                if (!downloadedVideos.length) {
+                    list.innerHTML = '<div class="segment-empty">No downloaded videos yet.</div>';
+                    return;
+                }
+                list.innerHTML = downloadedVideos.map(video => {
+                    const title = escapeHtml(video.title || video.filename || 'Downloaded video');
+                    const size = typeof video.size_mb === 'number' ? `${video.size_mb} MB` : '';
+                    const duration = video.duration_label ? ` • ${escapeHtml(video.duration_label)}` : '';
+                    const url = video.url || `${ENDPOINTS.DOWNLOADED_VIDEOS}/${encodeURIComponent(video.id)}`;
+                    return `
+                        <div class="segment-card" data-video-id="${escapeHtml(video.id)}" style="padding: 14px;">
+                            <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+                                <div style="min-width:0;">
+                                    <div class="segment-header" title="${title}">${title}</div>
+                                    <small style="color:var(--text-muted);">${escapeHtml(video.extension || 'video').toUpperCase()}${size ? ` • ${size}` : ''}${duration}</small>
+                                </div>
+                            </div>
+                            <video controls preload="metadata" src="${url}" style="width:100%; max-height:220px; margin-top:10px; border-radius:8px; background:#000;"></video>
+                            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
+                                <button type="button" class="btn btn-secondary downloaded-video-use" data-video-id="${escapeHtml(video.id)}" style="padding:6px 12px;font-size:0.82rem;">Use in Translate</button>
+                                <a class="btn btn-secondary" href="${url}" download="${escapeHtml(video.filename || video.id)}" style="padding:6px 12px;font-size:0.82rem;">Download</a>
+                                <button type="button" class="btn btn-danger downloaded-video-delete" data-video-id="${escapeHtml(video.id)}" data-video-title="${title}" style="padding:6px 12px;font-size:0.82rem;">🗑️ Delete</button>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+                list.querySelectorAll('.downloaded-video-use').forEach(button => {
+                    button.addEventListener('click', () => {
+                        selectDownloadedVideo(button.dataset.videoId || '');
+                        switchTab('translate');
+                    });
+                });
+                list.querySelectorAll('.downloaded-video-delete').forEach(button => {
+                    button.addEventListener('click', () => {
+                        deleteDownloadedVideo(button.dataset.videoId || '', button.dataset.videoTitle || '');
+                    });
+                });
+            }
+
+            function populateDownloadedVideoSelect() {
+                if (!translateDownloadedVideoSelect) {
+                    return;
+                }
+                const previous = selectedDownloadedVideoId || translateDownloadedVideoSelect.value || '';
+                translateDownloadedVideoSelect.innerHTML = '<option value="">Use uploaded audio</option>';
+                downloadedVideos.forEach(video => {
+                    const option = document.createElement('option');
+                    option.value = video.id;
+                    const bits = [video.title || video.filename || video.id];
+                    if (video.duration_label) {
+                        bits.push(video.duration_label);
+                    }
+                    if (typeof video.size_mb === 'number') {
+                        bits.push(`${video.size_mb} MB`);
+                    }
+                    option.textContent = bits.join(' - ');
+                    translateDownloadedVideoSelect.appendChild(option);
+                });
+                if (previous && downloadedVideos.some(video => video.id === previous)) {
+                    translateDownloadedVideoSelect.value = previous;
+                    selectedDownloadedVideoId = previous;
+                } else {
+                    translateDownloadedVideoSelect.value = '';
+                    selectedDownloadedVideoId = '';
+                }
+                updateDownloadedVideoHint();
+                updateAudioInputRequirement();
+            }
+
+            async function loadDownloadedVideos(options = {}) {
+                try {
+                    const response = await fetch(ENDPOINTS.DOWNLOADED_VIDEOS, { cache: 'no-cache' });
+                    const data = await response.json();
+                    downloadedVideos = Array.isArray(data.videos) ? data.videos : [];
+                    if (options.selectId) {
+                        selectedDownloadedVideoId = options.selectId;
+                    }
+                    populateDownloadedVideoSelect();
+                    renderDownloadedVideoList();
+                } catch (error) {
+                    console.warn('Failed to load downloaded videos', error);
+                    const list = document.getElementById('downloadedVideoList');
+                    if (list) {
+                        list.innerHTML = '<div class="segment-empty">Failed to load downloaded videos.</div>';
+                    }
+                }
+            }
+
+            function updateDownloadedVideoHint() {
+                if (!translateDownloadedVideoHint) {
+                    return;
+                }
+                const video = getSelectedDownloadedVideo();
+                if (!video) {
+                    translateDownloadedVideoHint.textContent = 'Select a downloaded video to auto-extract MP3 with FFmpeg.';
+                    return;
+                }
+                const details = [];
+                if (video.duration_label) {
+                    details.push(video.duration_label);
+                }
+                if (typeof video.size_mb === 'number') {
+                    details.push(`${video.size_mb} MB`);
+                }
+                translateDownloadedVideoHint.textContent = `Using ${video.filename || video.id}${details.length ? ` (${details.join(', ')})` : ''}.`;
+            }
+
+            function selectDownloadedVideo(videoId) {
+                selectedDownloadedVideoId = videoId || '';
+                if (translateDownloadedVideoSelect) {
+                    translateDownloadedVideoSelect.value = selectedDownloadedVideoId;
+                }
+                const video = getSelectedDownloadedVideo();
+                if (video && translateBaseFilenameInput && !translateBaseFilenameInput.dataset.userEdited) {
+                    const autoBase = deriveBaseFromFilename(video.filename || video.title || video.id);
+                    if (autoBase) {
+                        translateBaseFilenameInput.value = autoBase;
+                        translateBaseFilenameInput.dataset.userEdited = 'false';
+                    }
+                }
+                if (video && translateAudioInput) {
+                    translateAudioInput.value = '';
+                }
+                if (video && (currentChunkSessionId || translateChunkSessions.length)) {
+                    resetChunkResults();
+                }
+                if (video) {
+                    const reuseCheckbox = document.getElementById('translateReuseSeparation');
+                    if (reuseCheckbox) {
+                        reuseCheckbox.checked = false;
+                    }
+                }
+                updateDownloadedVideoHint();
+                updateAudioInputRequirement();
+                updateFfmpegCommands();
+            }
+
+            async function fetchVideoInfo() {
+                const urlInput = document.getElementById('videoDownloadUrl');
+                const infoDiv = document.getElementById('videoDownloadInfo');
+                const url = urlInput ? urlInput.value.trim() : '';
+                if (!url) {
+                    showStatus('Enter a video URL first.', 'error', 'videoDownloadStatus');
+                    return;
+                }
+                showStatus('Fetching video info...', 'info', 'videoDownloadStatus');
+                try {
+                    const response = await fetch(ENDPOINTS.VIDEO_INFO, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ url }),
+                    });
+                    const data = await response.json();
+                    if (!response.ok || data.status === 'error') {
+                        throw new Error(data.message || data.error || `Info failed (${response.status})`);
+                    }
+                    if (infoDiv) {
+                        const formats = Array.isArray(data.formats) ? data.formats.slice(0, 8) : [];
+                        infoDiv.innerHTML = `
+                            <div class="segment-card" style="padding:14px;">
+                                <div class="segment-header">${escapeHtml(data.title || 'Video')}</div>
+                                <small style="color:var(--text-muted);">${escapeHtml(data.duration_label || '')}</small>
+                                ${data.thumbnail ? `<img src="${data.thumbnail}" alt="" style="width:100%;max-height:260px;object-fit:cover;border-radius:8px;margin-top:10px;">` : ''}
+                                ${formats.length ? `<div style="margin-top:10px;color:var(--text-muted);font-size:0.82rem;">${formats.map(fmt => escapeHtml([fmt.resolution, fmt.ext, fmt.note].filter(Boolean).join(' / '))).join('<br>')}</div>` : ''}
+                                ${data.format_warning ? `<div style="margin-top:10px;color:var(--error);font-size:0.82rem;">${escapeHtml(data.format_warning)}</div>` : ''}
+                            </div>
+                        `;
+                    }
+
+                    const qualitySelect = document.getElementById('videoDownloadQuality');
+                    if (qualitySelect) {
+                        qualitySelect.innerHTML = '';
+                        const availableFormats = Array.isArray(data.formats)
+                            ? data.formats.filter(fmt => fmt && fmt.format_id)
+                            : [];
+                        if (availableFormats.length > 0) {
+                            availableFormats.forEach(fmt => {
+                                const option = document.createElement('option');
+                                const isVideo = fmt.vcodec && fmt.vcodec !== 'none';
+                                const isAudio = fmt.acodec && fmt.acodec !== 'none';
+                                
+                                let selector = fmt.format_id;
+                                let typeLabel = '';
+                                if (isVideo && !isAudio) {
+                                    selector = `${fmt.format_id}+bestaudio/${fmt.format_id}/best`;
+                                    typeLabel = '📹 Video';
+                                } else if (isAudio && !isVideo) {
+                                    typeLabel = '🎵 Audio';
+                                } else {
+                                    typeLabel = '🎥 Combined';
+                                }
+                                
+                                option.value = selector;
+                                
+                                const res = fmt.resolution || '';
+                                const ext = fmt.ext || '';
+                                const note = fmt.note || '';
+                                const size = fmt.filesize ? ` (${(fmt.filesize / (1024 * 1024)).toFixed(1)} MB)` : '';
+                                option.textContent = `${typeLabel} - ${res} (${ext}) ${note}${size}`;
+                                qualitySelect.appendChild(option);
+                            });
+                            qualitySelect.selectedIndex = 0;
+                        } else {
+                            const option = document.createElement('option');
+                            option.value = 'best';
+                            option.textContent = 'Best available (yt-dlp fallback)';
+                            qualitySelect.appendChild(option);
+                        }
+                    }
+
+                    showStatus(data.format_warning || 'Video info loaded.', data.format_warning ? 'error' : 'success', 'videoDownloadStatus');
+                } catch (error) {
+                    showStatus(`Failed to fetch info: ${error.message}`, 'error', 'videoDownloadStatus');
+                }
+            }
+
+            async function handleVideoDownloadSubmit(event) {
+                event.preventDefault();
+                const urlInput = document.getElementById('videoDownloadUrl');
+                const qualitySelect = document.getElementById('videoDownloadQuality');
+                const downloadBtn = document.getElementById('videoDownloadBtn');
+                const url = urlInput ? urlInput.value.trim() : '';
+                const quality = qualitySelect ? qualitySelect.value : 'best';
+                if (!url) {
+                    showStatus('Enter a video URL first.', 'error', 'videoDownloadStatus');
+                    return;
+                }
+                if (downloadBtn) {
+                    downloadBtn.disabled = true;
+                }
+                showStatus('Starting video download...', 'info', 'videoDownloadStatus');
+                try {
+                    const response = await fetch(ENDPOINTS.VIDEO_DOWNLOAD, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ url, quality }),
+                    });
+                    if (!response.ok) {
+                        const message = await parseHttpError(response, `Download failed (${response.status})`);
+                        throw new Error(message);
+                    }
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+                    let completedVideo = null;
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) {
+                            break;
+                        }
+                        buffer += decoder.decode(value, { stream: true });
+                        let newlineIndex = buffer.indexOf('\n');
+                        while (newlineIndex !== -1) {
+                            const line = buffer.slice(0, newlineIndex).trim();
+                            buffer = buffer.slice(newlineIndex + 1);
+                            newlineIndex = buffer.indexOf('\n');
+                            if (!line) {
+                                continue;
+                            }
+                            const eventData = parseJsonStreamEventLine(line);
+                            if (!eventData) {
+                                continue;
+                            }
+                            const eventType = eventData.event || 'status';
+                            if (eventType === 'progress') {
+                                const percent = typeof eventData.percent === 'number' ? ` ${eventData.percent.toFixed(1)}%` : '';
+                                showStatus(`${eventData.message || 'Downloading video...'}${percent}`, 'info', 'videoDownloadStatus');
+                            } else if (eventType === 'status') {
+                                showStatus(eventData.message || 'Processing video...', 'info', 'videoDownloadStatus');
+                            } else if (eventType === 'error') {
+                                throw new Error(eventData.message || 'Video download failed.');
+                            } else if (eventType === 'complete') {
+                                completedVideo = eventData.video || null;
+                                showStatus(eventData.message || 'Video downloaded.', 'success', 'videoDownloadStatus');
+                            }
+                        }
+                    }
+                    await loadDownloadedVideos({ selectId: completedVideo ? completedVideo.id : selectedDownloadedVideoId });
+                } catch (error) {
+                    showStatus(`Download failed: ${error.message}`, 'error', 'videoDownloadStatus');
+                } finally {
+                    if (downloadBtn) {
+                        downloadBtn.disabled = false;
+                    }
+                }
+            }
+
+            // ============================================================================
+            // Cookie Management Functions
+            // ============================================================================
+
+            async function loadCookieSites() {
+                const container = document.getElementById('cookieSitesList');
+                if (!container) return;
+                try {
+                    const response = await fetch(ENDPOINTS.COOKIES_LIST, { cache: 'no-cache' });
+                    const data = await response.json();
+                    if (data.status !== 'ok' || !data.sites || Object.keys(data.sites).length === 0) {
+                        container.innerHTML = '<span style="color: var(--text-muted); font-size: 0.85rem;">No cookies saved yet.</span>';
+                        return;
+                    }
+                    container.innerHTML = Object.entries(data.sites).map(([domain, info]) => `
+                        <div style="display: flex; align-items: center; gap: 8px; padding: 4px 0;">
+                            <span style="color: #51cf66; font-size: 0.88rem;">✓ ${escapeHtml(domain)}</span>
+                            <span style="color: var(--text-muted); font-size: 0.8rem;">(${info.count} cookies)</span>
+                            <button type="button" class="btn btn-danger cookie-delete-btn" data-domain="${escapeHtml(domain)}" style="padding: 2px 8px; font-size: 0.75rem; margin-left: auto;">✕</button>
+                        </div>
+                    `).join('');
+                    container.querySelectorAll('.cookie-delete-btn').forEach(btn => {
+                        btn.addEventListener('click', () => deleteCookieSite(btn.dataset.domain));
+                    });
+                } catch (error) {
+                    console.warn('Failed to load cookie sites', error);
+                }
+            }
+
+            async function importCookiesFromCurl() {
+                const curlInput = document.getElementById('cookieCurlInput');
+                const domainInput = document.getElementById('cookieDomainInput');
+                const curlText = curlInput ? curlInput.value.trim() : '';
+                const domain = domainInput ? domainInput.value.trim() : '';
+                if (!curlText) {
+                    showStatus('Paste a cURL command first.', 'error', 'cookieImportStatus');
+                    return;
+                }
+                showStatus('Importing cookies...', 'info', 'cookieImportStatus');
+                try {
+                    const body = { curl_text: curlText };
+                    if (domain) body.domain = domain;
+                    const response = await fetch(ENDPOINTS.COOKIES_IMPORT_CURL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    const data = await response.json();
+                    if (!response.ok || data.status === 'error') {
+                        throw new Error(data.message || data.error || 'Import failed');
+                    }
+                    showStatus(data.message || 'Cookies imported!', 'success', 'cookieImportStatus');
+                    if (curlInput) curlInput.value = '';
+                    if (domainInput) domainInput.value = '';
+                    loadCookieSites();
+                } catch (error) {
+                    showStatus(`Import failed: ${error.message}`, 'error', 'cookieImportStatus');
+                }
+            }
+
+            async function uploadCookiesFile() {
+                const fileInput = document.getElementById('cookieFileInput');
+                const domainInput = document.getElementById('cookieUploadDomainInput');
+                const file = fileInput ? fileInput.files[0] : null;
+                const domain = domainInput ? domainInput.value.trim() : '';
+
+                if (!file) {
+                    showStatus('Select a cookies.txt file first.', 'error', 'cookieUploadStatus');
+                    return;
+                }
+                if (!domain) {
+                    showStatus('Enter the domain for these cookies.', 'error', 'cookieUploadStatus');
+                    return;
+                }
+
+                showStatus('Uploading cookies...', 'info', 'cookieUploadStatus');
+                try {
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    formData.append('domain', domain);
+
+                    const response = await fetch(ENDPOINTS.COOKIES_UPLOAD, {
+                        method: 'POST',
+                        body: formData,
+                    });
+                    const data = await response.json();
+                    if (!response.ok || data.status === 'error') {
+                        throw new Error(data.message || data.error || 'Upload failed');
+                    }
+                    showStatus(data.message || 'Cookies uploaded successfully!', 'success', 'cookieUploadStatus');
+                    if (fileInput) fileInput.value = '';
+                    if (domainInput) domainInput.value = '';
+                    loadCookieSites();
+                } catch (error) {
+                    showStatus(`Upload failed: ${error.message}`, 'error', 'cookieUploadStatus');
+                }
+            }
+
+            function detectCookieDomain() {
+                const curlInput = document.getElementById('cookieCurlInput');
+                const domainInput = document.getElementById('cookieDomainInput');
+                const curlText = curlInput ? curlInput.value.trim() : '';
+                if (!curlText) return;
+                // Simple client-side domain detection from URL in cURL
+                const urlMatch = curlText.match(/https?:\/\/(?:www\.)?([^\s\/'";\ ]+)/);
+                if (urlMatch) {
+                    let domain = urlMatch[1];
+                    const parts = domain.split('.');
+                    if (parts.length > 2) domain = parts.slice(-2).join('.');
+                    if (domainInput) domainInput.value = domain;
+                }
+            }
+
+            async function deleteCookieSite(domain) {
+                if (!confirm(`Delete cookies for ${domain}?`)) return;
+                try {
+                    const response = await fetch(`${ENDPOINTS.COOKIES_LIST}/${encodeURIComponent(domain)}`, {
+                        method: 'DELETE',
+                    });
+                    const data = await response.json();
+                    if (!response.ok || data.status === 'error') {
+                        throw new Error(data.message || 'Delete failed');
+                    }
+                    loadCookieSites();
+                } catch (error) {
+                    console.error('Failed to delete cookies:', error);
+                }
+            }
+
+            // ============================================================================
+            // Video Delete Function
+            // ============================================================================
+
+            async function deleteDownloadedVideo(videoId, videoTitle) {
+                if (!videoId) return;
+                const displayName = videoTitle || videoId;
+                if (!confirm(`Delete video "${displayName}"? This cannot be undone.`)) return;
+                try {
+                    const response = await fetch(`${ENDPOINTS.DOWNLOADED_VIDEOS}/${encodeURIComponent(videoId)}`, {
+                        method: 'DELETE',
+                    });
+                    const data = await response.json();
+                    if (!response.ok || data.status === 'error') {
+                        throw new Error(data.message || 'Delete failed');
+                    }
+                    showStatus(data.message || 'Video deleted.', 'success', 'videoDownloadStatus');
+                    await loadDownloadedVideos();
+                } catch (error) {
+                    showStatus(`Delete failed: ${error.message}`, 'error', 'videoDownloadStatus');
+                }
             }
 
             async function loadSpeakers() {
@@ -4173,6 +4753,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             const translateMergeStatus = document.getElementById('translateMergeStatus');
             const translateChunkBatchStatus = document.getElementById('translateChunkBatchStatus');
             const translateAudioInput = document.getElementById('translateAudioFile');
+            const translateDownloadedVideoSelect = document.getElementById('translateDownloadedVideo');
+            const translateDownloadedVideoHint = document.getElementById('translateDownloadedVideoHint');
+            const translateRefreshVideosBtn = document.getElementById('translateRefreshVideosBtn');
             const translateBaseFilenameInput = document.getElementById('translateBaseFilename');
             const ffmpegPanel = document.getElementById('translateFfmpegPanel');
             const ffmpegExtractCmd = document.getElementById('ffmpegExtractCmd');
@@ -4181,6 +4764,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             const ffmpegSubtitleOriginalCmd = document.getElementById('ffmpegSubtitleOriginalCmd');
             let currentTranslateSessionId = null;
             let currentTranslateSegments = [];
+            let downloadedVideos = [];
+            let selectedDownloadedVideoId = '';
             let activeSyncedAudio = null;
             let translateSpeakerProfiles = [];
             let translateSpeakerProfileMap = {};
@@ -4549,6 +5134,17 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             }
             if (translateAudioInput) {
                 translateAudioInput.addEventListener('change', () => {
+                    if (translateAudioInput.files && translateAudioInput.files.length) {
+                        selectedDownloadedVideoId = '';
+                        if (translateDownloadedVideoSelect) {
+                            translateDownloadedVideoSelect.value = '';
+                        }
+                        const reuseCheckbox = document.getElementById('translateReuseSeparation');
+                        if (reuseCheckbox) {
+                            reuseCheckbox.checked = false;
+                        }
+                        updateDownloadedVideoHint();
+                    }
                     if (
                         translateBaseFilenameInput &&
                         translateAudioInput.files &&
@@ -4560,7 +5156,67 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             translateBaseFilenameInput.dataset.userEdited = 'false';
                         }
                     }
+                    updateAudioInputRequirement();
                     updateFfmpegCommands();
+                });
+            }
+            if (translateDownloadedVideoSelect) {
+                translateDownloadedVideoSelect.addEventListener('change', () => {
+                    selectDownloadedVideo(translateDownloadedVideoSelect.value || '');
+                });
+            }
+            if (translateRefreshVideosBtn) {
+                translateRefreshVideosBtn.addEventListener('click', () => loadDownloadedVideos());
+            }
+            const videoDownloadForm = document.getElementById('videoDownloadForm');
+            if (videoDownloadForm) {
+                videoDownloadForm.addEventListener('submit', handleVideoDownloadSubmit);
+            }
+            const videoInfoBtn = document.getElementById('videoInfoBtn');
+            if (videoInfoBtn) {
+                videoInfoBtn.addEventListener('click', fetchVideoInfo);
+            }
+            const refreshDownloadedVideosBtn = document.getElementById('refreshDownloadedVideosBtn');
+            if (refreshDownloadedVideosBtn) {
+                refreshDownloadedVideosBtn.addEventListener('click', () => loadDownloadedVideos());
+            }
+            const cookieImportBtn = document.getElementById('cookieImportBtn');
+            if (cookieImportBtn) {
+                cookieImportBtn.addEventListener('click', importCookiesFromCurl);
+            }
+            const cookieDetectDomainBtn = document.getElementById('cookieDetectDomainBtn');
+            if (cookieDetectDomainBtn) {
+                cookieDetectDomainBtn.addEventListener('click', detectCookieDomain);
+            }
+            const cookieUploadBtn = document.getElementById('cookieUploadBtn');
+            if (cookieUploadBtn) {
+                cookieUploadBtn.addEventListener('click', uploadCookiesFile);
+            }
+            const cookieFileInput = document.getElementById('cookieFileInput');
+            if (cookieFileInput) {
+                cookieFileInput.addEventListener('change', () => {
+                    const file = cookieFileInput.files[0];
+                    if (file) {
+                        const name = file.name.toLowerCase();
+                        const domainMatch = name.match(/([a-z0-9-]+\.[a-z]{2,})(?:_cookies)?\.txt$/);
+                        if (domainMatch) {
+                            const domainInput = document.getElementById('cookieUploadDomainInput');
+                            if (domainInput && !domainInput.value.trim()) {
+                                domainInput.value = domainMatch[1];
+                            }
+                        } else {
+                            const parts = name.split(/[._-]/);
+                            for (let i = 0; i < parts.length - 1; i++) {
+                                if (parts[i] && parts[i+1] && parts[i+1].length >= 2 && ['com', 'net', 'org', 'edu', 'tv', 'co', 'io'].includes(parts[i+1])) {
+                                    const domainInput = document.getElementById('cookieUploadDomainInput');
+                                    if (domainInput && !domainInput.value.trim()) {
+                                        domainInput.value = `${parts[i]}.${parts[i+1]}`;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 });
             }
             updateFfmpegCommands();
@@ -4623,7 +5279,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 const reuseCheckbox = document.getElementById('translateReuseSeparation');
                 const reuseCandidateActive =
                     reuseCheckbox && reuseCheckbox.checked && (currentChunkSessionId || currentTranslateSessionId);
-                const needsFile = !currentChunkSessionId && !reuseCandidateActive;
+                const downloadedVideoActive = Boolean(getSelectedDownloadedVideoId());
+                const needsFile = !downloadedVideoActive && !currentChunkSessionId && !reuseCandidateActive;
                 translateAudioInput.required = needsFile;
             }
 
@@ -5413,12 +6070,18 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 hideStatus(statusId);
                 resetChunkResults();
                 const audioInput = document.getElementById('translateAudioFile');
-                if (!audioInput || !audioInput.files || !audioInput.files.length) {
-                    showStatus('Select a source audio file before splitting.', 'error', statusId);
+                const downloadedVideoId = getSelectedDownloadedVideoId();
+                const hasAudioFile = Boolean(audioInput && audioInput.files && audioInput.files.length);
+                if (!hasAudioFile && !downloadedVideoId) {
+                    showStatus('Select a source audio file or downloaded video before splitting.', 'error', statusId);
                     return;
                 }
                 const formData = new FormData();
-                formData.append('audio_file', audioInput.files[0]);
+                if (downloadedVideoId) {
+                    formData.append('downloaded_video_id', downloadedVideoId);
+                } else {
+                    formData.append('audio_file', audioInput.files[0]);
+                }
                 if (translateDestLanguageSelect && translateDestLanguageSelect.value.trim()) {
                     formData.append('dest_language', translateDestLanguageSelect.value.trim());
                 }
@@ -5989,6 +6652,105 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 return link;
             }
 
+            function resolveSourceVideo(metadata = {}) {
+                const candidates = [
+                    metadata.source_video,
+                    metadata.downloaded_video,
+                    metadata.sources && metadata.sources.source_video,
+                ];
+                const sourceVideo = candidates.find(candidate => candidate && typeof candidate === 'object');
+                if (!sourceVideo) {
+                    return null;
+                }
+                const id = sourceVideo.id || sourceVideo.filename || sourceVideo.name || '';
+                if (!id) {
+                    return null;
+                }
+                return {
+                    ...sourceVideo,
+                    id,
+                };
+            }
+
+            function renderTranslatedVideoPreview(container, data = {}) {
+                if (!container || !data.video_url) {
+                    return;
+                }
+                let panel = container.querySelector('[data-translated-video-panel]');
+                if (!panel) {
+                    panel = document.createElement('section');
+                    panel.className = 'segment-card';
+                    panel.dataset.translatedVideoPanel = 'true';
+                    panel.style.marginTop = '16px';
+                    container.appendChild(panel);
+                }
+                panel.innerHTML = '';
+
+                const title = document.createElement('div');
+                title.className = 'segment-header';
+                title.textContent = 'Translated Video';
+                panel.appendChild(title);
+
+                const video = document.createElement('video');
+                video.controls = true;
+                video.preload = 'metadata';
+                video.src = `${data.video_url}?t=${Date.now()}`;
+                video.style.width = '100%';
+                video.style.maxHeight = '420px';
+                video.style.marginTop = '10px';
+                video.style.borderRadius = '8px';
+                video.style.background = '#000';
+                panel.appendChild(video);
+
+                const actions = document.createElement('div');
+                actions.style.display = 'flex';
+                actions.style.gap = '8px';
+                actions.style.flexWrap = 'wrap';
+                actions.style.marginTop = '10px';
+
+                actions.appendChild(createDownloadLink(data.video_url, data.file_name || 'translated_video.mp4', 'Download video', true));
+                panel.appendChild(actions);
+            }
+
+            async function renderTranslatedVideoFromAudio({ sourceVideo, audioFileName, sessionId, outputBaseName, container, button }) {
+                if (!sourceVideo || !audioFileName) {
+                    showStatus('Translated video cannot be rendered because source video metadata is missing.', 'error', 'translateStatus');
+                    return;
+                }
+                const originalLabel = button ? button.textContent : '';
+                if (button) {
+                    button.disabled = true;
+                    button.textContent = 'Rendering video...';
+                }
+                showStatus('Replacing the original video audio track...', 'info', 'translateStatus');
+                try {
+                    const safeBase = deriveBaseFromFilename(outputBaseName || audioFileName || sourceVideo.filename || 'translated_video');
+                    const response = await fetch(ENDPOINTS.VIDEO_REPLACE_AUDIO, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            downloaded_video_id: sourceVideo.id || sourceVideo.filename,
+                            session_id: sessionId || null,
+                            audio_file_name: audioFileName,
+                            output_filename: safeBase ? `${safeBase}_translated_video` : '',
+                        }),
+                    });
+                    const data = await response.json();
+                    if (!response.ok || data.status === 'error') {
+                        throw new Error(data.message || data.error || `Video render failed (${response.status})`);
+                    }
+                    renderTranslatedVideoPreview(container, data);
+                    showStatus(data.message || 'Translated video created.', 'success', 'translateStatus');
+                } catch (error) {
+                    showStatus(`Video render failed: ${error.message}`, 'error', 'translateStatus');
+                } finally {
+                    if (button) {
+                        button.disabled = false;
+                        button.textContent = originalLabel || 'Render video';
+                    }
+                }
+            }
+
             function resolveOriginalAudioUrl(metadata = {}) {
                 const separation = metadata && metadata.separation ? metadata.separation : {};
                 const chunk = metadata && metadata.chunk ? metadata.chunk : {};
@@ -6040,6 +6802,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 const originalSubtitleUrl = normalizeSubtitleUrl(options.originalSubtitleUrl);
                 const metadata = options.metadata || {};
                 const fallbackSegments = Array.isArray(options.segments) ? options.segments : [];
+                const sourceVideo = resolveSourceVideo(metadata);
+                const translatedAudioFileName = metadata.audio_file_name || options.audioFileName || options.downloadName || downloadName;
                 const originalAudioUrl = resolveOriginalAudioUrl(metadata);
                 const backingAudioUrl = resolveBackingAudioUrl(metadata);
                 const translatedVocalUrl = resolveTranslatedVocalUrl(metadata, audioUrl);
@@ -6207,6 +6971,23 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             true
                         )
                     );
+                }
+                if (sourceVideo && translatedAudioFileName) {
+                    const renderVideoBtn = document.createElement('button');
+                    renderVideoBtn.type = 'button';
+                    renderVideoBtn.className = 'btn btn-secondary';
+                    renderVideoBtn.textContent = 'Render video';
+                    renderVideoBtn.addEventListener('click', () => {
+                        renderTranslatedVideoFromAudio({
+                            sourceVideo,
+                            audioFileName: translatedAudioFileName,
+                            sessionId: metadata.session_id || metadata.reuse_session_id || options.sessionId || '',
+                            outputBaseName: metadata.output_base_name || metadata.base_output_name || translatedAudioFileName,
+                            container: resultDiv,
+                            button: renderVideoBtn,
+                        });
+                    });
+                    downloads.appendChild(renderVideoBtn);
                 }
                 stage.appendChild(downloads);
 
@@ -8281,6 +9062,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     }
 
                     const hasChunkSelection = Boolean(currentChunkSessionId);
+                    const downloadedVideoId = getSelectedDownloadedVideoId();
                     const selectedFormat = (formatSelect.value || 'mp3').toLowerCase();
 
                     const advancedEnabled = translateAdvancedToggle && translateAdvancedToggle.checked;
@@ -8304,10 +9086,11 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
 
                     if (
                         (!audioInput.files || audioInput.files.length === 0) &&
+                        !downloadedVideoId &&
                         !reuseSeparationEnabled &&
                         !hasChunkSelection
                     ) {
-                        showStatus('Please select a source audio file.', 'error', statusId);
+                        showStatus('Please select a source audio file or downloaded video.', 'error', statusId);
                         return;
                     }
 
@@ -8316,6 +9099,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         const formData = new FormData();
                         if (reuseSeparationEnabled) {
                             formData.append('reuse_session_id', reuseCandidateSessionId);
+                        } else if (downloadedVideoId) {
+                            formData.append('downloaded_video_id', downloadedVideoId);
                         } else if (audioInput.files && audioInput.files[0]) {
                             formData.append('audio_file', audioInput.files[0]);
                         } else if (hasChunkSelection) {
@@ -8404,6 +9189,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     const formData = new FormData();
                     if (hasChunkSelection) {
                         formData.append('reuse_session_id', currentChunkSessionId);
+                    } else if (downloadedVideoId) {
+                        formData.append('downloaded_video_id', downloadedVideoId);
                     } else {
                         formData.append('audio_file', audioInput.files[0]);
                     }
@@ -9418,9 +10205,15 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         streamingSettings.style.display = this.checked ? 'block' : 'none';
                     });
                 }
-                document.addEventListener('DOMContentLoaded', function () {
+                const loadInitialData = function () {
                     loadSpeakers();
-                });
+                    loadDownloadedVideos();
+                };
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', loadInitialData);
+                } else {
+                    loadInitialData();
+                }
             }
 
             init();
