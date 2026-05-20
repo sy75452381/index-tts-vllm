@@ -204,6 +204,24 @@ def _env_int(name: str, default: int, *, min_value: int = 1, max_value: Optional
     return parsed
 
 
+def _env_ffmpeg_threads(name: str = "FFMPEG_THREADS") -> int:
+    """Resolve FFmpeg worker threads; 0/auto lets FFmpeg choose."""
+    cpu_threads = max(1, os.cpu_count() or 1)
+    value = os.environ.get(name)
+    if value is None:
+        return cpu_threads
+    normalized = value.strip().lower()
+    if normalized in {"0", "auto"}:
+        return 0
+    try:
+        parsed = int(normalized)
+    except (TypeError, ValueError):
+        return cpu_threads
+    if parsed <= 0:
+        return 0
+    return min(parsed, cpu_threads)
+
+
 @dataclass(frozen=True)
 class AppSettings:
     verbose: bool = False
@@ -493,6 +511,11 @@ CHUNK_SPLIT_MIN_CHUNK_MS = 1000
 CHUNK_BATCH_GENERATE_DELAY_SECONDS = 60
 TRANSLATE_USE_FFMPEG_SPLIT_MERGE = _env_flag("TRANSLATE_USE_FFMPEG_SPLIT_MERGE", True)
 CHUNK_SPLIT_FFMPEG_CONCURRENCY = _env_int("CHUNK_SPLIT_FFMPEG_CONCURRENCY", 2, min_value=1, max_value=8)
+FFMPEG_THREADS = _env_ffmpeg_threads()
+VIDEO_SUBTITLE_FONT = os.environ.get("VIDEO_SUBTITLE_FONT", "").strip()
+VIDEO_SUBTITLE_FONT_FILE = os.environ.get("VIDEO_SUBTITLE_FONT_FILE", "").strip()
+VIDEO_SUBTITLE_FONTS_DIR = os.environ.get("VIDEO_SUBTITLE_FONTS_DIR", "").strip()
+VIDEO_SUBTITLE_FONT_SIZE = _env_int("VIDEO_SUBTITLE_FONT_SIZE", 24, min_value=8, max_value=96)
 
 CLEARVOICE_PARALLEL_MIN_CHUNK_SECONDS = 300
 CLEARVOICE_PARALLEL_MAX_CHUNK_SECONDS = 1800
@@ -714,7 +737,8 @@ def _export_audio_via_ffmpeg_sync(audio: AudioSegment, fmt: str = "mp3", bitrate
         elif fmt == "flac":
             cmd.extend(["-codec:a", "flac"])
         # WAV - no additional codec needed
-        
+
+        cmd.extend(_ffmpeg_thread_args())
         cmd.append(temp_output)
         
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -793,7 +817,8 @@ def _export_audio_to_path_via_ffmpeg_sync(
                 cmd.extend(["-b:a", bitrate])
         elif fmt == "flac":
             cmd.extend(["-codec:a", "flac"])
-        
+
+        cmd.extend(_ffmpeg_thread_args())
         cmd.append(path)
         
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -3141,7 +3166,8 @@ def _transcode_file_with_ffmpeg(
             cmd.extend(["-codec:a", "libmp3lame", "-b:a", "192k"])
         elif target_fmt == "aac":
             cmd.extend(["-codec:a", "aac", "-b:a", "192k"])
-        
+
+        cmd.extend(_ffmpeg_thread_args())
         cmd.append(target_path)
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         return result.returncode == 0 and os.path.exists(target_path)
@@ -3473,6 +3499,8 @@ VIDEO_DOWNLOAD_DIR = str((ROOT_OUTPUT_DIR / "downloaded_videos").resolve())
 os.makedirs(VIDEO_DOWNLOAD_DIR, exist_ok=True)
 VIDEO_AUDIO_CACHE_DIR = str((ROOT_OUTPUT_DIR / "downloaded_video_audio").resolve())
 os.makedirs(VIDEO_AUDIO_CACHE_DIR, exist_ok=True)
+VIDEO_SNAPSHOT_CACHE_DIR = str((ROOT_OUTPUT_DIR / "video_snapshots").resolve())
+os.makedirs(VIDEO_SNAPSHOT_CACHE_DIR, exist_ok=True)
 COOKIES_DIR = str((ROOT_OUTPUT_DIR / "cookies").resolve())
 os.makedirs(COOKIES_DIR, exist_ok=True)
 CLEARVOICE_CACHE_DIR = str((ROOT_OUTPUT_DIR / "clearvoice_cache").resolve())
@@ -7631,6 +7659,186 @@ def _ffmpeg_seconds_from_ms(ms: int) -> str:
     return f"{max(0, int(ms)) / 1000:.3f}"
 
 
+def _ffmpeg_thread_args() -> List[str]:
+    return ["-threads", str(FFMPEG_THREADS)]
+
+
+def _ffmpeg_video_thread_args() -> List[str]:
+    return ["-threads:v", str(FFMPEG_THREADS)]
+
+
+def _ffmpeg_filter_thread_args() -> List[str]:
+    thread_count = FFMPEG_THREADS if FFMPEG_THREADS > 0 else max(1, os.cpu_count() or 1)
+    return ["-filter_threads", str(thread_count), "-filter_complex_threads", str(thread_count)]
+
+
+def _existing_path_or_none(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    normalized = os.path.abspath(os.path.expandvars(os.path.expanduser(path)))
+    return normalized if os.path.exists(normalized) else None
+
+
+def _infer_subtitle_font_name_from_path(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    lower_name = os.path.basename(path).lower()
+    if "msyh" in lower_name or "yahei" in lower_name:
+        return "Microsoft YaHei"
+    if "simhei" in lower_name:
+        return "SimHei"
+    if "simsun" in lower_name:
+        return "SimSun"
+    if "notosanscjk" in lower_name or "noto sans cjk" in lower_name:
+        return "Noto Sans CJK SC"
+    if "notosanssc" in lower_name or "noto sans sc" in lower_name:
+        return "Noto Sans SC"
+    if "wqy" in lower_name or "wenquanyi" in lower_name:
+        return "WenQuanYi Micro Hei"
+    if "sourcehansans" in lower_name or "source han sans" in lower_name:
+        return "Source Han Sans SC"
+    return None
+
+
+def _subtitle_font_candidates() -> List[Tuple[str, List[str]]]:
+    local_fonts = os.path.join(current_dir, "fonts")
+    bundled_noto_fonts = os.path.join(local_fonts, "noto-cjk")
+    return [
+        (
+            "Noto Sans CJK SC",
+            [
+                os.path.join(bundled_noto_fonts, "NotoSansCJKsc-Regular.otf"),
+                os.path.join(local_fonts, "NotoSansCJK-Regular.ttc"),
+                os.path.join(local_fonts, "NotoSansCJKsc-Regular.otf"),
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+                "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+                "/usr/local/share/fonts/NotoSansCJK-Regular.ttc",
+            ],
+        ),
+        (
+            "Noto Sans SC",
+            [
+                os.path.join(local_fonts, "NotoSansSC-Regular.otf"),
+                "/usr/share/fonts/opentype/noto/NotoSansSC-Regular.otf",
+                "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.otf",
+                "/usr/local/share/fonts/NotoSansSC-Regular.otf",
+            ],
+        ),
+        (
+            "Source Han Sans SC",
+            [
+                os.path.join(local_fonts, "SourceHanSansSC-Regular.otf"),
+                "/usr/share/fonts/opentype/adobe-source-han-sans/SourceHanSansSC-Regular.otf",
+                "/usr/local/share/fonts/SourceHanSansSC-Regular.otf",
+            ],
+        ),
+        (
+            "WenQuanYi Micro Hei",
+            [
+                "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+                "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+            ],
+        ),
+        (
+            "Microsoft YaHei",
+            [
+                r"C:\Windows\Fonts\msyh.ttc",
+                r"C:\Windows\Fonts\msyh.ttf",
+                r"C:\Windows\Fonts\msyhbd.ttc",
+            ],
+        ),
+        ("SimHei", [r"C:\Windows\Fonts\simhei.ttf"]),
+        ("SimSun", [r"C:\Windows\Fonts\simsun.ttc"]),
+        (
+            "PingFang SC",
+            [
+                "/System/Library/Fonts/PingFang.ttc",
+                "/System/Library/Fonts/STHeiti Light.ttc",
+            ],
+        ),
+    ]
+
+
+@functools.lru_cache(maxsize=1)
+def _resolve_video_subtitle_font() -> Tuple[Optional[str], Optional[str]]:
+    configured_font_name = VIDEO_SUBTITLE_FONT or None
+    configured_fonts_dir = _existing_path_or_none(VIDEO_SUBTITLE_FONTS_DIR)
+    configured_font_file = _existing_path_or_none(VIDEO_SUBTITLE_FONT_FILE)
+
+    if configured_font_file:
+        return (
+            configured_font_name or _infer_subtitle_font_name_from_path(configured_font_file),
+            os.path.dirname(configured_font_file),
+        )
+    if VIDEO_SUBTITLE_FONT_FILE:
+        print(f"⚠️ VIDEO_SUBTITLE_FONT_FILE does not exist: {VIDEO_SUBTITLE_FONT_FILE}")
+
+    if configured_font_name:
+        return configured_font_name, configured_fonts_dir
+
+    for font_name, candidate_paths in _subtitle_font_candidates():
+        for candidate_path in candidate_paths:
+            font_path = _existing_path_or_none(candidate_path)
+            if font_path:
+                return font_name, os.path.dirname(font_path)
+
+    print(
+        "⚠️ No CJK subtitle font found for FFmpeg rendering. "
+        "Install a CJK font such as Noto Sans CJK, or set VIDEO_SUBTITLE_FONT_FILE "
+        "and optionally VIDEO_SUBTITLE_FONT."
+    )
+    return None, configured_fonts_dir
+
+
+def _ffmpeg_escape_filter_path(path: str) -> str:
+    normalized = os.path.abspath(path).replace("\\", "/")
+    return (
+        normalized
+        .replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace(",", "\\,")
+        .replace(";", "\\;")
+    )
+
+
+def _ffmpeg_escape_filter_quoted_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _ffmpeg_subtitle_force_style(font_name: Optional[str]) -> str:
+    style_parts = [
+        f"FontSize={VIDEO_SUBTITLE_FONT_SIZE}",
+        "PrimaryColour=&H00FFFFFF",
+        "OutlineColour=&H00000000",
+        "BorderStyle=1",
+        "Outline=1.5",
+        "Shadow=0.7",
+        "MarginV=36",
+    ]
+    if font_name:
+        style_parts.insert(0, f"FontName={font_name}")
+    return ",".join(style_parts)
+
+
+def _ffmpeg_subtitles_filter_arg(subtitle_path: str) -> str:
+    font_name, fonts_dir = _resolve_video_subtitle_font()
+    options = [f"filename='{_ffmpeg_escape_filter_path(subtitle_path)}'"]
+    ext = os.path.splitext(subtitle_path)[1].lstrip(".").lower()
+    if ext in {"srt", "vtt"}:
+        options.append("charenc=UTF-8")
+    if fonts_dir:
+        options.append(f"fontsdir='{_ffmpeg_escape_filter_path(fonts_dir)}'")
+    force_style = _ffmpeg_subtitle_force_style(font_name)
+    if force_style:
+        options.append(f"force_style='{_ffmpeg_escape_filter_quoted_value(force_style)}'")
+    return "subtitles=" + ":".join(options)
+
+
 def _ffmpeg_codec_args_for_format(fmt: Optional[str], bitrate: Optional[str]) -> List[str]:
     fmt_normalized = (fmt or "").lower()
     codec_map = {
@@ -7645,7 +7853,7 @@ def _ffmpeg_codec_args_for_format(fmt: Optional[str], bitrate: Optional[str]) ->
     codec_args = codec_map.get(fmt_normalized, ["-c:a", "libmp3lame"])
     if bitrate and fmt_normalized in {"mp3", "ogg", "opus", "aac", "webm"}:
         codec_args = codec_args + ["-b:a", bitrate]
-    return codec_args
+    return codec_args + _ffmpeg_thread_args()
 
 
 def _run_ffmpeg_command(cmd: List[str]) -> None:
@@ -8207,6 +8415,7 @@ def _downloaded_video_entry(path: str) -> Dict[str, Any]:
         "duration_seconds": duration_seconds,
         "duration_label": _format_video_duration(duration_seconds),
         "url": f"/api/downloaded_videos/{quote(safe_name)}",
+        "poster_url": f"/api/downloaded_videos/{quote(safe_name)}/snapshot",
     }
 
 
@@ -8260,6 +8469,61 @@ def _downloaded_video_audio_cache_path(video_path: str) -> str:
     return os.path.join(VIDEO_AUDIO_CACHE_DIR, f"{stem}_{cache_key}.mp3")
 
 
+def _video_snapshot_cache_path(video_path: str) -> str:
+    stat = os.stat(video_path)
+    cache_key = hashlib.md5(
+        f"{os.path.abspath(video_path)}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")
+    ).hexdigest()[:16]
+    stem = _sanitize_base_filename(os.path.basename(video_path)) or "video"
+    return os.path.join(VIDEO_SNAPSHOT_CACHE_DIR, f"{stem}_{cache_key}.jpg")
+
+
+def _generate_video_snapshot_sync(video_path: str) -> str:
+    if not _ffmpeg_available():
+        raise RuntimeError("ffmpeg is required to generate video snapshots.")
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    output_path = _video_snapshot_cache_path(video_path)
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        return output_path
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    temp_output = f"{output_path}.{uuid.uuid4().hex[:8]}.tmp.jpg"
+    try:
+        last_error: Optional[Exception] = None
+        for seek_seconds in ("1", "0"):
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                seek_seconds,
+                "-i",
+                video_path,
+                "-frames:v",
+                "1",
+                "-vf",
+                "format=yuvj420p",
+                "-q:v",
+                "3",
+                temp_output,
+            ]
+            try:
+                _run_ffmpeg_command(cmd)
+                if os.path.exists(temp_output) and os.path.getsize(temp_output) > 0:
+                    os.replace(temp_output, output_path)
+                    return output_path
+            except Exception as exc:
+                last_error = exc
+                _safe_remove_file(temp_output)
+        raise RuntimeError(f"Failed to generate video snapshot: {last_error}")
+    finally:
+        _safe_remove_file(temp_output)
+
+
 def _extract_audio_from_downloaded_video_sync(video_path: str) -> str:
     if not _ffmpeg_available():
         raise RuntimeError("ffmpeg is required to extract audio from downloaded videos.")
@@ -8282,6 +8546,7 @@ def _extract_audio_from_downloaded_video_sync(video_path: str) -> str:
         "libmp3lame",
         "-b:a",
         "192k",
+        *_ffmpeg_thread_args(),
         output_path,
     ]
     _run_ffmpeg_command(cmd)
@@ -8328,13 +8593,20 @@ def _public_downloaded_video_source(source: Optional[Dict[str, Any]]) -> Optiona
     }
 
 
-def _replace_video_audio_sync(video_path: str, audio_path: str, output_path: str) -> None:
+def _replace_video_audio_sync(
+    video_path: str,
+    audio_path: str,
+    output_path: str,
+    subtitle_path: Optional[str] = None,
+) -> None:
     if not _ffmpeg_available():
         raise RuntimeError("ffmpeg is required to replace the video audio track.")
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Source video not found: {video_path}")
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Translated audio not found: {audio_path}")
+    if subtitle_path and not os.path.exists(subtitle_path):
+        raise FileNotFoundError(f"Subtitle file not found: {subtitle_path}")
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     cmd = [
         "ffmpeg",
@@ -8342,6 +8614,10 @@ def _replace_video_audio_sync(video_path: str, audio_path: str, output_path: str
         "-hide_banner",
         "-loglevel",
         "error",
+    ]
+    if subtitle_path:
+        cmd += _ffmpeg_filter_thread_args()
+    cmd += [
         "-i",
         video_path,
         "-i",
@@ -8350,12 +8626,29 @@ def _replace_video_audio_sync(video_path: str, audio_path: str, output_path: str
         "0:v:0",
         "-map",
         "1:a:0",
-        "-c:v",
-        "copy",
+    ]
+    if subtitle_path:
+        cmd += [
+            "-vf",
+            _ffmpeg_subtitles_filter_arg(subtitle_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            *_ffmpeg_video_thread_args(),
+        ]
+    else:
+        cmd += ["-c:v", "copy"]
+    cmd += [
         "-c:a",
         "aac",
         "-b:a",
         "192k",
+        *_ffmpeg_thread_args(),
         "-shortest",
         "-movflags",
         "+faststart",
@@ -9934,6 +10227,7 @@ class VideoReplaceAudioRequest(BaseModel):
     session_id: Optional[str] = Field(default=None, description="Translate session id; used to resolve the source video when available.")
     audio_file_name: Optional[str] = Field(default=None, description="Translated audio filename from /api/translate_outputs.")
     output_filename: Optional[str] = Field(default=None, description="Optional output video base filename.")
+    subtitle_file_name: Optional[str] = Field(default=None, description="Optional SRT/VTT filename from /api/translate_outputs to burn into the rendered video.")
 
 
 class SpeakerOverrideInput(BaseModel):
@@ -10777,6 +11071,28 @@ async def api_downloaded_video_file(filename: str):
     )
 
 
+@app.get("/api/downloaded_videos/{filename}/snapshot")
+async def api_downloaded_video_snapshot(filename: str):
+    """API: Serve a generated snapshot image for a downloaded video."""
+    try:
+        file_path = _downloaded_video_path(filename)
+    except ValueError as exc:
+        return _status_error(str(exc), status_code=400)
+    if not os.path.exists(file_path):
+        return _status_error("Downloaded video not found.", status_code=404)
+    try:
+        snapshot_path = await _run_blocking(_generate_video_snapshot_sync, file_path)
+    except Exception as exc:
+        traceback.print_exc()
+        return _status_error(f"Failed to generate video snapshot: {str(exc)}", status_code=500)
+    return FileResponse(
+        snapshot_path,
+        media_type="image/jpeg",
+        filename=os.path.basename(snapshot_path),
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @app.get("/api/downloaded_videos/{filename}/audio")
 async def api_downloaded_video_audio(filename: str):
     """API: Extract and serve MP3 audio from a downloaded video."""
@@ -11051,6 +11367,18 @@ async def api_video_replace_audio(payload: VideoReplaceAudioRequest):
     if not os.path.exists(audio_path):
         return _status_error("Translated audio output not found.", status_code=404)
 
+    subtitle_path: Optional[str] = None
+    subtitle_name = os.path.basename((payload.subtitle_file_name or "").strip())
+    if subtitle_name:
+        if subtitle_name != (payload.subtitle_file_name or "").strip():
+            return _status_error("Invalid subtitle filename.", status_code=400)
+        subtitle_ext = os.path.splitext(subtitle_name)[1].lstrip(".").lower()
+        if subtitle_ext not in {"srt", "vtt", "ass", "ssa"}:
+            return _status_error("Subtitle file must be SRT, VTT, ASS, or SSA.", status_code=400)
+        subtitle_path = os.path.join(TRANSLATE_OUTPUT_DIR, subtitle_name)
+        if not os.path.exists(subtitle_path):
+            return _status_error("Selected subtitle output not found.", status_code=404)
+
     requested_base = _sanitize_base_filename(payload.output_filename)
     if not requested_base:
         video_base = _sanitize_base_filename(os.path.splitext(os.path.basename(video_path))[0]) or "video"
@@ -11064,7 +11392,7 @@ async def api_video_replace_audio(payload: VideoReplaceAudioRequest):
         output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
 
     try:
-        await _run_blocking(_replace_video_audio_sync, video_path, audio_path, output_path)
+        await _run_blocking(_replace_video_audio_sync, video_path, audio_path, output_path, subtitle_path)
     except Exception as exc:
         traceback.print_exc()
         return _status_error(f"Failed to create translated video: {str(exc)}", status_code=500)
@@ -11074,8 +11402,10 @@ async def api_video_replace_audio(payload: VideoReplaceAudioRequest):
             "status": "ok",
             "message": "Translated video created.",
             "video_url": f"/api/translate_outputs/{output_filename}",
+            "poster_url": f"/api/translate_outputs/{output_filename}/snapshot",
             "file_name": output_filename,
             "source_video": _downloaded_video_entry(video_path),
+            "subtitle_file_name": subtitle_name or None,
         }
     )
 
@@ -14129,6 +14459,40 @@ async def api_translate_outputs(filename: str):
         media_type=media_type,
         filename=safe_name,
         headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/translate_outputs/{filename}/snapshot")
+async def api_translate_output_snapshot(filename: str):
+    """Serve a generated snapshot for rendered translate output videos."""
+    safe_name = os.path.basename(filename)
+    if not safe_name or safe_name != filename:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "Invalid filename."},
+        )
+    if os.path.splitext(safe_name)[1].lstrip(".").lower() not in VIDEO_DOWNLOAD_EXTENSIONS:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "Snapshots are only available for video outputs."},
+        )
+
+    file_path = os.path.join(TRANSLATE_OUTPUT_DIR, safe_name)
+    if not os.path.exists(file_path):
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": "Requested video output not found."},
+        )
+    try:
+        snapshot_path = await _run_blocking(_generate_video_snapshot_sync, file_path)
+    except Exception as exc:
+        traceback.print_exc()
+        return _status_error(f"Failed to generate video snapshot: {str(exc)}", status_code=500)
+    return FileResponse(
+        snapshot_path,
+        media_type="image/jpeg",
+        filename=os.path.basename(snapshot_path),
+        headers={"Cache-Control": "public, max-age=86400"},
     )
 
 

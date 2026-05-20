@@ -3553,6 +3553,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     const size = typeof video.size_mb === 'number' ? `${video.size_mb} MB` : '';
                     const duration = video.duration_label ? ` • ${escapeHtml(video.duration_label)}` : '';
                     const url = video.url || `${ENDPOINTS.DOWNLOADED_VIDEOS}/${encodeURIComponent(video.id)}`;
+                    const posterUrl = video.poster_url || `${url}/snapshot`;
                     return `
                         <div class="segment-card" data-video-id="${escapeHtml(video.id)}" style="padding: 14px;">
                             <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
@@ -3561,7 +3562,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                                     <small style="color:var(--text-muted);">${escapeHtml(video.extension || 'video').toUpperCase()}${size ? ` • ${size}` : ''}${duration}</small>
                                 </div>
                             </div>
-                            <video controls preload="metadata" src="${url}" style="width:100%; max-height:220px; margin-top:10px; border-radius:8px; background:#000;"></video>
+                            ${lazyVideoMarkup(url, posterUrl, '220px')}
                             <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
                                 <button type="button" class="btn btn-secondary downloaded-video-use" data-video-id="${escapeHtml(video.id)}" style="padding:6px 12px;font-size:0.82rem;">Use in Translate</button>
                                 <a class="btn btn-secondary" href="${url}" download="${escapeHtml(video.filename || video.id)}" style="padding:6px 12px;font-size:0.82rem;">Download</a>
@@ -3570,6 +3571,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         </div>
                     `;
                 }).join('');
+                bindLazyVideos(list);
                 list.querySelectorAll('.downloaded-video-use').forEach(button => {
                     button.addEventListener('click', () => {
                         selectDownloadedVideo(button.dataset.videoId || '');
@@ -6051,14 +6053,16 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 const srtBurnedMp4 = `"${normalizedBase}_${languageCode}_srt.mp4"`;
                 const originalSrtFilename = `${normalizedBase}_original.srt`;
                 const originalSrtBurned = `"${normalizedBase}_original_srt.mp4"`;
-                const translatedSubtitleFilter = `"subtitles='${translatedSrtFilename.replace(/'/g, "\\'")}'"`;
-                const originalSubtitleFilter = `"subtitles='${originalSrtFilename.replace(/'/g, "\\'")}'"`;
+                const subtitleForceStyle = "force_style='FontName=Noto Sans CJK SC,FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1.5,Shadow=0.7,MarginV=36'";
+                const subtitleFontsDir = "fontsdir='fonts/noto-cjk'";
+                const translatedSubtitleFilter = `"subtitles='${translatedSrtFilename.replace(/'/g, "\\'")}':${subtitleFontsDir}:${subtitleForceStyle}"`;
+                const originalSubtitleFilter = `"subtitles='${originalSrtFilename.replace(/'/g, "\\'")}':${subtitleFontsDir}:${subtitleForceStyle}"`;
                 ffmpegPanel.style.display = 'block';
-                ffmpegExtractCmd.textContent = `ffmpeg -i ${baseMp4} -vn -codec:a libmp3lame -q:a 2 ${baseMp3}`;
-                ffmpegReplaceCmd.textContent = `ffmpeg -i ${baseMp4} -i ${translatedMp3} -c:v copy -c:a aac -map 0:v:0 -map 1:a:0 ${translatedMp4}`;
-                ffmpegSubtitleCmd.textContent = `ffmpeg -i ${translatedMp4} -vf ${translatedSubtitleFilter} ${srtBurnedMp4}`;
+                ffmpegExtractCmd.textContent = `ffmpeg -i ${baseMp4} -vn -codec:a libmp3lame -q:a 2 -threads 0 ${baseMp3}`;
+                ffmpegReplaceCmd.textContent = `ffmpeg -i ${baseMp4} -i ${translatedMp3} -c:v copy -c:a aac -threads 0 -map 0:v:0 -map 1:a:0 ${translatedMp4}`;
+                ffmpegSubtitleCmd.textContent = `ffmpeg -filter_threads 0 -filter_complex_threads 0 -i ${translatedMp4} -vf ${translatedSubtitleFilter} -c:v libx264 -preset veryfast -crf 18 -threads:v 0 -c:a copy ${srtBurnedMp4}`;
                 if (ffmpegSubtitleOriginalCmd) {
-                    ffmpegSubtitleOriginalCmd.textContent = `ffmpeg -i ${baseMp4} -vf ${originalSubtitleFilter} ${originalSrtBurned}`;
+                    ffmpegSubtitleOriginalCmd.textContent = `ffmpeg -filter_threads 0 -filter_complex_threads 0 -i ${baseMp4} -vf ${originalSubtitleFilter} -c:v libx264 -preset veryfast -crf 18 -threads:v 0 -c:a copy ${originalSrtBurned}`;
                 }
             }
 
@@ -6652,6 +6656,85 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 return link;
             }
 
+            function cacheBustUrl(url) {
+                if (!url) {
+                    return '';
+                }
+                return `${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`;
+            }
+
+            function fileNameFromUrl(url, fallback = '') {
+                try {
+                    const parsed = new URL(url, window.location.href);
+                    const rawName = parsed.pathname.split('/').filter(Boolean).pop() || fallback;
+                    return decodeURIComponent(rawName || fallback || '');
+                } catch (error) {
+                    const clean = String(url || fallback || '').split(/[?#]/)[0];
+                    return clean.split('/').pop() || fallback || '';
+                }
+            }
+
+            function resolveSubtitleFileName(explicitName, url, fallback) {
+                const fromUrl = fileNameFromUrl(url, '');
+                const fromExplicit = fileNameFromUrl(explicitName, '');
+                if (fromExplicit && fromExplicit !== fallback) {
+                    return fromExplicit;
+                }
+                return fromUrl || fromExplicit || fallback || '';
+            }
+
+            function lazyVideoMarkup(url, posterUrl = '', maxHeight = '220px') {
+                const safeUrl = escapeHtml(url || '');
+                const safePoster = posterUrl ? ` poster="${escapeHtml(posterUrl)}"` : '';
+                return `
+                    <div data-lazy-video-wrap style="position:relative;margin-top:10px;border-radius:8px;overflow:hidden;background:#000;">
+                        <video class="lazy-video" controls preload="none" data-lazy-src="${safeUrl}"${safePoster} style="width:100%;max-height:${escapeHtml(maxHeight)};display:block;background:#000;"></video>
+                        <button type="button" class="btn lazy-video-play" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:8px 16px;">Play</button>
+                    </div>
+                `;
+            }
+
+            function loadLazyVideo(video, autoplay = false) {
+                if (!video) {
+                    return;
+                }
+                const src = video.dataset.lazySrc || '';
+                if (src && !video.getAttribute('src')) {
+                    video.src = src;
+                    video.load();
+                }
+                const wrapper = video.closest('[data-lazy-video-wrap]');
+                const button = wrapper ? wrapper.querySelector('.lazy-video-play') : null;
+                if (button) {
+                    button.style.display = 'none';
+                }
+                if (autoplay) {
+                    video.play().catch(error => console.warn('Failed to play video after lazy load', error));
+                }
+            }
+
+            function bindLazyVideos(root = document) {
+                root.querySelectorAll('video.lazy-video:not([data-lazy-bound])').forEach(video => {
+                    video.dataset.lazyBound = 'true';
+                    const wrapper = video.closest('[data-lazy-video-wrap]');
+                    const button = wrapper ? wrapper.querySelector('.lazy-video-play') : null;
+                    if (button) {
+                        button.addEventListener('click', () => loadLazyVideo(video, true));
+                    }
+                    video.addEventListener('click', () => {
+                        if (!video.getAttribute('src')) {
+                            loadLazyVideo(video, true);
+                        }
+                    });
+                    video.addEventListener('keydown', event => {
+                        if ((event.key === 'Enter' || event.key === ' ') && !video.getAttribute('src')) {
+                            event.preventDefault();
+                            loadLazyVideo(video, true);
+                        }
+                    });
+                });
+            }
+
             function resolveSourceVideo(metadata = {}) {
                 const candidates = [
                     metadata.source_video,
@@ -6691,16 +6774,11 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 title.textContent = 'Translated Video';
                 panel.appendChild(title);
 
-                const video = document.createElement('video');
-                video.controls = true;
-                video.preload = 'metadata';
-                video.src = `${data.video_url}?t=${Date.now()}`;
-                video.style.width = '100%';
-                video.style.maxHeight = '420px';
-                video.style.marginTop = '10px';
-                video.style.borderRadius = '8px';
-                video.style.background = '#000';
-                panel.appendChild(video);
+                const posterUrl = data.poster_url ? cacheBustUrl(data.poster_url) : `${data.video_url}/snapshot`;
+                const videoWrap = document.createElement('div');
+                videoWrap.innerHTML = lazyVideoMarkup(cacheBustUrl(data.video_url), posterUrl, '420px').trim();
+                panel.appendChild(videoWrap.firstElementChild);
+                bindLazyVideos(panel);
 
                 const actions = document.createElement('div');
                 actions.style.display = 'flex';
@@ -6712,7 +6790,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 panel.appendChild(actions);
             }
 
-            async function renderTranslatedVideoFromAudio({ sourceVideo, audioFileName, sessionId, outputBaseName, container, button }) {
+            async function renderTranslatedVideoFromAudio({ sourceVideo, audioFileName, subtitleFileName, sessionId, outputBaseName, container, button }) {
                 if (!sourceVideo || !audioFileName) {
                     showStatus('Translated video cannot be rendered because source video metadata is missing.', 'error', 'translateStatus');
                     return;
@@ -6722,9 +6800,16 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     button.disabled = true;
                     button.textContent = 'Rendering video...';
                 }
-                showStatus('Replacing the original video audio track...', 'info', 'translateStatus');
+                showStatus(
+                    subtitleFileName
+                        ? 'Replacing audio and rendering the selected subtitle track...'
+                        : 'Replacing the original video audio track...',
+                    'info',
+                    'translateStatus'
+                );
                 try {
                     const safeBase = deriveBaseFromFilename(outputBaseName || audioFileName || sourceVideo.filename || 'translated_video');
+                    const outputSuffix = subtitleFileName ? '_translated_video_subtitled' : '_translated_video';
                     const response = await fetch(ENDPOINTS.VIDEO_REPLACE_AUDIO, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -6732,7 +6817,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             downloaded_video_id: sourceVideo.id || sourceVideo.filename,
                             session_id: sessionId || null,
                             audio_file_name: audioFileName,
-                            output_filename: safeBase ? `${safeBase}_translated_video` : '',
+                            subtitle_file_name: subtitleFileName || null,
+                            output_filename: safeBase ? `${safeBase}${outputSuffix}` : '',
                         }),
                     });
                     const data = await response.json();
@@ -6800,6 +6886,12 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 const downloadName = options.downloadName || 'translated_speech.mp3';
                 const subtitleUrl = normalizeSubtitleUrl(options.subtitleUrl);
                 const originalSubtitleUrl = normalizeSubtitleUrl(options.originalSubtitleUrl);
+                const translatedSubtitleFileName = subtitleUrl
+                    ? resolveSubtitleFileName(options.subtitleFileName, subtitleUrl, 'translated_speech.srt')
+                    : '';
+                const originalSubtitleFileName = originalSubtitleUrl
+                    ? resolveSubtitleFileName(options.originalSubtitleFileName, originalSubtitleUrl, 'translated_speech_original.srt')
+                    : '';
                 const metadata = options.metadata || {};
                 const fallbackSegments = Array.isArray(options.segments) ? options.segments : [];
                 const sourceVideo = resolveSourceVideo(metadata);
@@ -6956,7 +7048,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     downloads.appendChild(
                         createDownloadLink(
                             subtitleUrl,
-                            options.subtitleFileName || 'translated_speech.srt',
+                            translatedSubtitleFileName || 'translated_speech.srt',
                             'Translated SRT',
                             true
                         )
@@ -6966,21 +7058,50 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     downloads.appendChild(
                         createDownloadLink(
                             originalSubtitleUrl,
-                            options.originalSubtitleFileName || 'translated_speech_original.srt',
+                            originalSubtitleFileName || 'translated_speech_original.srt',
                             'Original SRT',
                             true
                         )
                     );
                 }
                 if (sourceVideo && translatedAudioFileName) {
+                    let renderSubtitleSelect = null;
+                    if (translatedSubtitleFileName || originalSubtitleFileName) {
+                        renderSubtitleSelect = document.createElement('select');
+                        renderSubtitleSelect.className = 'select-inline-dark';
+                        renderSubtitleSelect.title = 'Subtitle track to burn into rendered video';
+                        renderSubtitleSelect.style.minWidth = '150px';
+
+                        const noneOption = document.createElement('option');
+                        noneOption.value = '';
+                        noneOption.textContent = 'No subtitles';
+                        renderSubtitleSelect.appendChild(noneOption);
+
+                        if (translatedSubtitleFileName) {
+                            const translatedOption = document.createElement('option');
+                            translatedOption.value = translatedSubtitleFileName;
+                            translatedOption.textContent = 'Translated subtitles';
+                            renderSubtitleSelect.appendChild(translatedOption);
+                        }
+                        if (originalSubtitleFileName) {
+                            const originalOption = document.createElement('option');
+                            originalOption.value = originalSubtitleFileName;
+                            originalOption.textContent = 'Original subtitles';
+                            renderSubtitleSelect.appendChild(originalOption);
+                        }
+                        downloads.appendChild(renderSubtitleSelect);
+                    }
+
                     const renderVideoBtn = document.createElement('button');
                     renderVideoBtn.type = 'button';
                     renderVideoBtn.className = 'btn btn-secondary';
                     renderVideoBtn.textContent = 'Render video';
                     renderVideoBtn.addEventListener('click', () => {
+                        const selectedSubtitleFileName = renderSubtitleSelect ? renderSubtitleSelect.value : '';
                         renderTranslatedVideoFromAudio({
                             sourceVideo,
                             audioFileName: translatedAudioFileName,
+                            subtitleFileName: selectedSubtitleFileName,
                             sessionId: metadata.session_id || metadata.reuse_session_id || options.sessionId || '',
                             outputBaseName: metadata.output_base_name || metadata.base_output_name || translatedAudioFileName,
                             container: resultDiv,
