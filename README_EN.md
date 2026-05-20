@@ -32,6 +32,7 @@ pip install sentencepiece
 pip install "numpy<2"
 sudo apt install ffmpeg
 hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
+export YTDLP_NODE_PATH="$(node -p 'process.execPath')"
 python fastapi_webui_v2.py --use_torch_compile
 ```
 
