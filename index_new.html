@@ -1338,6 +1338,241 @@
             .segment-card.speech.speaker-color-17:hover, .segment-card.speech.speaker-color-17.expanded { border-color: rgba(251, 113, 133, 0.5) !important; border-left-color: #fb7185 !important; }
             .segment-card.speech.speaker-color-18:hover, .segment-card.speech.speaker-color-18.expanded { border-color: rgba(56, 189, 248, 0.5) !important; border-left-color: #38bdf8 !important; }
             .segment-card.speech.speaker-color-19:hover, .segment-card.speech.speaker-color-19.expanded { border-color: rgba(163, 230, 53, 0.5) !important; border-left-color: #a3e635 !important; }
+            .synced-audio-player {
+                margin-top: 22px;
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                background: rgba(15, 23, 42, 0.72);
+                overflow: hidden;
+                box-shadow: 0 16px 40px rgba(0, 0, 0, 0.22);
+            }
+            .synced-audio-main {
+                display: grid;
+                grid-template-columns: minmax(0, 1.05fr) minmax(320px, 0.95fr);
+                gap: 0;
+            }
+            .synced-audio-stage {
+                min-width: 0;
+                padding: 18px;
+                display: flex;
+                flex-direction: column;
+                gap: 14px;
+                border-right: 1px solid var(--border);
+            }
+            .synced-audio-topbar,
+            .synced-audio-actions {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+                flex-wrap: wrap;
+            }
+            .synced-audio-title {
+                min-width: 0;
+            }
+            .synced-audio-title strong {
+                display: block;
+                font-size: 0.98rem;
+                font-weight: 600;
+            }
+            .synced-audio-title span,
+            .synced-subtitle-count {
+                color: var(--text-muted);
+                font-size: 0.82rem;
+            }
+            .synced-audio-source-tabs {
+                display: inline-flex;
+                gap: 6px;
+                flex-wrap: wrap;
+            }
+            .synced-audio-source-tab {
+                border: 1px solid var(--border);
+                background: var(--surface-elevated);
+                color: var(--text-primary);
+                border-radius: 8px;
+                cursor: pointer;
+                padding: 7px 11px;
+                font-size: 0.8rem;
+                transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+            }
+            .synced-audio-source-tab:hover {
+                background: var(--surface-muted);
+                border-color: var(--border-bright);
+            }
+            .synced-audio-source-tab.active {
+                border-color: rgba(16, 185, 129, 0.45);
+                color: var(--brand-emerald);
+                background: rgba(16, 185, 129, 0.12);
+            }
+            .synced-audio-native {
+                display: none !important;
+            }
+            .synced-now {
+                min-height: 96px;
+                border: 1px solid rgba(148, 163, 184, 0.16);
+                border-radius: 10px;
+                background: rgba(30, 41, 59, 0.42);
+                padding: 16px;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                gap: 8px;
+            }
+            .synced-now-time {
+                font-family: 'JetBrains Mono', monospace;
+                color: var(--brand-cyan);
+                font-size: 0.78rem;
+            }
+            .synced-now-text {
+                color: var(--text-primary);
+                line-height: 1.55;
+                font-size: 1rem;
+            }
+            .synced-controls {
+                display: grid;
+                grid-template-columns: auto minmax(0, 1fr) auto;
+                align-items: center;
+                gap: 12px;
+            }
+            .synced-play-btn,
+            .synced-mini-btn,
+            .synced-subtitle-tab {
+                border: 1px solid var(--border);
+                background: var(--surface-elevated);
+                color: var(--text-primary);
+                border-radius: 8px;
+                cursor: pointer;
+                transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+            }
+            .synced-play-btn {
+                min-width: 76px;
+                height: 38px;
+                padding: 0 14px;
+                font-weight: 600;
+            }
+            .synced-mini-btn {
+                width: 34px;
+                height: 34px;
+                font-size: 0.8rem;
+            }
+            .synced-play-btn:hover,
+            .synced-mini-btn:hover,
+            .synced-subtitle-tab:hover {
+                background: var(--surface-muted);
+                border-color: var(--border-bright);
+            }
+            .synced-time {
+                display: flex;
+                justify-content: space-between;
+                gap: 10px;
+                font-family: 'JetBrains Mono', monospace;
+                color: var(--text-secondary);
+                font-size: 0.78rem;
+                margin-top: 6px;
+            }
+            .synced-seek {
+                width: 100%;
+                accent-color: var(--brand-cyan);
+                cursor: pointer;
+            }
+            .synced-side-controls {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .synced-rate-select {
+                min-width: 78px;
+                padding: 8px 10px;
+                font-size: 0.82rem;
+            }
+            .synced-downloads {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 10px;
+            }
+            .synced-downloads .btn {
+                margin: 0 !important;
+                padding: 9px 13px;
+                font-size: 0.82rem;
+            }
+            .synced-subtitle-panel {
+                min-width: 0;
+                display: flex;
+                flex-direction: column;
+                max-height: 480px;
+            }
+            .synced-subtitle-header {
+                padding: 14px 16px;
+                border-bottom: 1px solid var(--border);
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+            }
+            .synced-subtitle-tabs {
+                display: inline-flex;
+                gap: 6px;
+                flex-wrap: wrap;
+            }
+            .synced-subtitle-tab {
+                padding: 6px 10px;
+                font-size: 0.78rem;
+            }
+            .synced-subtitle-tab.active {
+                border-color: rgba(34, 211, 238, 0.45);
+                color: var(--brand-cyan);
+                background: rgba(34, 211, 238, 0.12);
+            }
+            .synced-subtitle-list {
+                overflow-y: auto;
+                padding: 10px;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+            .synced-subtitle-item {
+                width: 100%;
+                text-align: left;
+                border: 1px solid rgba(148, 163, 184, 0.14);
+                border-left: 3px solid transparent;
+                border-radius: 8px;
+                background: rgba(30, 41, 59, 0.35);
+                color: var(--text-secondary);
+                padding: 10px 12px;
+                cursor: pointer;
+                transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease;
+            }
+            .synced-subtitle-item:hover,
+            .synced-subtitle-item:focus-visible {
+                background: rgba(30, 41, 59, 0.62);
+                border-color: rgba(34, 211, 238, 0.32);
+                outline: none;
+            }
+            .synced-subtitle-item.active {
+                background: rgba(34, 211, 238, 0.12);
+                border-color: rgba(34, 211, 238, 0.45);
+                border-left-color: var(--brand-cyan);
+                color: var(--text-primary);
+            }
+            .synced-subtitle-time {
+                display: block;
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 0.74rem;
+                color: var(--brand-cyan);
+                margin-bottom: 4px;
+            }
+            .synced-subtitle-text {
+                display: block;
+                line-height: 1.45;
+                white-space: pre-line;
+            }
+            .synced-empty {
+                padding: 28px 16px;
+                text-align: center;
+                color: var(--text-muted);
+                font-size: 0.9rem;
+            }
             .loading {
                 display: inline-block;
                 width: 18px;
@@ -1386,6 +1621,25 @@
                 }
                 .form-section {
                     padding: 18px;
+                }
+                .synced-audio-main {
+                    grid-template-columns: 1fr;
+                }
+                .synced-audio-stage {
+                    border-right: 0;
+                    border-bottom: 1px solid var(--border);
+                }
+                .synced-controls {
+                    grid-template-columns: 1fr;
+                }
+                .synced-play-btn {
+                    width: 100%;
+                }
+                .synced-side-controls {
+                    justify-content: space-between;
+                }
+                .synced-subtitle-panel {
+                    max-height: 420px;
                 }
             }
             @media (max-width: 500px) {
@@ -3927,6 +4181,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             const ffmpegSubtitleOriginalCmd = document.getElementById('ffmpegSubtitleOriginalCmd');
             let currentTranslateSessionId = null;
             let currentTranslateSegments = [];
+            let activeSyncedAudio = null;
             let translateSpeakerProfiles = [];
             let translateSpeakerProfileMap = {};
             let translateSpeakerOverrides = {};
@@ -4988,7 +5243,6 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     baseName: data.base_output_name,
                     languageCode: data.language_code,
                 });
-                const mediaType = getMediaTypeForFormat(format);
                 const downloadName = data.file_name || `merged_chunks.${format}`;
                 const subtitleUrl = data.subtitle_url || (data.subtitle && data.subtitle.url) || null;
                 const subtitleFileName =
@@ -5003,22 +5257,16 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     data.original_subtitle_file_name ||
                     (data.subtitle_original && data.subtitle_original.filename) ||
                     downloadName.replace(/\.[^.]+$/, '_original.srt');
-                let downloadButtons = `<a class="btn" href="${audioUrl}" download="${downloadName}">💾 Download Merged Audio</a>`;
-                if (subtitleUrl) {
-                    downloadButtons += ` <a class="btn btn-secondary" href="${subtitleUrl}" download="${subtitleFileName}">📝 Translated Subtitles (.srt)</a>`;
-                }
-                if (originalSubtitleUrl) {
-                    downloadButtons += ` <a class="btn btn-secondary" href="${originalSubtitleUrl}" download="${originalSubtitleFileName}">📜 Original Subtitles (.srt)</a>`;
-                }
-                resultDiv.innerHTML = `
-                    <h3>🔗 Merged Chunk Output</h3>
-                    <audio controls preload="none" style="width: 100%; margin: 10px 0;">
-                        <source src="${audioUrl}" type="${mediaType}">
-                    </audio>
-                    <div style="margin-top: 12px;">
-                        ${downloadButtons}
-                    </div>
-                `;
+                renderTranslatedAudioPlayer(resultDiv, {
+                    audioUrl,
+                    downloadName,
+                    subtitleUrl,
+                    subtitleFileName,
+                    originalSubtitleUrl,
+                    originalSubtitleFileName,
+                    metadata: data.metadata || data,
+                    segments: [],
+                });
             }
 
             function getMediaTypeForFormat(format) {
@@ -5614,6 +5862,738 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 const div = document.createElement('div');
                 div.textContent = text;
                 return div.innerHTML;
+            }
+
+            function normalizeSubtitleUrl(url) {
+                return typeof url === 'string' && url.trim() ? url.trim() : null;
+            }
+
+            function parseSubtitleTimestamp(value) {
+                const raw = String(value || '').trim().replace(',', '.');
+                const parts = raw.split(':').map(part => part.trim()).filter(Boolean);
+                if (parts.length < 2) {
+                    return 0;
+                }
+                const seconds = parseFloat(parts.pop() || '0');
+                const minutes = parseInt(parts.pop() || '0', 10);
+                const hours = parts.length ? parseInt(parts.pop() || '0', 10) : 0;
+                if (Number.isNaN(seconds) || Number.isNaN(minutes) || Number.isNaN(hours)) {
+                    return 0;
+                }
+                return Math.max(0, hours * 3600 + minutes * 60 + seconds);
+            }
+
+            function formatPlayerTime(seconds) {
+                const safeSeconds = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+                const wholeSeconds = Math.floor(safeSeconds);
+                const hours = Math.floor(wholeSeconds / 3600);
+                const minutes = Math.floor((wholeSeconds % 3600) / 60);
+                const secs = wholeSeconds % 60;
+                if (hours > 0) {
+                    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+                }
+                return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+            }
+
+            function parseSrtCues(srtText) {
+                const normalized = String(srtText || '').replace(/\r/g, '').trim();
+                if (!normalized) {
+                    return [];
+                }
+                return normalized
+                    .split(/\n{2,}/)
+                    .map((block, blockIndex) => {
+                        const lines = block.split('\n');
+                        const timeIndex = lines.findIndex(line => line.includes('-->'));
+                        if (timeIndex < 0) {
+                            return null;
+                        }
+                        const [startRaw, endRawWithSettings] = lines[timeIndex].split(/\s*-->\s*/);
+                        if (!startRaw || !endRawWithSettings) {
+                            return null;
+                        }
+                        const endRaw = endRawWithSettings.trim().split(/\s+/)[0];
+                        const start = parseSubtitleTimestamp(startRaw);
+                        const end = parseSubtitleTimestamp(endRaw);
+                        const text = lines
+                            .slice(timeIndex + 1)
+                            .map(line => line.trim())
+                            .filter(Boolean)
+                            .join('\n')
+                            .trim();
+                        if (!text || end <= start) {
+                            return null;
+                        }
+                        return {
+                            id: `srt-${blockIndex}`,
+                            start,
+                            end,
+                            text,
+                        };
+                    })
+                    .filter(Boolean)
+                    .sort((a, b) => a.start - b.start);
+            }
+
+            function buildCuesFromSegments(segments = [], textKind = 'translated') {
+                if (!Array.isArray(segments)) {
+                    return [];
+                }
+                return segments
+                    .map((segment, index) => {
+                        if (!segment) {
+                            return null;
+                        }
+                        const startMs = Number(segment.start_ms);
+                        const endMs = Number(segment.end_ms);
+                        if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+                            return null;
+                        }
+                        const primaryText =
+                            textKind === 'source'
+                                ? segment.source_text
+                                : segment.translated_text || segment.source_text;
+                        const text = String(primaryText || '').trim();
+                        if (!text) {
+                            return null;
+                        }
+                        return {
+                            id: `segment-${segment.index ?? index}`,
+                            start: startMs / 1000,
+                            end: endMs / 1000,
+                            text,
+                        };
+                    })
+                    .filter(Boolean)
+                    .sort((a, b) => a.start - b.start);
+            }
+
+            async function loadSubtitleCues(url) {
+                const subtitleUrl = normalizeSubtitleUrl(url);
+                if (!subtitleUrl) {
+                    return [];
+                }
+                const response = await fetch(subtitleUrl, { cache: 'no-cache' });
+                if (!response.ok) {
+                    throw new Error(`Subtitle fetch failed (${response.status})`);
+                }
+                return parseSrtCues(await response.text());
+            }
+
+            function createDownloadLink(url, fileName, label, secondary = false) {
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = fileName || '';
+                link.className = secondary ? 'btn btn-secondary' : 'btn';
+                link.textContent = label;
+                return link;
+            }
+
+            function resolveOriginalAudioUrl(metadata = {}) {
+                const separation = metadata && metadata.separation ? metadata.separation : {};
+                const chunk = metadata && metadata.chunk ? metadata.chunk : {};
+                const sources = metadata && metadata.sources ? metadata.sources : {};
+                const candidates = [
+                    metadata.vocals_url,
+                    separation.vocals_url,
+                    chunk.vocals_url,
+                    sources.vocals_url,
+                    metadata.original_audio_url,
+                    metadata.source_audio_url,
+                ];
+                return normalizeSubtitleUrl(candidates.find(candidate => typeof candidate === 'string' && candidate.trim()));
+            }
+
+            function resolveBackingAudioUrl(metadata = {}) {
+                const separation = metadata && metadata.separation ? metadata.separation : {};
+                const chunk = metadata && metadata.chunk ? metadata.chunk : {};
+                const backing = metadata && metadata.backing_track ? metadata.backing_track : {};
+                const sources = metadata && metadata.sources ? metadata.sources : {};
+                const candidates = [
+                    metadata.backing_url,
+                    separation.backing_url,
+                    chunk.backing_url,
+                    backing.preview_url,
+                    sources.backing_url,
+                ];
+                return normalizeSubtitleUrl(candidates.find(candidate => typeof candidate === 'string' && candidate.trim()));
+            }
+
+            function resolveTranslatedVocalUrl(metadata = {}, fallbackUrl = '') {
+                const candidates = [
+                    metadata.translated_vocals_url,
+                    metadata.translated_unmixed_url,
+                    metadata.translated_dry_url,
+                    fallbackUrl,
+                ];
+                return normalizeSubtitleUrl(candidates.find(candidate => typeof candidate === 'string' && candidate.trim()));
+            }
+
+            function renderTranslatedAudioPlayer(resultDiv, options = {}) {
+                if (!resultDiv || !options.audioUrl) {
+                    return;
+                }
+
+                const audioUrl = options.audioUrl;
+                const downloadName = options.downloadName || 'translated_speech.mp3';
+                const subtitleUrl = normalizeSubtitleUrl(options.subtitleUrl);
+                const originalSubtitleUrl = normalizeSubtitleUrl(options.originalSubtitleUrl);
+                const metadata = options.metadata || {};
+                const fallbackSegments = Array.isArray(options.segments) ? options.segments : [];
+                const originalAudioUrl = resolveOriginalAudioUrl(metadata);
+                const backingAudioUrl = resolveBackingAudioUrl(metadata);
+                const translatedVocalUrl = resolveTranslatedVocalUrl(metadata, audioUrl);
+                const audioSources = {
+                    translated: {
+                        label: 'Translated Audio',
+                        url: translatedVocalUrl,
+                        downloadName,
+                    },
+                };
+                if (originalAudioUrl && originalAudioUrl !== audioUrl) {
+                    audioSources.original = {
+                        label: 'Original Audio',
+                        url: originalAudioUrl,
+                        downloadName: 'original_audio.mp3',
+                    };
+                }
+
+                resultDiv.innerHTML = '';
+
+                const player = document.createElement('section');
+                player.className = 'synced-audio-player';
+
+                const audio = document.createElement('audio');
+                audio.className = 'synced-audio-native';
+                audio.preload = 'metadata';
+                audio.src = audioSources.translated.url;
+                player.appendChild(audio);
+
+                const backingAudio = document.createElement('audio');
+                backingAudio.className = 'synced-audio-native';
+                backingAudio.preload = 'metadata';
+                if (backingAudioUrl) {
+                    backingAudio.src = backingAudioUrl;
+                }
+                player.appendChild(backingAudio);
+
+                const main = document.createElement('div');
+                main.className = 'synced-audio-main';
+                player.appendChild(main);
+
+                const stage = document.createElement('div');
+                stage.className = 'synced-audio-stage';
+                main.appendChild(stage);
+
+                const topbar = document.createElement('div');
+                topbar.className = 'synced-audio-topbar';
+                stage.appendChild(topbar);
+
+                const title = document.createElement('div');
+                title.className = 'synced-audio-title';
+                const strong = document.createElement('strong');
+                strong.textContent = 'Translated Audio';
+                const sub = document.createElement('span');
+                const segmentCount = typeof metadata.segment_count === 'number' ? metadata.segment_count : null;
+                sub.textContent = segmentCount ? `${segmentCount} segments` : 'Ready';
+                title.appendChild(strong);
+                title.appendChild(sub);
+                topbar.appendChild(title);
+
+                const topbarRight = document.createElement('div');
+                topbarRight.className = 'synced-audio-actions';
+                const sourceTabs = document.createElement('div');
+                sourceTabs.className = 'synced-audio-source-tabs';
+                const subtitleCount = document.createElement('span');
+                subtitleCount.className = 'synced-subtitle-count';
+                subtitleCount.textContent = subtitleUrl || fallbackSegments.length ? 'Loading subtitles' : 'No subtitles';
+                topbarRight.appendChild(sourceTabs);
+                topbarRight.appendChild(subtitleCount);
+                topbar.appendChild(topbarRight);
+
+                const now = document.createElement('div');
+                now.className = 'synced-now';
+                const nowTime = document.createElement('div');
+                nowTime.className = 'synced-now-time';
+                nowTime.textContent = '00:00';
+                const nowText = document.createElement('div');
+                nowText.className = 'synced-now-text';
+                nowText.textContent = 'Loading subtitles...';
+                now.appendChild(nowTime);
+                now.appendChild(nowText);
+                stage.appendChild(now);
+
+                const controls = document.createElement('div');
+                controls.className = 'synced-controls';
+                stage.appendChild(controls);
+
+                const playButton = document.createElement('button');
+                playButton.type = 'button';
+                playButton.className = 'synced-play-btn';
+                playButton.textContent = 'Play';
+                playButton.title = 'Play or pause';
+                controls.appendChild(playButton);
+
+                const seekWrap = document.createElement('div');
+                const seek = document.createElement('input');
+                seek.type = 'range';
+                seek.className = 'synced-seek';
+                seek.min = '0';
+                seek.max = '1000';
+                seek.step = '1';
+                seek.value = '0';
+                const timeRow = document.createElement('div');
+                timeRow.className = 'synced-time';
+                const elapsed = document.createElement('span');
+                elapsed.textContent = '00:00';
+                const durationLabel = document.createElement('span');
+                durationLabel.textContent = '00:00';
+                timeRow.appendChild(elapsed);
+                timeRow.appendChild(durationLabel);
+                seekWrap.appendChild(seek);
+                seekWrap.appendChild(timeRow);
+                controls.appendChild(seekWrap);
+
+                const sideControls = document.createElement('div');
+                sideControls.className = 'synced-side-controls';
+                const backButton = document.createElement('button');
+                backButton.type = 'button';
+                backButton.className = 'synced-mini-btn';
+                backButton.textContent = '-10';
+                backButton.title = 'Back 10 seconds';
+                const forwardButton = document.createElement('button');
+                forwardButton.type = 'button';
+                forwardButton.className = 'synced-mini-btn';
+                forwardButton.textContent = '+10';
+                forwardButton.title = 'Forward 10 seconds';
+                const rateSelect = document.createElement('select');
+                rateSelect.className = 'synced-rate-select select-inline-dark';
+                ['0.75', '1', '1.25', '1.5', '2'].forEach(rate => {
+                    const option = document.createElement('option');
+                    option.value = rate;
+                    option.textContent = `${rate}x`;
+                    if (rate === '1') {
+                        option.selected = true;
+                    }
+                    rateSelect.appendChild(option);
+                });
+                sideControls.appendChild(backButton);
+                sideControls.appendChild(forwardButton);
+                sideControls.appendChild(rateSelect);
+                controls.appendChild(sideControls);
+
+                const downloads = document.createElement('div');
+                downloads.className = 'synced-downloads';
+                downloads.appendChild(createDownloadLink(audioUrl, downloadName, 'Download audio'));
+                if (backingAudioUrl) {
+                    downloads.appendChild(createDownloadLink(backingAudioUrl, 'backing_track.mp3', 'Backing track', true));
+                }
+                if (subtitleUrl) {
+                    downloads.appendChild(
+                        createDownloadLink(
+                            subtitleUrl,
+                            options.subtitleFileName || 'translated_speech.srt',
+                            'Translated SRT',
+                            true
+                        )
+                    );
+                }
+                if (originalSubtitleUrl) {
+                    downloads.appendChild(
+                        createDownloadLink(
+                            originalSubtitleUrl,
+                            options.originalSubtitleFileName || 'translated_speech_original.srt',
+                            'Original SRT',
+                            true
+                        )
+                    );
+                }
+                stage.appendChild(downloads);
+
+                const subtitlePanel = document.createElement('aside');
+                subtitlePanel.className = 'synced-subtitle-panel';
+                main.appendChild(subtitlePanel);
+
+                const subtitleHeader = document.createElement('div');
+                subtitleHeader.className = 'synced-subtitle-header';
+                const subtitleHeading = document.createElement('strong');
+                subtitleHeading.textContent = 'Subtitles';
+                const subtitleTabs = document.createElement('div');
+                subtitleTabs.className = 'synced-subtitle-tabs';
+                subtitleHeader.appendChild(subtitleHeading);
+                subtitleHeader.appendChild(subtitleTabs);
+                subtitlePanel.appendChild(subtitleHeader);
+
+                const subtitleList = document.createElement('div');
+                subtitleList.className = 'synced-subtitle-list';
+                subtitlePanel.appendChild(subtitleList);
+
+                resultDiv.appendChild(player);
+
+                const subtitleSets = {
+                    translated: {
+                        label: 'Translated',
+                        url: subtitleUrl,
+                        cues: buildCuesFromSegments(fallbackSegments, 'translated'),
+                    },
+                    original: {
+                        label: 'Original',
+                        url: originalSubtitleUrl,
+                        cues: buildCuesFromSegments(fallbackSegments, 'source'),
+                    },
+                };
+                let activeSubtitleKind = subtitleSets.translated.url || subtitleSets.translated.cues.length
+                    ? 'translated'
+                    : 'original';
+                let activeAudioKind = 'translated';
+                let backingEnabled = Boolean(backingAudioUrl);
+                let cueButtons = [];
+                let activeCueIndex = -1;
+                let manualScrollUntil = 0;
+                let programmaticSubtitleScroll = false;
+                let pendingSubtitleLoads = [subtitleUrl, originalSubtitleUrl].filter(Boolean).length;
+
+                const getActiveCues = () => (subtitleSets[activeSubtitleKind] || subtitleSets.translated).cues || [];
+                const getActiveAudioSource = () => audioSources[activeAudioKind] || audioSources.translated;
+                const getBackingVolume = () => {
+                    const backing = metadata && metadata.backing_track ? metadata.backing_track : {};
+                    const rawVolume =
+                        typeof backing.volume_percent === 'number'
+                            ? backing.volume_percent
+                            : typeof metadata.backing_volume_percent === 'number'
+                              ? metadata.backing_volume_percent
+                              : 100;
+                    return Math.max(0, Math.min(1, rawVolume / 100));
+                };
+                const syncBackingPosition = () => {
+                    if (!backingAudioUrl || !backingAudio.src) {
+                        return;
+                    }
+                    const currentTime = audio.currentTime || 0;
+                    try {
+                        backingAudio.currentTime = currentTime;
+                    } catch (_error) {
+                        /* backing metadata may not be ready yet */
+                    }
+                };
+                const pauseBacking = () => {
+                    if (backingAudioUrl) {
+                        backingAudio.pause();
+                    }
+                };
+                const playBacking = () => {
+                    if (!backingEnabled || !backingAudioUrl) {
+                        pauseBacking();
+                        return;
+                    }
+                    backingAudio.volume = getBackingVolume();
+                    backingAudio.playbackRate = audio.playbackRate || 1;
+                    syncBackingPosition();
+                    backingAudio.play().catch(error => console.warn('Failed to play backing track', error));
+                };
+                const updateAudioSourceTitle = () => {
+                    const source = getActiveAudioSource();
+                    strong.textContent = source.label;
+                    if (activeAudioKind === 'original') {
+                        sub.textContent = segmentCount ? `Original vocal - ${segmentCount} segments` : 'Original vocal';
+                    } else {
+                        sub.textContent = segmentCount ? `${segmentCount} segments` : 'Ready';
+                    }
+                };
+                const getEffectiveDuration = () => {
+                    if (Number.isFinite(audio.duration) && audio.duration > 0) {
+                        return audio.duration;
+                    }
+                    const cues = getActiveCues();
+                    const lastCue = cues.length ? cues[cues.length - 1] : null;
+                    return lastCue ? lastCue.end : 0;
+                };
+                const seekTo = seconds => {
+                    const duration = getEffectiveDuration();
+                    const nextTime = Math.max(0, duration ? Math.min(seconds, duration) : seconds);
+                    try {
+                        audio.currentTime = nextTime;
+                    } catch (_error) {
+                        /* metadata may not be ready yet */
+                    }
+                    syncBackingPosition();
+                    updatePlaybackUi();
+                };
+                const seekBy = delta => seekTo((audio.currentTime || 0) + delta);
+                const updateAudioSourceTabs = () => {
+                    sourceTabs.innerHTML = '';
+                    const entries = Object.entries(audioSources);
+                    if (entries.length >= 2) {
+                        entries.forEach(([kind, source]) => {
+                            const tab = document.createElement('button');
+                            tab.type = 'button';
+                            tab.className = `synced-audio-source-tab${kind === activeAudioKind ? ' active' : ''}`;
+                            tab.textContent = kind === 'original' ? 'Original' : 'Translated';
+                            tab.title = `Switch to ${source.label}`;
+                            tab.addEventListener('click', () => switchAudioSource(kind));
+                            sourceTabs.appendChild(tab);
+                        });
+                    }
+                    if (backingAudioUrl) {
+                        const backingTab = document.createElement('button');
+                        backingTab.type = 'button';
+                        backingTab.className = `synced-audio-source-tab${backingEnabled ? ' active' : ''}`;
+                        backingTab.textContent = backingEnabled ? 'Backing On' : 'Backing Off';
+                        backingTab.title = backingEnabled ? 'Turn backing off' : 'Turn backing on';
+                        backingTab.addEventListener('click', () => {
+                            backingEnabled = !backingEnabled;
+                            updateAudioSourceTabs();
+                            if (backingEnabled && !audio.paused) {
+                                playBacking();
+                            } else {
+                                pauseBacking();
+                            }
+                        });
+                        sourceTabs.appendChild(backingTab);
+                    }
+                };
+                const switchAudioSource = kind => {
+                    const nextSource = audioSources[kind];
+                    if (!nextSource || kind === activeAudioKind) {
+                        return;
+                    }
+                    const wasPlaying = !audio.paused;
+                    const currentTime = audio.currentTime || 0;
+                    activeAudioKind = kind;
+                    if (subtitleSets[kind] && (subtitleSets[kind].url || subtitleSets[kind].cues.length)) {
+                        activeSubtitleKind = kind;
+                    }
+                    activeCueIndex = -1;
+                    updateAudioSourceTitle();
+                    updateAudioSourceTabs();
+                    updateSubtitleTabs();
+                    renderSubtitleList();
+                    audio.src = nextSource.url;
+                    audio.load();
+                    pauseBacking();
+                    const restorePosition = () => {
+                        seekTo(currentTime);
+                        updatePlaybackUi();
+                        if (wasPlaying) {
+                            audio.play().catch(error => console.warn('Failed to resume audio after source switch', error));
+                        }
+                    };
+                    audio.addEventListener('loadedmetadata', restorePosition, { once: true });
+                    window.setTimeout(() => {
+                        if (audio.readyState > 0) {
+                            restorePosition();
+                        }
+                    }, 250);
+                    updatePlaybackUi();
+                };
+                const updateSubtitleCount = () => {
+                    const cues = getActiveCues();
+                    if (cues.length) {
+                        subtitleCount.textContent = `${cues.length} subtitles`;
+                    } else if (pendingSubtitleLoads > 0) {
+                        subtitleCount.textContent = 'Loading subtitles';
+                    } else {
+                        subtitleCount.textContent = 'No subtitles';
+                    }
+                };
+                const updateSubtitleTabs = () => {
+                    subtitleTabs.innerHTML = '';
+                    ['translated', 'original'].forEach(kind => {
+                        const set = subtitleSets[kind];
+                        if (!set.url && !set.cues.length) {
+                            return;
+                        }
+                        const tab = document.createElement('button');
+                        tab.type = 'button';
+                        tab.className = `synced-subtitle-tab${kind === activeSubtitleKind ? ' active' : ''}`;
+                        tab.textContent = set.label;
+                        tab.addEventListener('click', () => {
+                            activeSubtitleKind = kind;
+                            activeCueIndex = -1;
+                            updateSubtitleTabs();
+                            renderSubtitleList();
+                            updatePlaybackUi();
+                        });
+                        subtitleTabs.appendChild(tab);
+                    });
+                };
+                const renderSubtitleList = () => {
+                    const cues = getActiveCues();
+                    subtitleList.innerHTML = '';
+                    cueButtons = [];
+                    if (!cues.length) {
+                        const empty = document.createElement('div');
+                        empty.className = 'synced-empty';
+                        empty.textContent = pendingSubtitleLoads > 0 ? 'Loading subtitles...' : 'No synced subtitles available.';
+                        subtitleList.appendChild(empty);
+                        nowText.textContent = pendingSubtitleLoads > 0 ? 'Loading subtitles...' : 'No synced subtitles available.';
+                        nowTime.textContent = formatPlayerTime(audio.currentTime || 0);
+                        updateSubtitleCount();
+                        return;
+                    }
+                    cues.forEach((cue, index) => {
+                        const item = document.createElement('button');
+                        item.type = 'button';
+                        item.className = 'synced-subtitle-item';
+                        item.dataset.index = String(index);
+                        const cueTime = document.createElement('span');
+                        cueTime.className = 'synced-subtitle-time';
+                        cueTime.textContent = `${formatPlayerTime(cue.start)} - ${formatPlayerTime(cue.end)}`;
+                        const cueText = document.createElement('span');
+                        cueText.className = 'synced-subtitle-text';
+                        cueText.textContent = cue.text;
+                        item.appendChild(cueTime);
+                        item.appendChild(cueText);
+                        item.addEventListener('click', () => {
+                            const wasPlaying = !audio.paused;
+                            manualScrollUntil = Date.now() + 1200;
+                            seekTo(cue.start);
+                            if (wasPlaying) {
+                                audio.play().catch(error => console.warn('Failed to resume audio after subtitle seek', error));
+                            }
+                        });
+                        subtitleList.appendChild(item);
+                        cueButtons.push(item);
+                    });
+                    updateSubtitleCount();
+                };
+                const updateActiveCue = currentTime => {
+                    const cues = getActiveCues();
+                    let nextIndex = -1;
+                    for (let i = 0; i < cues.length; i += 1) {
+                        if (currentTime >= cues[i].start) {
+                            nextIndex = i;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (nextIndex !== activeCueIndex) {
+                        if (cueButtons[activeCueIndex]) {
+                            cueButtons[activeCueIndex].classList.remove('active');
+                        }
+                        activeCueIndex = nextIndex;
+                        if (cueButtons[activeCueIndex]) {
+                            cueButtons[activeCueIndex].classList.add('active');
+                            if (!audio.paused && Date.now() > manualScrollUntil) {
+                                programmaticSubtitleScroll = true;
+                                cueButtons[activeCueIndex].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+                                window.setTimeout(() => {
+                                    programmaticSubtitleScroll = false;
+                                }, 450);
+                            }
+                        }
+                    }
+                    const activeCue = cues[activeCueIndex];
+                    if (activeCue) {
+                        nowTime.textContent = `${formatPlayerTime(activeCue.start)} - ${formatPlayerTime(activeCue.end)}`;
+                        nowText.textContent = activeCue.text;
+                    } else {
+                        nowTime.textContent = formatPlayerTime(currentTime);
+                        nowText.textContent = cues.length ? '' : (pendingSubtitleLoads > 0 ? 'Loading subtitles...' : 'No synced subtitles available.');
+                    }
+                };
+                function updatePlaybackUi() {
+                    const duration = getEffectiveDuration();
+                    const currentTime = audio.currentTime || 0;
+                    const progress = duration > 0 ? Math.min(1000, Math.max(0, (currentTime / duration) * 1000)) : 0;
+                    seek.value = String(progress);
+                    elapsed.textContent = formatPlayerTime(currentTime);
+                    durationLabel.textContent = formatPlayerTime(duration);
+                    updateActiveCue(currentTime);
+                }
+                const loadSubtitleSet = async kind => {
+                    const set = subtitleSets[kind];
+                    if (!set || !set.url) {
+                        return;
+                    }
+                    try {
+                        const cues = await loadSubtitleCues(set.url);
+                        if (cues.length) {
+                            set.cues = cues;
+                        }
+                    } catch (error) {
+                        console.warn(`Failed to load ${kind} subtitles`, error);
+                    } finally {
+                        pendingSubtitleLoads = Math.max(0, pendingSubtitleLoads - 1);
+                        if (!getActiveCues().length && set.cues.length) {
+                            activeSubtitleKind = kind;
+                        }
+                        activeCueIndex = -1;
+                        updateSubtitleTabs();
+                        renderSubtitleList();
+                        updatePlaybackUi();
+                    }
+                };
+
+                subtitleList.addEventListener('wheel', () => {
+                    manualScrollUntil = Date.now() + 2500;
+                }, { passive: true });
+                subtitleList.addEventListener('scroll', () => {
+                    if (!programmaticSubtitleScroll) {
+                        manualScrollUntil = Date.now() + 1800;
+                    }
+                }, { passive: true });
+                subtitleList.addEventListener('touchstart', () => {
+                    manualScrollUntil = Date.now() + 2500;
+                }, { passive: true });
+                playButton.addEventListener('click', () => {
+                    if (audio.paused) {
+                        audio.play().catch(error => console.warn('Failed to play translated audio', error));
+                    } else {
+                        audio.pause();
+                    }
+                });
+                seek.addEventListener('input', () => {
+                    const duration = getEffectiveDuration();
+                    if (!duration) {
+                        return;
+                    }
+                    seekTo((parseFloat(seek.value) / 1000) * duration);
+                });
+                backButton.addEventListener('click', () => seekBy(-10));
+                forwardButton.addEventListener('click', () => seekBy(10));
+                rateSelect.addEventListener('change', () => {
+                    const nextRate = parseFloat(rateSelect.value);
+                    audio.playbackRate = Number.isFinite(nextRate) ? nextRate : 1;
+                    backingAudio.playbackRate = audio.playbackRate;
+                });
+                audio.addEventListener('play', () => {
+                    if (activeSyncedAudio && activeSyncedAudio !== audio) {
+                        activeSyncedAudio.pause();
+                    }
+                    activeSyncedAudio = audio;
+                    playButton.textContent = 'Pause';
+                    playBacking();
+                });
+                audio.addEventListener('pause', () => {
+                    playButton.textContent = 'Play';
+                    pauseBacking();
+                });
+                audio.addEventListener('ended', () => {
+                    playButton.textContent = 'Play';
+                    pauseBacking();
+                });
+                audio.addEventListener('loadedmetadata', updatePlaybackUi);
+                audio.addEventListener('durationchange', updatePlaybackUi);
+                audio.addEventListener('timeupdate', () => {
+                    if (
+                        backingEnabled &&
+                        backingAudioUrl &&
+                        !audio.paused &&
+                        Math.abs((backingAudio.currentTime || 0) - (audio.currentTime || 0)) > 0.45
+                    ) {
+                        syncBackingPosition();
+                    }
+                    updatePlaybackUi();
+                });
+
+                updateAudioSourceTitle();
+                updateAudioSourceTabs();
+                updateSubtitleTabs();
+                renderSubtitleList();
+                updatePlaybackUi();
+                loadSubtitleSet('translated');
+                loadSubtitleSet('original');
             }
 
             // Toggle segment card expand/collapse
@@ -7704,21 +8684,17 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                                     eventData.metadata.subtitle_original &&
                                     eventData.metadata.subtitle_original.filename) ||
                                 'translated_speech_original.srt';
-                            let downloadButtons = `<a href="${audioUrl}" download="${downloadName}" class="btn">💾 Download</a>`;
-                            if (subtitleUrl) {
-                                downloadButtons += `<a href="${subtitleUrl}" download="${subtitleFileName}" class="btn btn-secondary" style="margin-left: 10px;">📝 Translated Subtitles (.srt)</a>`;
-                            }
-                            if (originalSubtitleUrl) {
-                                downloadButtons += `<a href="${originalSubtitleUrl}" download="${originalSubtitleFileName}" class="btn btn-secondary" style="margin-left: 10px;">📜 Original Subtitles (.srt)</a>`;
-                            }
-                            resultDiv.innerHTML = `
-                                <audio controls src="${audioUrl}" style="width: 100%; margin-top: 20px;"></audio>
-                                <div style="margin-top: 12px;">
-                                    ${downloadButtons}
-                                </div>
-                            `;
-
                             const metadata = eventData.metadata || {};
+                            renderTranslatedAudioPlayer(resultDiv, {
+                                audioUrl,
+                                downloadName,
+                                subtitleUrl,
+                                subtitleFileName,
+                                originalSubtitleUrl,
+                                originalSubtitleFileName,
+                                metadata,
+                                segments: currentTranslateSegments,
+                            });
                             const statusMessage = buildTranslationCompleteMessage(metadata);
                             showStatus(statusMessage, 'success', statusId);
                             applyChunkGenerationMetadata(metadata, audioUrl);
@@ -7981,20 +8957,17 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         data.original_subtitle_file_name ||
                         (metadata.subtitle_original && metadata.subtitle_original.filename) ||
                         'translated_speech_original.srt';
-                    let downloadButtons = `<a href="${audioUrl}" download="${downloadName}" class="btn">💾 Download</a>`;
-                    if (subtitleUrl) {
-                        downloadButtons += `<a href="${subtitleUrl}" download="${subtitleFileName}" class="btn btn-secondary" style="margin-left: 10px;">📝 Translated Subtitles (.srt)</a>`;
-                    }
-                    if (originalSubtitleUrl) {
-                        downloadButtons += `<a href="${originalSubtitleUrl}" download="${originalSubtitleFileName}" class="btn btn-secondary" style="margin-left: 10px;">📜 Original Subtitles (.srt)</a>`;
-                    }
                     if (resultDiv) {
-                        resultDiv.innerHTML = `
-                            <audio controls src="${audioUrl}" style="width: 100%; margin-top: 20px;"></audio>
-                            <div style="margin-top: 12px;">
-                                ${downloadButtons}
-                            </div>
-                        `;
+                        renderTranslatedAudioPlayer(resultDiv, {
+                            audioUrl,
+                            downloadName,
+                            subtitleUrl,
+                            subtitleFileName,
+                            originalSubtitleUrl,
+                            originalSubtitleFileName,
+                            metadata,
+                            segments: segmentsPayload,
+                        });
                     }
 
                     let statusMessage = '✅ Advanced translation complete!';

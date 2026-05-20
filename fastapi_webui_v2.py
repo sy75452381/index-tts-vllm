@@ -4971,6 +4971,7 @@ async def _generate_chunk_audio_from_session(
         backing_volume_percent=backing_volume_percent,
         default_speaker_preset=default_speaker_preset,
         default_emotion_weight=default_emotion_weight,
+        return_unmixed_audio=merge_with_backing and backing_track_audio is not None,
     )
 
     metadata = dict(segment_result.metadata)
@@ -5005,6 +5006,14 @@ async def _generate_chunk_audio_from_session(
     with open(output_path, "wb") as outfile:
         outfile.write(audio_payload)
     audio_url = f"/api/translate_outputs/{output_filename}"
+    unmixed_audio_bytes = metadata.pop("_unmixed_audio_bytes", None)
+    if unmixed_audio_bytes:
+        unmixed_filename = f"{audio_stem}_vocals.{response_format}"
+        unmixed_path = os.path.join(TRANSLATE_OUTPUT_DIR, unmixed_filename)
+        with open(unmixed_path, "wb") as outfile:
+            outfile.write(unmixed_audio_bytes)
+        metadata["translated_vocals_url"] = f"/api/translate_outputs/{unmixed_filename}"
+        metadata["translated_vocals_file_name"] = unmixed_filename
 
     subtitle_translated = _export_srt_from_segments(
         segment_result.segments,
@@ -7815,6 +7824,7 @@ async def _synthesize_translated_audio(
     default_speaker_preset: Optional[str] = None,
     default_emotion_weight: Optional[float] = None,
     emit_status: Optional[Callable[..., Awaitable[None]]] = None,
+    return_unmixed_audio: bool = False,
 ) -> Tuple[bytes, str, Dict[str, Any]]:
     tts = tts_manager.get_tts()
     frame_rate = int(original_audio.frame_rate or 22050)
@@ -8112,6 +8122,7 @@ async def _synthesize_translated_audio(
     original_duration_ms = len(original_audio)
     audio_format = _normalize_translate_output_format(response_format)
     final_duration_ms = 0
+    unmixed_audio_bytes: Optional[bytes] = None
     
     # Use FFmpeg for fast concatenation and post-processing (much faster than pydub for large files)
     use_ffmpeg_concat = len(audio_chunks) > 100  # Use FFmpeg for larger files
@@ -8207,6 +8218,22 @@ async def _synthesize_translated_audio(
                 current_wav_path = padded_path
                 paths_to_cleanup.append(padded_path)
                 concat_duration_ms = original_duration_ms
+
+            if return_unmixed_audio:
+                print("[synthesize] Exporting dry translated vocal preview before backing mix...")
+                unmixed_output_path = os.path.join(temp_dir, f"unmixed.{audio_format}")
+                unmixed_export_cmd = ["ffmpeg", "-y", "-i", current_wav_path]
+                unmixed_export_cmd += _ffmpeg_codec_args_for_format(audio_format, bitrate or TRANSLATE_DEFAULT_BITRATE)
+                unmixed_export_cmd.append(unmixed_output_path)
+                unmixed_result = await _run_blocking(
+                    lambda: subprocess.run(unmixed_export_cmd, capture_output=True, text=True, timeout=600)
+                )
+                if unmixed_result.returncode == 0 and os.path.exists(unmixed_output_path):
+                    with open(unmixed_output_path, "rb") as infile:
+                        unmixed_audio_bytes = infile.read()
+                    paths_to_cleanup.append(unmixed_output_path)
+                else:
+                    print(f"⚠️ Failed to export dry translated audio: {unmixed_result.stderr[:300]}")
             
             # Mix with backing track using FFmpeg if needed
             backing_applied = False
@@ -8351,6 +8378,19 @@ async def _synthesize_translated_audio(
             print(f"[synthesize] Padding audio from {final_duration_ms}ms to {original_duration_ms}ms...")
             combined_audio = combined_audio + _create_silence_segment(original_duration_ms - final_duration_ms, frame_rate, sample_width, channels)
 
+        if return_unmixed_audio:
+            print("[synthesize] Exporting dry translated vocal preview before backing mix...")
+            export_kwargs: Dict[str, Any] = {}
+            if audio_format == "mp3" and bitrate:
+                export_kwargs["bitrate"] = bitrate
+
+            def _blocking_unmixed_export():
+                buffer = BytesIO()
+                combined_audio.export(buffer, format=audio_format, **export_kwargs)
+                return buffer.getvalue()
+
+            unmixed_audio_bytes = await _run_blocking(_blocking_unmixed_export)
+
         backing_applied = False
         if merge_with_backing and backing_track_audio is not None:
             if emit_status:
@@ -8440,6 +8480,8 @@ async def _synthesize_translated_audio(
         "volume_percent": backing_volume_percent,
         "source": backing_track_source,
     }
+    if unmixed_audio_bytes:
+        metadata["_unmixed_audio_bytes"] = unmixed_audio_bytes
     metadata["preserve_silence_audio"] = preserve_silence_audio
     metadata["generated_volume_percent"] = generated_volume_percent
 
@@ -11862,6 +11904,7 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                         default_speaker_preset=session.default_speaker_preset,
                         default_emotion_weight=session.default_emotion_weight,
                         emit_status=emit_status,
+                        return_unmixed_audio=merge_with_backing and _session_has_backing_audio(session),
                     )
 
                     backing_meta = metadata.setdefault("backing_track", {})
@@ -11886,6 +11929,17 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                     metadata["selected_generated_count"] = generated_count
                     metadata["selected_preserved_count"] = preserved_count
                     metadata["session_id"] = session.session_id
+                    metadata["separation"] = {
+                        "vocals_available": True,
+                        "vocals_url": f"/api/translate_vocals/{session.session_id}",
+                        "backing_available": _session_has_backing_audio(session),
+                        "backing_url": (
+                            f"/api/translate_backing_track/{session.session_id}"
+                            if _session_has_backing_audio(session)
+                            else None
+                        ),
+                        "session_id": session.session_id,
+                    }
                     metadata["gemini_model"] = session.gemini_model or _get_gemini_model_name()
                     metadata["output_base_name"] = resolved_base_name
 
@@ -11937,6 +11991,14 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                     with open(output_path, "wb") as outfile:
                         outfile.write(audio_payload)
                     audio_url = f"/api/translate_outputs/{output_filename}"
+                    unmixed_audio_bytes = metadata.pop("_unmixed_audio_bytes", None)
+                    if unmixed_audio_bytes:
+                        unmixed_filename = f"{audio_stem}_vocals.{response_format_value}"
+                        unmixed_path = os.path.join(TRANSLATE_OUTPUT_DIR, unmixed_filename)
+                        with open(unmixed_path, "wb") as outfile:
+                            outfile.write(unmixed_audio_bytes)
+                        metadata["translated_vocals_url"] = f"/api/translate_outputs/{unmixed_filename}"
+                        metadata["translated_vocals_file_name"] = unmixed_filename
                     subtitle_translated = _export_srt_from_segments(
                         final_segments,
                         base_name=base_stem,
@@ -13138,6 +13200,7 @@ async def api_translate_audio(
                         default_speaker_preset=session.default_speaker_preset,
                         default_emotion_weight=session.default_emotion_weight,
                         emit_status=emit_status,
+                        return_unmixed_audio=merge_with_backing and backing_track_audio is not None,
                     )
 
                     metadata = dict(segment_result.metadata)
@@ -13217,6 +13280,14 @@ async def api_translate_audio(
                     with open(output_path, "wb") as outfile:
                         outfile.write(audio_payload)
                     audio_url = f"/api/translate_outputs/{output_filename}"
+                    unmixed_audio_bytes = metadata.pop("_unmixed_audio_bytes", None)
+                    if unmixed_audio_bytes:
+                        unmixed_filename = f"{audio_stem}_vocals.{response_format_value}"
+                        unmixed_path = os.path.join(TRANSLATE_OUTPUT_DIR, unmixed_filename)
+                        with open(unmixed_path, "wb") as outfile:
+                            outfile.write(unmixed_audio_bytes)
+                        metadata["translated_vocals_url"] = f"/api/translate_outputs/{unmixed_filename}"
+                        metadata["translated_vocals_file_name"] = unmixed_filename
                     subtitle_translated = _export_srt_from_segments(
                         segments,
                         base_name=base_stem,
