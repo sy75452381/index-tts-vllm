@@ -17,6 +17,9 @@ pip install json-repair
 git clone https://github.com/garyswansrs/index-tts-vllm
 cd index-tts-vllm
 pip install -r requirements.txt
+pip install -U "yt-dlp[default]"
+pip install -U yt-dlp-ejs
+python -m pip install -U bgutil-ytdlp-pot-provider
 pip install pydub
 pip install flashinfer-python
 pip install flash-attn --no-build-isolation --no-cache-dir
