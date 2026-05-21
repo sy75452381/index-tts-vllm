@@ -19,10 +19,24 @@ tag = f"{cuda_version}-{flavor}-{operating_sys}"
 # Create Modal image for IndexTTS v2 with vLLM optimization
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
-    .apt_install("ffmpeg", "git", "wget", "build-essential", "gcc", "g++", "cmake", "sox", "libsox-fmt-all")
+    .apt_install(
+        "ffmpeg",
+        "git",
+        "wget",
+        "build-essential",
+        "gcc",
+        "g++",
+        "cmake",
+        "sox",
+        "libsox-fmt-all",
+        "nodejs",
+        "npm",
+    )
     .env({
         "CUDA_HOME": "/usr/local/cuda",
         "CUDA_PATH": "/usr/local/cuda", 
+        "YTDLP_NODE_PATH": "/usr/bin/node",
+        "YTDLP_JS_RUNTIMES": "node:/usr/bin/node",
         "TORCH_CUDA_ARCH_LIST": "6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0;12.0",
         "FORCE_CUDA": "1",
         "CXX": "g++",
@@ -42,7 +56,8 @@ image = (
         "VLLM_CACHE": "/persistent_cache/vllm_cache",
         "VLLM_SERVER_DEV_MODE": "1",
         "TORCHINDUCTOR_COMPILE_THREADS": "1",
-        "TORCH_NCCL_ENABLE_MONITORING": "0"
+        "TORCH_NCCL_ENABLE_MONITORING": "0",
+        "TORCH_CPP_LOG_LEVEL": "ERROR"
     })
     .run_commands("pip install --upgrade pip setuptools wheel")
     .pip_install(
@@ -70,6 +85,11 @@ image = (
     .run_commands("pip install audio-separator")
     .run_commands("pip install clearvoice google-genai")
     .run_commands("pip install qwen-asr omnivad")
+    .pip_install(
+        "yt-dlp[default]",
+        "yt-dlp-ejs",
+        "bgutil-ytdlp-pot-provider",
+    )
     .pip_install("numpy<2")
 )
 
@@ -485,6 +505,8 @@ def legacy_serve_without_snapshot():
         "XDG_CACHE_HOME": "/persistent_cache",
         "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
         "TORCHINDUCTOR_AUTOGRAD_CACHE": "1",
+        "YTDLP_NODE_PATH": "/usr/bin/node",
+        "YTDLP_JS_RUNTIMES": "node:/usr/bin/node",
     }
     
     print("   Setting environment variables:")
@@ -664,7 +686,10 @@ def _configure_persistent_runtime():
         "VLLM_SERVER_DEV_MODE": "1",
         "INDEXTTS_ENABLE_VLLM_SLEEP_MODE": "1",
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512",
-        "TORCH_NCCL_ENABLE_MONITORING": "0"
+        "TORCH_NCCL_ENABLE_MONITORING": "0",
+        "TORCH_CPP_LOG_LEVEL": "ERROR",
+        "YTDLP_NODE_PATH": "/usr/bin/node",
+        "YTDLP_JS_RUNTIMES": "node:/usr/bin/node",
     }
 
     print("Configuring persistent cache environment:")

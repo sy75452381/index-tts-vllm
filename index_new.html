@@ -2417,6 +2417,10 @@
                                 <label style="font-weight: 500;">Burn original subtitles into video:</label>
                                 <pre id="ffmpegSubtitleOriginalCmd" style="white-space: pre-wrap; word-break: break-all; background: #111; color: #0f0; padding: 10px; border-radius: 8px; margin: 6px 0 0 0;"></pre>
                             </div>
+                            <div style="margin-top: 12px;">
+                                <label style="font-weight: 500;">Embed selectable subtitle tracks:</label>
+                                <pre id="ffmpegEmbedSubtitleCmd" style="white-space: pre-wrap; word-break: break-all; background: #111; color: #0f0; padding: 10px; border-radius: 8px; margin: 6px 0 0 0;"></pre>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -4769,6 +4773,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             const ffmpegDualAudioCmd = document.getElementById('ffmpegDualAudioCmd');
             const ffmpegSubtitleCmd = document.getElementById('ffmpegSubtitleCmd');
             const ffmpegSubtitleOriginalCmd = document.getElementById('ffmpegSubtitleOriginalCmd');
+            const ffmpegEmbedSubtitleCmd = document.getElementById('ffmpegEmbedSubtitleCmd');
             let currentTranslateSessionId = null;
             let currentTranslateSegments = [];
             let downloadedVideos = [];
@@ -6039,6 +6044,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     if (ffmpegSubtitleOriginalCmd) {
                         ffmpegSubtitleOriginalCmd.textContent = '';
                     }
+                    if (ffmpegEmbedSubtitleCmd) {
+                        ffmpegEmbedSubtitleCmd.textContent = '';
+                    }
                     return;
                 }
                 const languageLabel =
@@ -6075,6 +6083,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 ffmpegSubtitleCmd.textContent = `ffmpeg -filter_threads 0 -filter_complex_threads 0 -i ${translatedMp4} -vf ${translatedSubtitleFilter} -c:v libx264 -preset veryfast -crf 18 -threads:v 0 -c:a copy ${srtBurnedMp4}`;
                 if (ffmpegSubtitleOriginalCmd) {
                     ffmpegSubtitleOriginalCmd.textContent = `ffmpeg -filter_threads 0 -filter_complex_threads 0 -i ${baseMp4} -vf ${originalSubtitleFilter} -c:v libx264 -preset veryfast -crf 18 -threads:v 0 -c:a copy ${originalSrtBurned}`;
+                }
+                if (ffmpegEmbedSubtitleCmd) {
+                    ffmpegEmbedSubtitleCmd.textContent = `ffmpeg -i ${translatedMp4} -i "${translatedSrtFilename}" -i "${originalSrtFilename}" -map 0:v:0 -map 0:a? -map 1:0 -map 2:0 -c:v copy -c:a copy -c:s mov_text -metadata:s:s:0 title=Translated -metadata:s:s:1 title=Original -movflags +faststart "${normalizedBase}_${languageCode}_subtracks.mp4"`;
                 }
             }
 
@@ -6806,7 +6817,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 panel.appendChild(actions);
             }
 
-            async function renderTranslatedVideoFromAudio({ sourceVideo, audioFileName, subtitleFileName, audioMode = 'translated', sessionId, outputBaseName, container, button }) {
+            async function renderTranslatedVideoFromAudio({ sourceVideo, audioFileName, subtitleFileName, embeddedSubtitleFileNames = [], audioMode = 'translated', sessionId, outputBaseName, container, button }) {
                 const normalizedAudioMode = ['translated', 'original', 'both'].includes(audioMode) ? audioMode : 'translated';
                 const needsTranslatedAudio = normalizedAudioMode === 'translated' || normalizedAudioMode === 'both';
                 if (!sourceVideo || (needsTranslatedAudio && !audioFileName)) {
@@ -6845,6 +6856,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             session_id: sessionId || null,
                             audio_file_name: needsTranslatedAudio ? audioFileName : null,
                             subtitle_file_name: subtitleFileName || null,
+                            embedded_subtitle_file_names: Array.isArray(embeddedSubtitleFileNames) ? embeddedSubtitleFileNames : [],
                             audio_mode: normalizedAudioMode,
                             output_filename: safeBase ? `${safeBase}${outputSuffix}` : '',
                         }),
@@ -7094,30 +7106,54 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 }
                 if (sourceVideo && translatedAudioFileName) {
                     let renderSubtitleSelect = null;
+                    let embedSubtitleSelect = null;
                     if (translatedSubtitleFileName || originalSubtitleFileName) {
                         renderSubtitleSelect = document.createElement('select');
                         renderSubtitleSelect.className = 'select-inline-dark';
-                        renderSubtitleSelect.title = 'Subtitle track to burn into rendered video';
+                        renderSubtitleSelect.title = 'Subtitle track to burn into video frames';
                         renderSubtitleSelect.style.minWidth = '150px';
 
                         const noneOption = document.createElement('option');
                         noneOption.value = '';
-                        noneOption.textContent = 'No subtitles';
+                        noneOption.textContent = 'Burn: none';
                         renderSubtitleSelect.appendChild(noneOption);
 
                         if (translatedSubtitleFileName) {
                             const translatedOption = document.createElement('option');
                             translatedOption.value = translatedSubtitleFileName;
-                            translatedOption.textContent = 'Translated subtitles';
+                            translatedOption.textContent = 'Burn: translated';
                             renderSubtitleSelect.appendChild(translatedOption);
                         }
                         if (originalSubtitleFileName) {
                             const originalOption = document.createElement('option');
                             originalOption.value = originalSubtitleFileName;
-                            originalOption.textContent = 'Original subtitles';
+                            originalOption.textContent = 'Burn: original';
                             renderSubtitleSelect.appendChild(originalOption);
                         }
                         downloads.appendChild(renderSubtitleSelect);
+
+                        embedSubtitleSelect = document.createElement('select');
+                        embedSubtitleSelect.className = 'select-inline-dark';
+                        embedSubtitleSelect.title = 'Subtitle tracks to embed in the MP4';
+                        embedSubtitleSelect.style.minWidth = '170px';
+
+                        const embedOptions = [['', 'Embed: none']];
+                        if (translatedSubtitleFileName) {
+                            embedOptions.push(['translated', 'Embed: translated']);
+                        }
+                        if (originalSubtitleFileName) {
+                            embedOptions.push(['original', 'Embed: original']);
+                        }
+                        if (translatedSubtitleFileName && originalSubtitleFileName) {
+                            embedOptions.push(['both', 'Embed: both']);
+                        }
+                        embedOptions.forEach(([value, label]) => {
+                            const option = document.createElement('option');
+                            option.value = value;
+                            option.textContent = label;
+                            embedSubtitleSelect.appendChild(option);
+                        });
+                        downloads.appendChild(embedSubtitleSelect);
                     }
 
                     const renderAudioModeSelect = document.createElement('select');
@@ -7142,11 +7178,20 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     renderVideoBtn.textContent = 'Render video';
                     renderVideoBtn.addEventListener('click', () => {
                         const selectedSubtitleFileName = renderSubtitleSelect ? renderSubtitleSelect.value : '';
+                        const selectedEmbedMode = embedSubtitleSelect ? embedSubtitleSelect.value : '';
+                        const embeddedSubtitleFileNames = [];
+                        if ((selectedEmbedMode === 'translated' || selectedEmbedMode === 'both') && translatedSubtitleFileName) {
+                            embeddedSubtitleFileNames.push(translatedSubtitleFileName);
+                        }
+                        if ((selectedEmbedMode === 'original' || selectedEmbedMode === 'both') && originalSubtitleFileName) {
+                            embeddedSubtitleFileNames.push(originalSubtitleFileName);
+                        }
                         const selectedAudioMode = renderAudioModeSelect ? renderAudioModeSelect.value : 'translated';
                         renderTranslatedVideoFromAudio({
                             sourceVideo,
                             audioFileName: translatedAudioFileName,
                             subtitleFileName: selectedSubtitleFileName,
+                            embeddedSubtitleFileNames,
                             audioMode: selectedAudioMode,
                             sessionId: metadata.session_id || metadata.reuse_session_id || options.sessionId || '',
                             outputBaseName: metadata.output_base_name || metadata.base_output_name || translatedAudioFileName,

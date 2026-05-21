@@ -8646,6 +8646,7 @@ def _replace_video_audio_sync(
     output_path: str,
     subtitle_path: Optional[str] = None,
     audio_mode: str = "translated",
+    embedded_subtitle_paths: Optional[List[Tuple[str, str]]] = None,
 ) -> None:
     if not _ffmpeg_available():
         raise RuntimeError("ffmpeg is required to render video outputs.")
@@ -8659,6 +8660,10 @@ def _replace_video_audio_sync(
         raise FileNotFoundError(f"Translated audio not found: {audio_path}")
     if subtitle_path and not os.path.exists(subtitle_path):
         raise FileNotFoundError(f"Subtitle file not found: {subtitle_path}")
+    embedded_subtitles = embedded_subtitle_paths or []
+    for embedded_path, _embedded_label in embedded_subtitles:
+        if not os.path.exists(embedded_path):
+            raise FileNotFoundError(f"Embedded subtitle file not found: {embedded_path}")
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     source_has_audio = _video_has_audio_stream_sync(video_path)
     cmd = [
@@ -8673,6 +8678,9 @@ def _replace_video_audio_sync(
     cmd += ["-i", video_path]
     if needs_translated_audio:
         cmd += ["-i", str(audio_path)]
+    first_subtitle_input_index = 2 if needs_translated_audio else 1
+    for embedded_path, _embedded_label in embedded_subtitles:
+        cmd += ["-i", embedded_path]
     cmd += ["-map", "0:v:0"]
     if normalized_audio_mode == "original":
         cmd += ["-map", "0:a:0?"]
@@ -8682,6 +8690,8 @@ def _replace_video_audio_sync(
         if source_has_audio:
             cmd += ["-map", "0:a:0"]
         cmd += ["-map", "1:a:0"]
+    for subtitle_offset, (_embedded_path, _embedded_label) in enumerate(embedded_subtitles):
+        cmd += ["-map", f"{first_subtitle_input_index + subtitle_offset}:0"]
     if subtitle_path:
         cmd += [
             "-vf",
@@ -8716,7 +8726,20 @@ def _replace_video_audio_sync(
                 ]
             else:
                 cmd += ["-metadata:s:a:0", "title=Translated", "-disposition:a:0", "default"]
-    cmd += [*_ffmpeg_thread_args(), "-shortest", "-movflags", "+faststart", output_path]
+    if embedded_subtitles:
+        cmd += ["-c:s", "mov_text"]
+        for subtitle_index, (_embedded_path, embedded_label) in enumerate(embedded_subtitles):
+            label = embedded_label or f"Subtitle {subtitle_index + 1}"
+            cmd += [
+                f"-metadata:s:s:{subtitle_index}",
+                f"title={label}",
+                f"-disposition:s:{subtitle_index}",
+                "0",
+            ]
+    cmd += [*_ffmpeg_thread_args()]
+    if not embedded_subtitles:
+        cmd += ["-shortest"]
+    cmd += ["-movflags", "+faststart", output_path]
     _run_ffmpeg_command(cmd)
 
 
@@ -8741,6 +8764,15 @@ def _video_has_audio_stream_sync(video_path: str) -> bool:
         text=True,
     )
     return process.returncode == 0 and bool(process.stdout.strip())
+
+
+def _embedded_subtitle_label(filename: str) -> str:
+    lower_name = filename.lower()
+    if "original" in lower_name:
+        return "Original"
+    if "translated" in lower_name:
+        return "Translated"
+    return os.path.splitext(filename)[0] or "Subtitle"
 
 
 def _source_video_metadata_from_session(session: Optional[TranslateSessionData]) -> Optional[Dict[str, Any]]:
@@ -10314,6 +10346,10 @@ class VideoReplaceAudioRequest(BaseModel):
     audio_file_name: Optional[str] = Field(default=None, description="Translated audio filename from /api/translate_outputs.")
     output_filename: Optional[str] = Field(default=None, description="Optional output video base filename.")
     subtitle_file_name: Optional[str] = Field(default=None, description="Optional SRT/VTT filename from /api/translate_outputs to burn into the rendered video.")
+    embedded_subtitle_file_names: Optional[List[str]] = Field(
+        default=None,
+        description="Optional SRT/VTT subtitle filenames from /api/translate_outputs to embed as selectable MP4 subtitle tracks.",
+    )
     audio_mode: Optional[Literal["translated", "original", "both"]] = Field(
         default="translated",
         description="Rendered MP4 audio: translated track, original source track, or both selectable tracks.",
@@ -11475,6 +11511,26 @@ async def api_video_replace_audio(payload: VideoReplaceAudioRequest):
         if not os.path.exists(subtitle_path):
             return _status_error("Selected subtitle output not found.", status_code=404)
 
+    embedded_subtitles: List[Tuple[str, str]] = []
+    seen_embedded_subtitle_names: Set[str] = set()
+    for raw_embedded_name in payload.embedded_subtitle_file_names or []:
+        embedded_name_value = (raw_embedded_name or "").strip()
+        if not embedded_name_value:
+            continue
+        embedded_name = os.path.basename(embedded_name_value)
+        if embedded_name != embedded_name_value:
+            return _status_error("Invalid embedded subtitle filename.", status_code=400)
+        if embedded_name in seen_embedded_subtitle_names:
+            continue
+        embedded_ext = os.path.splitext(embedded_name)[1].lstrip(".").lower()
+        if embedded_ext not in {"srt", "vtt"}:
+            return _status_error("Embedded subtitle tracks must be SRT or VTT for MP4 output.", status_code=400)
+        embedded_path = os.path.join(TRANSLATE_OUTPUT_DIR, embedded_name)
+        if not os.path.exists(embedded_path):
+            return _status_error("Selected embedded subtitle output not found.", status_code=404)
+        seen_embedded_subtitle_names.add(embedded_name)
+        embedded_subtitles.append((embedded_path, _embedded_subtitle_label(embedded_name)))
+
     requested_base = _sanitize_base_filename(payload.output_filename)
     if not requested_base:
         video_base = _sanitize_base_filename(os.path.splitext(os.path.basename(video_path))[0]) or "video"
@@ -11495,6 +11551,7 @@ async def api_video_replace_audio(payload: VideoReplaceAudioRequest):
             output_path,
             subtitle_path,
             audio_mode,
+            embedded_subtitles,
         )
     except Exception as exc:
         traceback.print_exc()
@@ -11509,6 +11566,7 @@ async def api_video_replace_audio(payload: VideoReplaceAudioRequest):
             "file_name": output_filename,
             "source_video": _downloaded_video_entry(video_path),
             "subtitle_file_name": subtitle_name or None,
+            "embedded_subtitle_file_names": [os.path.basename(path) for path, _label in embedded_subtitles],
             "audio_mode": audio_mode,
         }
     )
