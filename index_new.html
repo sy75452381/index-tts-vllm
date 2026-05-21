@@ -2405,6 +2405,10 @@
                                 <label style="font-weight: 500;">Replace video audio with translated track:</label>
                                 <pre id="ffmpegReplaceCmd" style="white-space: pre-wrap; word-break: break-all; background: #111; color: #0f0; padding: 10px; border-radius: 8px; margin: 6px 0 0 0;"></pre>
                             </div>
+                            <div style="margin-bottom: 12px;">
+                                <label style="font-weight: 500;">Embed original + translated audio tracks:</label>
+                                <pre id="ffmpegDualAudioCmd" style="white-space: pre-wrap; word-break: break-all; background: #111; color: #0f0; padding: 10px; border-radius: 8px; margin: 6px 0 0 0;"></pre>
+                            </div>
                             <div>
                                 <label style="font-weight: 500;">Burn subtitles into video:</label>
                                 <pre id="ffmpegSubtitleCmd" style="white-space: pre-wrap; word-break: break-all; background: #111; color: #0f0; padding: 10px; border-radius: 8px; margin: 6px 0 0 0;"></pre>
@@ -4762,6 +4766,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             const ffmpegPanel = document.getElementById('translateFfmpegPanel');
             const ffmpegExtractCmd = document.getElementById('ffmpegExtractCmd');
             const ffmpegReplaceCmd = document.getElementById('ffmpegReplaceCmd');
+            const ffmpegDualAudioCmd = document.getElementById('ffmpegDualAudioCmd');
             const ffmpegSubtitleCmd = document.getElementById('ffmpegSubtitleCmd');
             const ffmpegSubtitleOriginalCmd = document.getElementById('ffmpegSubtitleOriginalCmd');
             let currentTranslateSessionId = null;
@@ -6027,6 +6032,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     ffmpegPanel.style.display = 'none';
                     ffmpegExtractCmd.textContent = '';
                     ffmpegReplaceCmd.textContent = '';
+                    if (ffmpegDualAudioCmd) {
+                        ffmpegDualAudioCmd.textContent = '';
+                    }
                     ffmpegSubtitleCmd.textContent = '';
                     if (ffmpegSubtitleOriginalCmd) {
                         ffmpegSubtitleOriginalCmd.textContent = '';
@@ -6049,17 +6057,21 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 const baseMp3 = `"${normalizedBase}.mp3"`;
                 const translatedMp3 = `"${normalizedBase}_${languageCode}.mp3"`;
                 const translatedMp4 = `"${normalizedBase}_${languageCode}.mp4"`;
+                const dualAudioMp4 = `"${normalizedBase}_${languageCode}_dual_audio.mp4"`;
                 const translatedSrtFilename = `${normalizedBase}_${languageCode}.srt`;
                 const srtBurnedMp4 = `"${normalizedBase}_${languageCode}_srt.mp4"`;
                 const originalSrtFilename = `${normalizedBase}_original.srt`;
                 const originalSrtBurned = `"${normalizedBase}_original_srt.mp4"`;
-                const subtitleForceStyle = "force_style='FontName=Noto Sans CJK SC,FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1.5,Shadow=0.7,MarginV=36'";
+                const subtitleForceStyle = "force_style='FontName=Noto Sans CJK SC,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1.5,Shadow=0.7'";
                 const subtitleFontsDir = "fontsdir='fonts/noto-cjk'";
                 const translatedSubtitleFilter = `"subtitles='${translatedSrtFilename.replace(/'/g, "\\'")}':${subtitleFontsDir}:${subtitleForceStyle}"`;
                 const originalSubtitleFilter = `"subtitles='${originalSrtFilename.replace(/'/g, "\\'")}':${subtitleFontsDir}:${subtitleForceStyle}"`;
                 ffmpegPanel.style.display = 'block';
                 ffmpegExtractCmd.textContent = `ffmpeg -i ${baseMp4} -vn -codec:a libmp3lame -q:a 2 -threads 0 ${baseMp3}`;
                 ffmpegReplaceCmd.textContent = `ffmpeg -i ${baseMp4} -i ${translatedMp3} -c:v copy -c:a aac -threads 0 -map 0:v:0 -map 1:a:0 ${translatedMp4}`;
+                if (ffmpegDualAudioCmd) {
+                    ffmpegDualAudioCmd.textContent = `ffmpeg -i ${baseMp4} -i ${translatedMp3} -map 0:v:0 -map 0:a:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -metadata:s:a:0 title=Original -metadata:s:a:1 title=Translated -disposition:a:0 0 -disposition:a:1 default -threads 0 ${dualAudioMp4}`;
+                }
                 ffmpegSubtitleCmd.textContent = `ffmpeg -filter_threads 0 -filter_complex_threads 0 -i ${translatedMp4} -vf ${translatedSubtitleFilter} -c:v libx264 -preset veryfast -crf 18 -threads:v 0 -c:a copy ${srtBurnedMp4}`;
                 if (ffmpegSubtitleOriginalCmd) {
                     ffmpegSubtitleOriginalCmd.textContent = `ffmpeg -filter_threads 0 -filter_complex_threads 0 -i ${baseMp4} -vf ${originalSubtitleFilter} -c:v libx264 -preset veryfast -crf 18 -threads:v 0 -c:a copy ${originalSrtBurned}`;
@@ -6771,7 +6783,11 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
 
                 const title = document.createElement('div');
                 title.className = 'segment-header';
-                title.textContent = 'Translated Video';
+                title.textContent = data.audio_mode === 'original'
+                    ? 'Subtitled Video'
+                    : data.audio_mode === 'both'
+                    ? 'Video with Audio Tracks'
+                    : 'Translated Video';
                 panel.appendChild(title);
 
                 const posterUrl = data.poster_url ? cacheBustUrl(data.poster_url) : `${data.video_url}/snapshot`;
@@ -6790,8 +6806,10 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 panel.appendChild(actions);
             }
 
-            async function renderTranslatedVideoFromAudio({ sourceVideo, audioFileName, subtitleFileName, sessionId, outputBaseName, container, button }) {
-                if (!sourceVideo || !audioFileName) {
+            async function renderTranslatedVideoFromAudio({ sourceVideo, audioFileName, subtitleFileName, audioMode = 'translated', sessionId, outputBaseName, container, button }) {
+                const normalizedAudioMode = ['translated', 'original', 'both'].includes(audioMode) ? audioMode : 'translated';
+                const needsTranslatedAudio = normalizedAudioMode === 'translated' || normalizedAudioMode === 'both';
+                if (!sourceVideo || (needsTranslatedAudio && !audioFileName)) {
                     showStatus('Translated video cannot be rendered because source video metadata is missing.', 'error', 'translateStatus');
                     return;
                 }
@@ -6801,7 +6819,11 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     button.textContent = 'Rendering video...';
                 }
                 showStatus(
-                    subtitleFileName
+                    normalizedAudioMode === 'original'
+                        ? 'Rendering video with the original audio track...'
+                        : normalizedAudioMode === 'both'
+                        ? 'Rendering video with original and translated audio tracks...'
+                        : subtitleFileName
                         ? 'Replacing audio and rendering the selected subtitle track...'
                         : 'Replacing the original video audio track...',
                     'info',
@@ -6809,15 +6831,21 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 );
                 try {
                     const safeBase = deriveBaseFromFilename(outputBaseName || audioFileName || sourceVideo.filename || 'translated_video');
-                    const outputSuffix = subtitleFileName ? '_translated_video_subtitled' : '_translated_video';
+                    const audioSuffix = normalizedAudioMode === 'original'
+                        ? '_original_audio'
+                        : normalizedAudioMode === 'both'
+                        ? '_dual_audio'
+                        : '_translated_video';
+                    const outputSuffix = subtitleFileName ? `${audioSuffix}_subtitled` : audioSuffix;
                     const response = await fetch(ENDPOINTS.VIDEO_REPLACE_AUDIO, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             downloaded_video_id: sourceVideo.id || sourceVideo.filename,
                             session_id: sessionId || null,
-                            audio_file_name: audioFileName,
+                            audio_file_name: needsTranslatedAudio ? audioFileName : null,
                             subtitle_file_name: subtitleFileName || null,
+                            audio_mode: normalizedAudioMode,
                             output_filename: safeBase ? `${safeBase}${outputSuffix}` : '',
                         }),
                     });
@@ -6826,7 +6854,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         throw new Error(data.message || data.error || `Video render failed (${response.status})`);
                     }
                     renderTranslatedVideoPreview(container, data);
-                    showStatus(data.message || 'Translated video created.', 'success', 'translateStatus');
+                    showStatus(data.message || 'Video created.', 'success', 'translateStatus');
                 } catch (error) {
                     showStatus(`Video render failed: ${error.message}`, 'error', 'translateStatus');
                 } finally {
@@ -7092,16 +7120,34 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         downloads.appendChild(renderSubtitleSelect);
                     }
 
+                    const renderAudioModeSelect = document.createElement('select');
+                    renderAudioModeSelect.className = 'select-inline-dark';
+                    renderAudioModeSelect.title = 'Audio track for rendered video';
+                    renderAudioModeSelect.style.minWidth = '170px';
+                    [
+                        ['translated', 'Translated audio'],
+                        ['original', 'Original audio'],
+                        ['both', 'Both audio tracks'],
+                    ].forEach(([value, label]) => {
+                        const option = document.createElement('option');
+                        option.value = value;
+                        option.textContent = label;
+                        renderAudioModeSelect.appendChild(option);
+                    });
+                    downloads.appendChild(renderAudioModeSelect);
+
                     const renderVideoBtn = document.createElement('button');
                     renderVideoBtn.type = 'button';
                     renderVideoBtn.className = 'btn btn-secondary';
                     renderVideoBtn.textContent = 'Render video';
                     renderVideoBtn.addEventListener('click', () => {
                         const selectedSubtitleFileName = renderSubtitleSelect ? renderSubtitleSelect.value : '';
+                        const selectedAudioMode = renderAudioModeSelect ? renderAudioModeSelect.value : 'translated';
                         renderTranslatedVideoFromAudio({
                             sourceVideo,
                             audioFileName: translatedAudioFileName,
                             subtitleFileName: selectedSubtitleFileName,
+                            audioMode: selectedAudioMode,
                             sessionId: metadata.session_id || metadata.reuse_session_id || options.sessionId || '',
                             outputBaseName: metadata.output_base_name || metadata.base_output_name || translatedAudioFileName,
                             container: resultDiv,

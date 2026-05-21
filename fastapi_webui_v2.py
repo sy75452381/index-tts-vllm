@@ -7810,22 +7810,39 @@ def _ffmpeg_escape_filter_quoted_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
-def _ffmpeg_subtitle_force_style(font_name: Optional[str]) -> str:
+def _subtitle_style_for_video(video_path: Optional[str]) -> Tuple[int, float, float, int]:
+    dimensions = _ffprobe_video_dimensions(video_path) if video_path else None
+    if not dimensions:
+        return VIDEO_SUBTITLE_FONT_SIZE, 1.5, 0.7, 36
+    width, height = dimensions
+    short_side = max(1, min(width, height))
+    scale = short_side / 1080.0
+    font_size = int(round(VIDEO_SUBTITLE_FONT_SIZE * scale))
+    font_size = max(12, min(VIDEO_SUBTITLE_FONT_SIZE, font_size))
+    outline = round(max(0.8, min(1.5, 1.5 * scale)), 2)
+    shadow = round(max(0.35, min(0.7, 0.7 * scale)), 2)
+    margin_v = int(round(36 * scale))
+    margin_v = max(14, min(36, margin_v))
+    return font_size, outline, shadow, margin_v
+
+
+def _ffmpeg_subtitle_force_style(font_name: Optional[str], video_path: Optional[str] = None) -> str:
+    font_size, outline, shadow, margin_v = _subtitle_style_for_video(video_path)
     style_parts = [
-        f"FontSize={VIDEO_SUBTITLE_FONT_SIZE}",
+        f"FontSize={font_size}",
         "PrimaryColour=&H00FFFFFF",
         "OutlineColour=&H00000000",
         "BorderStyle=1",
-        "Outline=1.5",
-        "Shadow=0.7",
-        "MarginV=36",
+        f"Outline={outline}",
+        f"Shadow={shadow}",
+        f"MarginV={margin_v}",
     ]
     if font_name:
         style_parts.insert(0, f"FontName={font_name}")
     return ",".join(style_parts)
 
 
-def _ffmpeg_subtitles_filter_arg(subtitle_path: str) -> str:
+def _ffmpeg_subtitles_filter_arg(subtitle_path: str, video_path: Optional[str] = None) -> str:
     font_name, fonts_dir = _resolve_video_subtitle_font()
     options = [f"filename='{_ffmpeg_escape_filter_path(subtitle_path)}'"]
     ext = os.path.splitext(subtitle_path)[1].lstrip(".").lower()
@@ -7833,7 +7850,7 @@ def _ffmpeg_subtitles_filter_arg(subtitle_path: str) -> str:
         options.append("charenc=UTF-8")
     if fonts_dir:
         options.append(f"fontsdir='{_ffmpeg_escape_filter_path(fonts_dir)}'")
-    force_style = _ffmpeg_subtitle_force_style(font_name)
+    force_style = _ffmpeg_subtitle_force_style(font_name, video_path)
     if force_style:
         options.append(f"force_style='{_ffmpeg_escape_filter_quoted_value(force_style)}'")
     return "subtitles=" + ":".join(options)
@@ -8385,6 +8402,36 @@ def _ffprobe_duration_seconds(path: str) -> Optional[float]:
         return None
 
 
+def _ffprobe_video_dimensions(path: str) -> Optional[Tuple[int, int]]:
+    if shutil.which("ffprobe") is None or not os.path.exists(path):
+        return None
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=s=x:p=0",
+        path,
+    ]
+    try:
+        process = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if process.returncode != 0:
+            return None
+        value = (process.stdout or "").strip().splitlines()[0]
+        width_text, height_text = value.split("x", 1)
+        width = int(width_text)
+        height = int(height_text)
+        if width <= 0 or height <= 0:
+            return None
+        return width, height
+    except Exception:
+        return None
+
+
 def _format_video_duration(seconds: Optional[float]) -> str:
     if not seconds or seconds <= 0:
         return ""
@@ -8595,19 +8642,25 @@ def _public_downloaded_video_source(source: Optional[Dict[str, Any]]) -> Optiona
 
 def _replace_video_audio_sync(
     video_path: str,
-    audio_path: str,
+    audio_path: Optional[str],
     output_path: str,
     subtitle_path: Optional[str] = None,
+    audio_mode: str = "translated",
 ) -> None:
     if not _ffmpeg_available():
-        raise RuntimeError("ffmpeg is required to replace the video audio track.")
+        raise RuntimeError("ffmpeg is required to render video outputs.")
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Source video not found: {video_path}")
-    if not os.path.exists(audio_path):
+    normalized_audio_mode = (audio_mode or "translated").strip().lower()
+    if normalized_audio_mode not in {"translated", "original", "both"}:
+        raise ValueError(f"Unsupported video audio mode: {audio_mode}")
+    needs_translated_audio = normalized_audio_mode in {"translated", "both"}
+    if needs_translated_audio and (not audio_path or not os.path.exists(audio_path)):
         raise FileNotFoundError(f"Translated audio not found: {audio_path}")
     if subtitle_path and not os.path.exists(subtitle_path):
         raise FileNotFoundError(f"Subtitle file not found: {subtitle_path}")
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    source_has_audio = _video_has_audio_stream_sync(video_path)
     cmd = [
         "ffmpeg",
         "-y",
@@ -8617,20 +8670,22 @@ def _replace_video_audio_sync(
     ]
     if subtitle_path:
         cmd += _ffmpeg_filter_thread_args()
-    cmd += [
-        "-i",
-        video_path,
-        "-i",
-        audio_path,
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-    ]
+    cmd += ["-i", video_path]
+    if needs_translated_audio:
+        cmd += ["-i", str(audio_path)]
+    cmd += ["-map", "0:v:0"]
+    if normalized_audio_mode == "original":
+        cmd += ["-map", "0:a:0?"]
+    elif normalized_audio_mode == "translated":
+        cmd += ["-map", "1:a:0"]
+    else:
+        if source_has_audio:
+            cmd += ["-map", "0:a:0"]
+        cmd += ["-map", "1:a:0"]
     if subtitle_path:
         cmd += [
             "-vf",
-            _ffmpeg_subtitles_filter_arg(subtitle_path),
+            _ffmpeg_subtitles_filter_arg(subtitle_path, video_path),
             "-c:v",
             "libx264",
             "-preset",
@@ -8643,18 +8698,49 @@ def _replace_video_audio_sync(
         ]
     else:
         cmd += ["-c:v", "copy"]
-    cmd += [
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        *_ffmpeg_thread_args(),
-        "-shortest",
-        "-movflags",
-        "+faststart",
-        output_path,
-    ]
+    if normalized_audio_mode == "original":
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", "192k"]
+        if normalized_audio_mode == "both":
+            if source_has_audio:
+                cmd += [
+                    "-metadata:s:a:0",
+                    "title=Original",
+                    "-metadata:s:a:1",
+                    "title=Translated",
+                    "-disposition:a:0",
+                    "0",
+                    "-disposition:a:1",
+                    "default",
+                ]
+            else:
+                cmd += ["-metadata:s:a:0", "title=Translated", "-disposition:a:0", "default"]
+    cmd += [*_ffmpeg_thread_args(), "-shortest", "-movflags", "+faststart", output_path]
     _run_ffmpeg_command(cmd)
+
+
+def _video_has_audio_stream_sync(video_path: str) -> bool:
+    """Return whether ffprobe can see at least one audio stream in a video."""
+    if shutil.which("ffprobe") is None:
+        return True
+    process = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+            video_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return process.returncode == 0 and bool(process.stdout.strip())
 
 
 def _source_video_metadata_from_session(session: Optional[TranslateSessionData]) -> Optional[Dict[str, Any]]:
@@ -10228,6 +10314,10 @@ class VideoReplaceAudioRequest(BaseModel):
     audio_file_name: Optional[str] = Field(default=None, description="Translated audio filename from /api/translate_outputs.")
     output_filename: Optional[str] = Field(default=None, description="Optional output video base filename.")
     subtitle_file_name: Optional[str] = Field(default=None, description="Optional SRT/VTT filename from /api/translate_outputs to burn into the rendered video.")
+    audio_mode: Optional[Literal["translated", "original", "both"]] = Field(
+        default="translated",
+        description="Rendered MP4 audio: translated track, original source track, or both selectable tracks.",
+    )
 
 
 class SpeakerOverrideInput(BaseModel):
@@ -11358,14 +11448,20 @@ async def api_video_replace_audio(payload: VideoReplaceAudioRequest):
     if not os.path.exists(video_path):
         return _status_error("Downloaded video not found.", status_code=404)
 
+    audio_mode = (payload.audio_mode or "translated").strip().lower()
+    if audio_mode not in {"translated", "original", "both"}:
+        return _status_error("Audio mode must be translated, original, or both.", status_code=400)
+    needs_translated_audio = audio_mode in {"translated", "both"}
     audio_name = os.path.basename((payload.audio_file_name or "").strip())
-    if not audio_name:
-        return _status_error("Translated audio filename is required.")
-    if audio_name != (payload.audio_file_name or "").strip():
-        return _status_error("Invalid translated audio filename.", status_code=400)
-    audio_path = os.path.join(TRANSLATE_OUTPUT_DIR, audio_name)
-    if not os.path.exists(audio_path):
-        return _status_error("Translated audio output not found.", status_code=404)
+    audio_path: Optional[str] = None
+    if needs_translated_audio:
+        if not audio_name:
+            return _status_error("Translated audio filename is required.")
+        if audio_name != (payload.audio_file_name or "").strip():
+            return _status_error("Invalid translated audio filename.", status_code=400)
+        audio_path = os.path.join(TRANSLATE_OUTPUT_DIR, audio_name)
+        if not os.path.exists(audio_path):
+            return _status_error("Translated audio output not found.", status_code=404)
 
     subtitle_path: Optional[str] = None
     subtitle_name = os.path.basename((payload.subtitle_file_name or "").strip())
@@ -11392,7 +11488,14 @@ async def api_video_replace_audio(payload: VideoReplaceAudioRequest):
         output_path = os.path.join(TRANSLATE_OUTPUT_DIR, output_filename)
 
     try:
-        await _run_blocking(_replace_video_audio_sync, video_path, audio_path, output_path, subtitle_path)
+        await _run_blocking(
+            _replace_video_audio_sync,
+            video_path,
+            audio_path,
+            output_path,
+            subtitle_path,
+            audio_mode,
+        )
     except Exception as exc:
         traceback.print_exc()
         return _status_error(f"Failed to create translated video: {str(exc)}", status_code=500)
@@ -11400,12 +11503,13 @@ async def api_video_replace_audio(payload: VideoReplaceAudioRequest):
     return JSONResponse(
         content={
             "status": "ok",
-            "message": "Translated video created.",
+            "message": "Video created.",
             "video_url": f"/api/translate_outputs/{output_filename}",
             "poster_url": f"/api/translate_outputs/{output_filename}/snapshot",
             "file_name": output_filename,
             "source_video": _downloaded_video_entry(video_path),
             "subtitle_file_name": subtitle_name or None,
+            "audio_mode": audio_mode,
         }
     )
 
