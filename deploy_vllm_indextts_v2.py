@@ -35,8 +35,6 @@ image = (
     .env({
         "CUDA_HOME": "/usr/local/cuda",
         "CUDA_PATH": "/usr/local/cuda", 
-        "YTDLP_NODE_PATH": "/usr/bin/node",
-        "YTDLP_JS_RUNTIMES": "node:/usr/bin/node",
         "TORCH_CUDA_ARCH_LIST": "6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0;12.0",
         "FORCE_CUDA": "1",
         "CXX": "g++",
@@ -91,6 +89,11 @@ image = (
         "bgutil-ytdlp-pot-provider",
     )
     .pip_install("numpy<2")
+    .run_commands(
+        "npm install -g n",
+        "n 22",
+        "node --version",
+    )
 )
 
 app = modal.App("vllm-indextts-v2", image=image)
@@ -505,8 +508,6 @@ def legacy_serve_without_snapshot():
         "XDG_CACHE_HOME": "/persistent_cache",
         "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
         "TORCHINDUCTOR_AUTOGRAD_CACHE": "1",
-        "YTDLP_NODE_PATH": "/usr/bin/node",
-        "YTDLP_JS_RUNTIMES": "node:/usr/bin/node",
     }
     
     print("   Setting environment variables:")
@@ -583,6 +584,7 @@ def legacy_serve_without_snapshot():
     
     # 3.2: Setup Python path for vLLM worker processes
     os.environ["PYTHONPATH"] = str(persistent_app_path)
+    os.environ["PYTHONUNBUFFERED"] = "1"
     print(f"   🐍 PYTHONPATH: {os.environ['PYTHONPATH']}")
     
     # 3.3: Setup Qwen3-TTS Voice Design model path (use local pre-downloaded model)
@@ -600,7 +602,7 @@ def legacy_serve_without_snapshot():
     
     # Build the command
     cmd = [
-        "python", "fastapi_webui_v2.py"
+        "python", "-u", "fastapi_webui_v2.py"
     ]
     
     print(f"   Command: {' '.join(cmd)}")
@@ -610,7 +612,9 @@ def legacy_serve_without_snapshot():
     print("="*80 + "\n")
     
     # Start the FastAPI server (this will keep running)
-    subprocess.Popen(" ".join(cmd), shell=True, cwd=str(persistent_app_path))
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    subprocess.Popen(cmd, cwd=str(persistent_app_path), env=env)
 
 
 def _local_url(path: str) -> str:
@@ -688,8 +692,6 @@ def _configure_persistent_runtime():
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512",
         "TORCH_NCCL_ENABLE_MONITORING": "0",
         "TORCH_CPP_LOG_LEVEL": "ERROR",
-        "YTDLP_NODE_PATH": "/usr/bin/node",
-        "YTDLP_JS_RUNTIMES": "node:/usr/bin/node",
     }
 
     print("Configuring persistent cache environment:")
@@ -738,6 +740,7 @@ def _configure_persistent_runtime():
 
     os.chdir(str(persistent_app_path))
     os.environ["PYTHONPATH"] = str(persistent_app_path)
+    os.environ["PYTHONUNBUFFERED"] = "1"
 
     voice_design_model_path = checkpoints_dir / "Qwen3-TTS-12Hz-1.7B-VoiceDesign"
     if voice_design_model_path.exists():
@@ -780,6 +783,7 @@ class IndexTTSVllmServer:
 
         cmd = [
             "python",
+            "-u",
             "fastapi_webui_v2.py",
             "--host",
             "0.0.0.0",
@@ -790,7 +794,9 @@ class IndexTTSVllmServer:
             "--use_torch_compile",
         ]
         print(f"Starting FastAPI server: {' '.join(cmd)}")
-        self.server_proc = subprocess.Popen(cmd, cwd=str(persistent_app_path))
+        env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+        self.server_proc = subprocess.Popen(cmd, cwd=str(persistent_app_path), env=env)
 
         _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
 

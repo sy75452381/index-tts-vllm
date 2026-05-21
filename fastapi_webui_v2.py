@@ -31,6 +31,13 @@ from pathlib import Path
 from typing import Any, List, Dict, Optional, Literal, Tuple, Set, Callable, Awaitable, Union
 import logging
 import multiprocessing
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 PERF_LOGGER = logging.getLogger("perf")
 if not PERF_LOGGER.handlers:
     handler = logging.StreamHandler(sys.stdout)
@@ -3556,7 +3563,7 @@ def _request_has_json_body(request: Request) -> bool:
     return "application/json" in request.headers.get("content-type", "").lower()
 
 
-JSON_STREAM_MIN_CHUNK_BYTES = 2048
+JSON_STREAM_MIN_CHUNK_BYTES = 4096
 
 
 def _json_event_bytes(event: Dict[str, Any]) -> bytes:
@@ -3572,8 +3579,10 @@ def _json_event_bytes(event: Dict[str, Any]) -> bytes:
 
 
 JSON_STREAM_RESPONSE_HEADERS = {
-    "Cache-Control": "no-cache, no-transform",
+    "Cache-Control": "no-store, no-cache, no-transform",
+    "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
+    "X-Content-Type-Options": "nosniff",
 }
 
 
@@ -8028,7 +8037,7 @@ def _yt_dlp_common_opts() -> Dict[str, Any]:
 
     for runtime, executable in runtime_items:
         if runtime and executable:
-            js_runtimes[runtime] = {"executable": executable}
+            js_runtimes[runtime] = {"path": executable}
     if js_runtimes:
         opts["js_runtimes"] = js_runtimes
 
@@ -8370,8 +8379,29 @@ def _safe_video_download_filename(filename: str) -> str:
     return safe_name
 
 
-def _downloaded_video_path(filename: str) -> str:
+DOWNLOADED_VIDEO_ID_PREFIX = "v_"
+
+
+def _encode_downloaded_video_id(filename: str) -> str:
     safe_name = _safe_video_download_filename(filename)
+    encoded = base64.urlsafe_b64encode(safe_name.encode("utf-8")).decode("ascii")
+    return DOWNLOADED_VIDEO_ID_PREFIX + encoded.rstrip("=")
+
+
+def _decode_downloaded_video_id(video_id_or_filename: str) -> str:
+    value = (video_id_or_filename or "").strip()
+    if value.startswith(DOWNLOADED_VIDEO_ID_PREFIX):
+        payload = value[len(DOWNLOADED_VIDEO_ID_PREFIX):]
+        padding = "=" * (-len(payload) % 4)
+        try:
+            return base64.urlsafe_b64decode((payload + padding).encode("ascii")).decode("utf-8")
+        except Exception as exc:
+            raise ValueError("Invalid downloaded video id.") from exc
+    return value
+
+
+def _downloaded_video_path(video_id_or_filename: str) -> str:
+    safe_name = _safe_video_download_filename(_decode_downloaded_video_id(video_id_or_filename))
     path = os.path.abspath(os.path.join(VIDEO_DOWNLOAD_DIR, safe_name))
     root = os.path.abspath(VIDEO_DOWNLOAD_DIR)
     if os.path.commonpath([root, path]) != root:
@@ -8449,10 +8479,11 @@ def _format_size_mb(size_bytes: int) -> float:
 
 def _downloaded_video_entry(path: str) -> Dict[str, Any]:
     safe_name = os.path.basename(path)
+    video_id = _encode_downloaded_video_id(safe_name)
     stat = os.stat(path)
     duration_seconds = _ffprobe_duration_seconds(path)
     return {
-        "id": safe_name,
+        "id": video_id,
         "filename": safe_name,
         "title": os.path.splitext(safe_name)[0],
         "extension": os.path.splitext(safe_name)[1].lstrip(".").lower(),
@@ -8461,8 +8492,8 @@ def _downloaded_video_entry(path: str) -> Dict[str, Any]:
         "mtime": stat.st_mtime,
         "duration_seconds": duration_seconds,
         "duration_label": _format_video_duration(duration_seconds),
-        "url": f"/api/downloaded_videos/{quote(safe_name)}",
-        "poster_url": f"/api/downloaded_videos/{quote(safe_name)}/snapshot",
+        "url": f"/api/downloaded_videos/{video_id}",
+        "poster_url": f"/api/downloaded_videos/{video_id}/snapshot",
     }
 
 
@@ -10995,8 +11026,8 @@ async def api_video_ytdlp_diagnostics(url: Optional[str] = Query(default=None)):
         common_opts_payload["remote_components"] = sorted(common_opts_payload["remote_components"])
 
     js_runtime_opts = (common_opts.get("js_runtimes") or {}) if isinstance(common_opts.get("js_runtimes"), dict) else {}
-    node_path = (js_runtime_opts.get("node") or {}).get("executable") or shutil.which("node")
-    deno_path = (js_runtime_opts.get("deno") or {}).get("executable") or shutil.which("deno")
+    node_path = (js_runtime_opts.get("node") or {}).get("path") or shutil.which("node")
+    deno_path = (js_runtime_opts.get("deno") or {}).get("path") or shutil.which("deno")
     nvm_node_candidates = [str(path) for path in Path("/home").glob("*/.nvm/versions/node/*/bin/node")]
     return JSONResponse(content={
         "status": "ok",
@@ -11168,16 +11199,17 @@ async def api_delete_downloaded_video(filename: str):
     if not os.path.exists(file_path):
         return _status_error("Downloaded video not found.", status_code=404)
     try:
+        safe_name = os.path.basename(file_path)
         file_size = os.path.getsize(file_path)
         os.remove(file_path)
         # Also remove cached extracted audio if any
-        audio_cache = os.path.join(VIDEO_AUDIO_CACHE_DIR, os.path.splitext(filename)[0] + ".mp3")
+        audio_cache = os.path.join(VIDEO_AUDIO_CACHE_DIR, os.path.splitext(safe_name)[0] + ".mp3")
         if os.path.exists(audio_cache):
             os.remove(audio_cache)
         return JSONResponse(content={
             "status": "ok",
-            "message": f"Deleted {filename}.",
-            "filename": filename,
+            "message": f"Deleted {safe_name}.",
+            "filename": safe_name,
             "freed_mb": round(file_size / (1024 * 1024), 2),
         })
     except Exception as exc:
@@ -11194,10 +11226,11 @@ async def api_downloaded_video_file(filename: str):
         return _status_error(str(exc), status_code=400)
     if not os.path.exists(file_path):
         return _status_error("Downloaded video not found.", status_code=404)
+    safe_name = os.path.basename(file_path)
     return FileResponse(
         file_path,
-        media_type=_guess_media_type_from_extension(filename),
-        filename=filename,
+        media_type=_guess_media_type_from_extension(safe_name),
+        filename=safe_name,
         headers={"Cache-Control": "no-store"},
     )
 
