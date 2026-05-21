@@ -6085,7 +6085,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     ffmpegSubtitleOriginalCmd.textContent = `ffmpeg -filter_threads 0 -filter_complex_threads 0 -i ${baseMp4} -vf ${originalSubtitleFilter} -c:v libx264 -preset veryfast -crf 18 -threads:v 0 -c:a copy ${originalSrtBurned}`;
                 }
                 if (ffmpegEmbedSubtitleCmd) {
-                    ffmpegEmbedSubtitleCmd.textContent = `ffmpeg -i ${translatedMp4} -i "${translatedSrtFilename}" -i "${originalSrtFilename}" -map 0:v:0 -map 0:a? -map 1:0 -map 2:0 -c:v copy -c:a copy -c:s mov_text -metadata:s:s:0 title=Translated -metadata:s:s:1 title=Original -movflags +faststart "${normalizedBase}_${languageCode}_subtracks.mp4"`;
+                    ffmpegEmbedSubtitleCmd.textContent = `ffmpeg -i ${translatedMp4} -i "${translatedSrtFilename}" -i "${originalSrtFilename}" -map 0:v:0 -map 0:a? -map 1:0 -map 2:0 -c:v copy -c:a copy -c:s mov_text -metadata:s:s:0 title=Translated -metadata:s:s:0 handler_name=Translated -metadata:s:s:0 language=eng -disposition:s:0 default -metadata:s:s:1 title=Original -metadata:s:s:1 handler_name=Original -metadata:s:s:1 language=und -disposition:s:1 0 -movflags +faststart "${normalizedBase}_${languageCode}_subtracks.mp4"`;
                 }
             }
 

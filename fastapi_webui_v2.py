@@ -8730,11 +8730,16 @@ def _replace_video_audio_sync(
         cmd += ["-c:s", "mov_text"]
         for subtitle_index, (_embedded_path, embedded_label) in enumerate(embedded_subtitles):
             label = embedded_label or f"Subtitle {subtitle_index + 1}"
+            language = "eng" if label.lower() == "translated" else "und"
             cmd += [
                 f"-metadata:s:s:{subtitle_index}",
                 f"title={label}",
+                f"-metadata:s:s:{subtitle_index}",
+                f"handler_name={label}",
+                f"-metadata:s:s:{subtitle_index}",
+                f"language={language}",
                 f"-disposition:s:{subtitle_index}",
-                "0",
+                "default" if subtitle_index == 0 else "0",
             ]
     cmd += [*_ffmpeg_thread_args()]
     if not embedded_subtitles:
