@@ -18,7 +18,7 @@ git clone https://github.com/garyswansrs/index-tts-vllm
 cd index-tts-vllm
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 pip install -r requirements.txt
-pip install v-diffusion alias-free-torch dill einops-exts huggingface_hub importlib-resources nnAudio PyWavelets safetensors scipy soxr torchsde tqdm transformers v-diffusion-pytorch vector-quantize-pytorch
+pip install alias-free-torch dill einops-exts huggingface_hub importlib-resources nnAudio PyWavelets safetensors scipy soxr torchsde tqdm transformers v-diffusion-pytorch vector-quantize-pytorch
 pip install --no-deps --ignore-requires-python "git+https://github.com/Stability-AI/stable-audio-tools.git"
 pip install -U "yt-dlp[default]"
 pip install -U yt-dlp-ejs
