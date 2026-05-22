@@ -133,7 +133,7 @@ WHISPERX_HF_TOKEN = os.getenv(
 )
 WHISPERX_TRANSLATION_LLM = os.getenv(
     "WHISPERX_TRANSLATION_LLM",
-    "lightning-ai/gemma-4-31B-it",
+    "tencent/Hy-MT2-1.8B",
 )
 WHISPERX_TRANSLATION_BATCH_SIZE = int(
     os.getenv("WHISPERX_TRANSLATION_BATCH_SIZE", "30")
@@ -148,13 +148,14 @@ WHISPERX_TRANSLATION_MAX_WORKERS = _env_int(
     max_value=10,
 )
 HY_MT_TRANSLATION_MODEL = (
-    os.getenv("HY_MT_TRANSLATION_MODEL", "tencent/HY-MT1.5-1.8B").strip()
-    or "tencent/HY-MT1.5-1.8B"
+    os.getenv("HY_MT_TRANSLATION_MODEL", "tencent/Hy-MT2-1.8B").strip()
+    or "tencent/Hy-MT2-1.8B"
 )
 HY_MT_TRANSLATION_MODEL_ALIASES = {
     "hy-mt",
-    "hy-mt1.5-1.8b",
-    "tencent/hy-mt1.5-1.8b",
+    "hy-mt2",
+    "hy-mt2-1.8b",
+    "tencent/hy-mt2-1.8b",
 }
 HY_MT_TRANSLATION_FALLBACK_ENABLED = _env_flag(
     "HY_MT_TRANSLATION_FALLBACK_ENABLED",
@@ -168,7 +169,7 @@ HY_MT_TRANSLATION_DEVICE = os.getenv("HY_MT_TRANSLATION_DEVICE", "auto").strip()
 HY_MT_TRANSLATION_DTYPE = os.getenv("HY_MT_TRANSLATION_DTYPE", "auto").strip().lower()
 HY_MT_TRANSLATION_MAX_NEW_TOKENS = _env_int(
     "HY_MT_TRANSLATION_MAX_NEW_TOKENS",
-    2048,
+    4096,
     min_value=1,
     max_value=65536,
 )
@@ -302,10 +303,12 @@ def _load_hy_mt_model() -> Tuple[Any, Any]:
         tokenizer = AutoTokenizer.from_pretrained(
             HY_MT_TRANSLATION_MODEL,
             local_files_only=HY_MT_TRANSLATION_LOCAL_FILES_ONLY,
+            trust_remote_code=True,
         )
 
         model_kwargs: Dict[str, Any] = {
             "local_files_only": HY_MT_TRANSLATION_LOCAL_FILES_ONLY,
+            "trust_remote_code": True,
         }
         dtype = _hy_mt_torch_dtype()
         if dtype is not None:
@@ -362,7 +365,8 @@ def _hy_mt_prompt(
     _ = source_language
     return (
         f"Translate the following text into {dest_language}. "
-        f"Output only the translated text.\n\n{source_text}"
+        "Note that you should only output the translated result without any "
+        f"additional explanation:\n\n{source_text}"
     )
 
 
@@ -457,7 +461,7 @@ def _hy_mt_prompt_texts(
                 tokenizer.apply_chat_template(
                     [{"role": "user", "content": prompt}],
                     tokenize=False,
-                    add_generation_prompt=False,
+                    add_generation_prompt=True,
                 )
             )
     except Exception as exc:

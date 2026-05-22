@@ -117,7 +117,7 @@
             .hero-highlights {
                 flex: 1 1 100%;
                 display: grid;
-                grid-template-columns: repeat(6, 1fr);
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
                 gap: 12px;
                 z-index: 1;
             }
@@ -809,6 +809,11 @@
                 background: rgba(239, 68, 68, 0.15);
                 border: 1px solid rgba(239, 68, 68, 0.4);
                 color: #f87171;
+            }
+            .status.info {
+                background: rgba(34, 211, 238, 0.12);
+                border: 1px solid rgba(34, 211, 238, 0.35);
+                color: var(--brand-cyan);
             }
             .segment-panel {
                 margin-top: 24px;
@@ -1672,6 +1677,18 @@
                             <span class="hero-card-feature">🇨🇳 Chinese/English</span>
                         </div>
                     </div>
+                    <div class="hero-card" data-tab="stable-audio" role="button" tabindex="0">
+                        <div class="hero-card-header">
+                            <span class="icon">♫</span>
+                            <strong>Music / SFX</strong>
+                        </div>
+                        <div class="hero-card-features">
+                            <span class="hero-card-feature highlight">Stable Audio 3</span>
+                            <span class="hero-card-feature">Medium Default</span>
+                            <span class="hero-card-feature">Music</span>
+                            <span class="hero-card-feature">Sound Effects</span>
+                        </div>
+                    </div>
                     <div class="hero-card" data-tab="translate" role="button" tabindex="0">
                         <div class="hero-card-header">
                             <span class="icon">🌐</span>
@@ -1686,7 +1703,7 @@
                     </div>
                     <div class="hero-card" data-tab="video-download" role="button" tabindex="0">
                         <div class="hero-card-header">
-                            <span class="icon">DL</span>
+                            <span class="icon">↓</span>
                             <strong>Video Download</strong>
                         </div>
                         <div class="hero-card-features">
@@ -1843,6 +1860,128 @@
                         
                         <div id="status" class="status"></div>
                         <div id="audioResult"></div>
+                    </div>
+                </div>
+
+                <!-- Stable Audio 3 Tab -->
+                <div id="stable-audio" class="tab-content">
+                    <div class="form-section">
+                        <h3>Stable Audio 3 Music / SFX</h3>
+                        <form id="stableAudioForm" enctype="multipart/form-data">
+                            <div class="form-row-2">
+                                <div class="form-group">
+                                    <label for="stableAudioModel">Model:</label>
+                                    <select id="stableAudioModel" name="variant_key">
+                                        <option value="medium">Medium - general audio</option>
+                                        <option value="small-music">Small Music - music-focused</option>
+                                        <option value="small-sfx">Small SFX - sound effects</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="stableAudioOutputFormat">Output:</label>
+                                    <select id="stableAudioOutputFormat" name="response_format">
+                                        <option value="mp3" selected>MP3</option>
+                                        <option value="wav">WAV</option>
+                                        <option value="flac">FLAC</option>
+                                        <option value="ogg">OGG</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div class="form-group">
+                                <label for="stableAudioPrompt">Prompt:</label>
+                                <textarea id="stableAudioPrompt" name="prompt" rows="4" required placeholder="A dream-like Synthpop instrumental that would accompany a dream-sequence in a surrealist movie 120 BPM"></textarea>
+                            </div>
+
+                            <div class="form-group">
+                                <label for="stableAudioNegativePrompt">Negative Prompt:</label>
+                                <input type="text" id="stableAudioNegativePrompt" name="negative_prompt" placeholder="distorted, low quality, noisy">
+                            </div>
+
+                            <div class="form-row-4">
+                                <div class="form-group">
+                                    <label for="stableAudioDuration">Duration: <span id="stableAudioDurationValue">60</span>s</label>
+                                    <input type="range" id="stableAudioDuration" min="1" max="360" step="1" value="60" class="range-full">
+                                </div>
+                                <div class="form-group">
+                                    <label for="stableAudioSteps">Steps: <span id="stableAudioStepsValue">8</span></label>
+                                    <input type="range" id="stableAudioSteps" min="1" max="50" step="1" value="8" class="range-full">
+                                </div>
+                                <div class="form-group">
+                                    <label for="stableAudioCfg">CFG: <span id="stableAudioCfgValue">1.0</span></label>
+                                    <input type="range" id="stableAudioCfg" min="0" max="8" step="0.1" value="1.0" class="range-full">
+                                </div>
+                                <div class="form-group">
+                                    <label for="stableAudioSeed">Seed:</label>
+                                    <input type="number" id="stableAudioSeed" value="0" min="0" step="1" placeholder="0 = random">
+                                </div>
+                            </div>
+
+                            <details style="margin: 16px 0;">
+                                <summary style="cursor: pointer; color: var(--brand-cyan); font-weight: 600;">Advanced sampling and audio edit controls</summary>
+                                <div style="margin-top: 14px; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: rgba(30, 41, 59, 0.35);">
+                                    <div class="form-row-4">
+                                        <div class="form-group">
+                                            <label for="stableAudioSampler">Sampler:</label>
+                                            <select id="stableAudioSampler">
+                                                <option value="pingpong" selected>pingpong</option>
+                                                <option value="euler">euler</option>
+                                                <option value="rk4">rk4</option>
+                                                <option value="dpmpp">dpmpp</option>
+                                            </select>
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="stableAudioSigmaMax">Sigma Max:</label>
+                                            <input type="number" id="stableAudioSigmaMax" min="0" max="1" step="0.01" value="1.0">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="stableAudioApgScale">APG Scale:</label>
+                                            <input type="number" id="stableAudioApgScale" min="0" max="1" step="0.1" value="1.0">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="stableAudioDurationPadding">Padding (s):</label>
+                                            <input type="number" id="stableAudioDurationPadding" min="0" max="30" step="0.5" value="6.0">
+                                        </div>
+                                    </div>
+                                    <div class="form-row-3">
+                                        <div class="form-group">
+                                            <label for="stableAudioInitAudio">Init Audio:</label>
+                                            <input type="file" id="stableAudioInitAudio" accept=".wav,.mp3,.flac,.ogg,.m4a">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="stableAudioInitNoise">Init Noise:</label>
+                                            <input type="number" id="stableAudioInitNoise" min="0.01" max="1" step="0.01" value="0.9">
+                                        </div>
+                                        <div class="form-group">
+                                            <label style="display: flex; align-items: center; gap: 8px; margin-top: 28px;">
+                                                <input type="checkbox" id="stableAudioCutToDuration" checked>
+                                                Cut to duration
+                                            </label>
+                                        </div>
+                                    </div>
+                                    <div class="form-row-3">
+                                        <div class="form-group">
+                                            <label for="stableAudioInpaintAudio">Inpaint Audio:</label>
+                                            <input type="file" id="stableAudioInpaintAudio" accept=".wav,.mp3,.flac,.ogg,.m4a">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="stableAudioMaskStart">Mask Start (s):</label>
+                                            <input type="number" id="stableAudioMaskStart" min="0" step="0.1" value="0">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="stableAudioMaskEnd">Mask End (s):</label>
+                                            <input type="number" id="stableAudioMaskEnd" min="0" step="0.1" value="0">
+                                        </div>
+                                    </div>
+                                </div>
+                            </details>
+
+                            <button type="button" class="btn" data-action="stable-audio-generate">Generate Audio</button>
+                            <button type="button" class="btn btn-secondary" data-action="stable-audio-refresh">Refresh Status</button>
+                        </form>
+                        <div id="stableAudioStatus" class="status"></div>
+                        <div id="stableAudioModelStatus" style="color: var(--text-muted); font-size: 0.85rem; margin-top: 10px;"></div>
+                        <div id="stableAudioResult"></div>
                     </div>
                 </div>
 
@@ -2155,11 +2294,11 @@
                                             <div class="form-group">
                                                 <label for="translateTranslationLlmModel">Translation Model:</label>
                                                 <select id="translateTranslationLlmModel" name="translation_llm_model">
-                                                    <option value="lightning-ai/gemma-4-31B-it" selected>Gemma 4 31B IT</option>
+                                                    <option value="tencent/Hy-MT2-1.8B" selected>Hy-MT2 1.8B (Local)</option>
+                                                    <option value="lightning-ai/gemma-4-31B-it">Gemma 4 31B IT</option>
                                                     <option value="lightning-ai/gpt-oss-20b">GPT OSS 20B</option>
                                                     <option value="lightning-ai/gpt-oss-120b">GPT OSS 120B</option>
                                                     <option value="lightning-ai/minimax-m2.5">MiniMax M2.5</option>
-                                                    <option value="tencent/HY-MT1.5-1.8B">HY-MT 1.5 1.8B (Local)</option>
                                                 </select>
                                                 <small style="color: var(--text-muted); display: block; margin-top: 4px; font-size: 0.75rem;">
                                                     Used by WhisperX, Qwen3-ASR, and Parakeet local transcription pipelines for batched translation.
@@ -2597,6 +2736,57 @@
                                     <span class="path">/api/design-voice</span>
                                     <span class="desc">Voice design</span>
                                 </div>
+                                <div class="api-quick-ref-item">
+                                    <span class="method post">POST</span>
+                                    <span class="path">/api/stable-audio/generate</span>
+                                    <span class="desc">Music / SFX</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Stable Audio Section -->
+                        <div class="api-section">
+                            <div class="api-section-header">
+                                <span class="icon">SA3</span>
+                                <h4>Stable Audio 3</h4>
+                                <span class="badge cyan">Music / SFX</span>
+                            </div>
+                            <div class="api-section-content">
+                                <div class="api-endpoint">
+                                    <div class="api-endpoint-header">
+                                        <span class="api-method get">GET</span>
+                                        <span class="api-path">/api/stable-audio/models</span>
+                                    </div>
+                                    <div class="api-endpoint-body">
+                                        <p class="api-desc">List Stable Audio 3 variants, checkpoint readiness, and loaded model state.</p>
+                                    </div>
+                                </div>
+                                <div class="api-endpoint">
+                                    <div class="api-endpoint-header">
+                                        <span class="api-method post">POST</span>
+                                        <span class="api-path">/api/stable-audio/generate</span>
+                                    </div>
+                                    <div class="api-endpoint-body">
+                                        <p class="api-desc">Generate music or sound effects. Uses Stable Audio 3 Medium by default.</p>
+                                        <div class="api-params">
+                                            <div class="api-param-group">
+                                                <div class="api-param-group-title">Required</div>
+                                                <div class="api-param"><span class="api-param-name">prompt</span> <span class="api-param-type">string</span> <span class="api-param-desc">- Audio description</span></div>
+                                            </div>
+                                            <div class="api-param-group">
+                                                <div class="api-param-group-title">Optional</div>
+                                                <div class="api-param"><span class="api-param-name">variant_key</span> <span class="api-param-type">string</span> <span class="api-param-desc">- medium, small-music, or small-sfx</span></div>
+                                                <div class="api-param"><span class="api-param-name">duration</span>, <span class="api-param-name">steps</span>, <span class="api-param-name">cfg_scale</span>, <span class="api-param-name">sampler_type</span>, <span class="api-param-name">seed</span> <span class="api-param-desc">- Sampling controls</span></div>
+                                                <div class="api-param"><span class="api-param-name">init_audio_file</span>, <span class="api-param-name">inpaint_audio_file</span> <span class="api-param-type">file</span> <span class="api-param-desc">- Optional audio-to-audio and inpainting inputs</span></div>
+                                            </div>
+                                        </div>
+                                        <div class="api-response">
+                                            <div class="api-response-title">Response</div>
+                                            <div class="api-code">Content-Type: audio/mpeg
+Content-Disposition: attachment; filename=stable_audio_medium.mp3</div>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                         </div>
 
@@ -2735,7 +2925,7 @@ Status: CONTINUE (more chunks) or LAST (final chunk)</div>
                                                 <div class="api-param-group-title">Advanced Options</div>
                                                 <div class="api-param"><span class="api-param-name">prompt</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Custom Gemini instructions</span></div>
                                                 <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini', 'whisperx', 'qwen_omnivad', or 'parakeet'</span></div>
-                                                <div class="api-param"><span class="api-param-name">translation_llm_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Translation model: 'lightning-ai/gemma-4-31B-it' (default), 'lightning-ai/gpt-oss-20b', 'lightning-ai/gpt-oss-120b', 'lightning-ai/minimax-m2.5', or 'tencent/HY-MT1.5-1.8B'</span></div>
+                                                <div class="api-param"><span class="api-param-name">translation_llm_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Translation model: 'tencent/Hy-MT2-1.8B' (default), 'lightning-ai/gemma-4-31B-it', 'lightning-ai/gpt-oss-20b', 'lightning-ai/gpt-oss-120b', or 'lightning-ai/minimax-m2.5'</span></div>
                                                 <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (default true)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_diarization</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable diarization for Qwen OmniVAD (default true)</span></div>
@@ -2769,7 +2959,7 @@ Content-Type: audio/mpeg</div>
                                                 <div class="api-param"><span class="api-param-name">dest_language</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Target language (required)</span></div>
                                                 <div class="api-param"><span class="api-param-name">translate_text</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— true=translate, false=transcribe only</span></div>
                                                 <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini', 'whisperx', 'qwen_omnivad', or 'parakeet'</span></div>
-                                                <div class="api-param"><span class="api-param-name">translation_llm_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Translation model: 'lightning-ai/gemma-4-31B-it' (default), 'lightning-ai/gpt-oss-20b', 'lightning-ai/gpt-oss-120b', 'lightning-ai/minimax-m2.5', or 'tencent/HY-MT1.5-1.8B'</span></div>
+                                                <div class="api-param"><span class="api-param-name">translation_llm_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Translation model: 'tencent/Hy-MT2-1.8B' (default), 'lightning-ai/gemma-4-31B-it', 'lightning-ai/gpt-oss-20b', 'lightning-ai/gpt-oss-120b', or 'lightning-ai/minimax-m2.5'</span></div>
                                                 <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (default true)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_diarization</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable diarization for Qwen OmniVAD (default true)</span></div>
@@ -2879,7 +3069,7 @@ Content-Type: audio/mpeg</div>
                                                 <div class="api-param"><span class="api-param-name">chunk_session_ids</span> <span class="api-param-type">array</span> <span class="api-param-desc">— Array of session IDs to process</span></div>
                                                 <div class="api-param"><span class="api-param-name">dest_language</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Target language</span></div>
                                                 <div class="api-param"><span class="api-param-name">transcription_pipeline</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'gemini', 'whisperx', 'qwen_omnivad', or 'parakeet'</span></div>
-                                                <div class="api-param"><span class="api-param-name">translation_llm_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Translation model: 'lightning-ai/gemma-4-31B-it' (default), 'lightning-ai/gpt-oss-20b', 'lightning-ai/gpt-oss-120b', 'lightning-ai/minimax-m2.5', or 'tencent/HY-MT1.5-1.8B'</span></div>
+                                                <div class="api-param"><span class="api-param-name">translation_llm_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Translation model: 'tencent/Hy-MT2-1.8B' (default), 'lightning-ai/gemma-4-31B-it', 'lightning-ai/gpt-oss-20b', 'lightning-ai/gpt-oss-120b', or 'lightning-ai/minimax-m2.5'</span></div>
                                                 <div class="api-param"><span class="api-param-name">whisperx_proxy_refiner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable WhisperX proxy refiner (default false)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_forced_aligner</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable Qwen ForcedAligner timestamps (inherits session; default true)</span></div>
                                                 <div class="api-param"><span class="api-param-name">qwen_omnivad_enable_diarization</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— Enable diarization for Qwen OmniVAD</span></div>
@@ -3305,6 +3495,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 ESTIMATE_DURATION: '/api/estimate_duration',
                 CLEAR_OUTPUTS: '/api/clear_outputs',
                 PROMPT_TEMPLATES: '/api/prompt_templates',
+                STABLE_AUDIO_STATUS: '/api/stable-audio/status',
+                STABLE_AUDIO_MODELS: '/api/stable-audio/models',
+                STABLE_AUDIO_GENERATE: '/api/stable-audio/generate',
             });
 
             /* ---------- Helpers (HTTP, UI binding) ---------- */
@@ -3335,6 +3528,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     ['emotionWeight', 'emotionWeightValue'],
                     ['diffusionSteps', 'diffusionStepsValue'],
                     ['maxTextTokens', 'maxTextTokensValue'],
+                    ['stableAudioDuration', 'stableAudioDurationValue'],
+                    ['stableAudioSteps', 'stableAudioStepsValue'],
+                    ['stableAudioCfg', 'stableAudioCfgValue'],
                 ];
                 pairs.forEach(([inputId, labelId]) => {
                     const input = document.getElementById(inputId);
@@ -3400,6 +3596,14 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         saveVoiceDesignToPreset();
                         return;
                     }
+                    if (action === 'stable-audio-generate') {
+                        generateStableAudio();
+                        return;
+                    }
+                    if (action === 'stable-audio-refresh') {
+                        loadStableAudioModels(true);
+                        return;
+                    }
                     if (action === 'delete-speaker') {
                         const raw = actionEl.dataset.speakerName;
                         if (raw !== undefined && raw !== '') {
@@ -3409,6 +3613,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                                 deleteSpeaker(raw);
                             }
                         }
+                        return;
                     }
                 });
 
@@ -3458,6 +3663,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 if (tabName === 'video-download') {
                     loadDownloadedVideos();
                     loadCookieSites();
+                }
+                if (tabName === 'stable-audio') {
+                    loadStableAudioModels();
                 }
                 
                 if (content && window.matchMedia('(max-width: 1024px)').matches) {
@@ -3533,6 +3741,164 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
 
             function hideStatus(elementId = 'status') {
                 document.getElementById(elementId).style.display = 'none';
+            }
+
+            let stableAudioModels = [];
+            let stableAudioModelsLoaded = false;
+            let stableAudioDefaultsApplied = false;
+
+            function getStableAudioModel(key) {
+                return stableAudioModels.find((model) => model.key === key) || stableAudioModels[0] || null;
+            }
+
+            function updateStableAudioModelStatus(model) {
+                if (!model) {
+                    return;
+                }
+                const status = model.checkpoint && model.checkpoint.ready ? 'ready' : 'missing checkpoint';
+                const loaded = model.loaded ? ', loaded' : '';
+                const statusEl = document.getElementById('stableAudioModelStatus');
+                if (statusEl) {
+                    statusEl.textContent = `${model.label}: ${status}${loaded}. Checkpoint: ${model.checkpoint ? model.checkpoint.path : ''}`;
+                }
+            }
+
+            function updateStableAudioModelDefaults(resetValues = true) {
+                const select = document.getElementById('stableAudioModel');
+                const duration = document.getElementById('stableAudioDuration');
+                const prompt = document.getElementById('stableAudioPrompt');
+                const maskEnd = document.getElementById('stableAudioMaskEnd');
+                if (!select || !duration || !prompt) {
+                    return;
+                }
+                const model = getStableAudioModel(select.value);
+                if (!model) {
+                    return;
+                }
+                const maxSeconds = model.max_seconds || 360;
+                const defaultDuration = Math.min(model.default_duration || 60, maxSeconds);
+                duration.max = String(maxSeconds);
+                if (resetValues) {
+                    duration.value = String(defaultDuration);
+                } else if (Number(duration.value || 0) > maxSeconds) {
+                    duration.value = String(maxSeconds);
+                }
+                document.getElementById('stableAudioDurationValue').textContent = duration.value;
+                prompt.placeholder = model.placeholder || prompt.placeholder;
+                if (resetValues && !prompt.value.trim()) {
+                    prompt.value = model.placeholder || '';
+                }
+                if (maskEnd) {
+                    maskEnd.max = String(maxSeconds);
+                    if (resetValues) {
+                        maskEnd.value = String(defaultDuration);
+                    } else if (Number(maskEnd.value || 0) > maxSeconds) {
+                        maskEnd.value = String(maxSeconds);
+                    }
+                }
+                updateStableAudioModelStatus(model);
+            }
+
+            async function loadStableAudioModels(force = false, options = {}) {
+                if (stableAudioModelsLoaded && !force) {
+                    return;
+                }
+                const preserveControls = options.preserveControls !== false;
+                try {
+                    const response = await fetch(ENDPOINTS.STABLE_AUDIO_MODELS, { cache: 'no-cache' });
+                    if (!response.ok) {
+                        throw new Error(await parseHttpError(response, 'Failed to load Stable Audio models'));
+                    }
+                    const data = await response.json();
+                    stableAudioModels = Array.isArray(data.models) ? data.models : [];
+                    const select = document.getElementById('stableAudioModel');
+                    if (select && stableAudioModels.length) {
+                        const previousValue = preserveControls ? select.value : '';
+                        const hadOptions = select.options.length > 0;
+                        select.innerHTML = stableAudioModels.map((model) => {
+                            const label = `${model.label}${model.checkpoint && model.checkpoint.ready ? '' : ' (missing)'}`;
+                            return `<option value="${model.key}">${label}</option>`;
+                        }).join('');
+                        const hasPrevious = previousValue && stableAudioModels.some((model) => model.key === previousValue);
+                        select.value = hasPrevious ? previousValue : (data.default_variant || 'medium');
+                        select.onchange = () => updateStableAudioModelDefaults(true);
+                        const shouldApplyDefaults = !stableAudioDefaultsApplied || !preserveControls || !hadOptions || !hasPrevious;
+                        updateStableAudioModelDefaults(shouldApplyDefaults);
+                        stableAudioDefaultsApplied = true;
+                    }
+                    stableAudioModelsLoaded = true;
+                    if (force) {
+                        showStatus('Stable Audio status refreshed.', 'success', 'stableAudioStatus');
+                    }
+                } catch (error) {
+                    showStatus(`Stable Audio status error: ${error.message}`, 'error', 'stableAudioStatus');
+                }
+            }
+
+            async function generateStableAudio() {
+                await loadStableAudioModels();
+                const promptEl = document.getElementById('stableAudioPrompt');
+                const prompt = promptEl ? promptEl.value.trim() : '';
+                if (!prompt) {
+                    showStatus('Enter a music or sound effect prompt first.', 'error', 'stableAudioStatus');
+                    return;
+                }
+
+                const startTime = performance.now();
+                const outputFormat = document.getElementById('stableAudioOutputFormat').value || 'mp3';
+                const formData = new FormData();
+                formData.append('variant_key', document.getElementById('stableAudioModel').value || 'medium');
+                formData.append('prompt', prompt);
+                formData.append('negative_prompt', document.getElementById('stableAudioNegativePrompt').value || '');
+                formData.append('duration', document.getElementById('stableAudioDuration').value || '60');
+                formData.append('steps', document.getElementById('stableAudioSteps').value || '8');
+                formData.append('cfg_scale', document.getElementById('stableAudioCfg').value || '1.0');
+                formData.append('sampler_type', document.getElementById('stableAudioSampler').value || 'pingpong');
+                formData.append('seed', document.getElementById('stableAudioSeed').value || '0');
+                formData.append('sigma_max', document.getElementById('stableAudioSigmaMax').value || '1.0');
+                formData.append('apg_scale', document.getElementById('stableAudioApgScale').value || '1.0');
+                formData.append('duration_padding_sec', document.getElementById('stableAudioDurationPadding').value || '6.0');
+                formData.append('cut_to_seconds_total', document.getElementById('stableAudioCutToDuration').checked ? 'true' : 'false');
+                formData.append('init_noise_level', document.getElementById('stableAudioInitNoise').value || '0.9');
+                formData.append('mask_start_sec', document.getElementById('stableAudioMaskStart').value || '0');
+                formData.append('mask_end_sec', document.getElementById('stableAudioMaskEnd').value || '0');
+                formData.append('response_format', outputFormat);
+
+                const initFile = document.getElementById('stableAudioInitAudio').files[0];
+                const inpaintFile = document.getElementById('stableAudioInpaintAudio').files[0];
+                if (initFile) {
+                    formData.append('init_audio_file', initFile);
+                }
+                if (inpaintFile) {
+                    formData.append('inpaint_audio_file', inpaintFile);
+                }
+
+                showStatus('Generating Stable Audio 3 output...', 'info', 'stableAudioStatus');
+                document.getElementById('stableAudioResult').innerHTML = '';
+                try {
+                    const response = await fetch(ENDPOINTS.STABLE_AUDIO_GENERATE, {
+                        method: 'POST',
+                        body: formData,
+                    });
+                    if (!response.ok) {
+                        throw new Error(await parseHttpError(response, 'Stable Audio generation failed'));
+                    }
+                    const blob = await response.blob();
+                    const audioUrl = URL.createObjectURL(blob);
+                    const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+                    const extension = outputFormat === 'mp3' ? 'mp3' : outputFormat;
+                    document.getElementById('stableAudioResult').innerHTML = `
+                        <h3>Generated Audio (${elapsed}s)</h3>
+                        <audio controls autoplay preload="none" style="width: 100%; margin: 10px 0;" src="${audioUrl}"></audio>
+                        <br>
+                        <a href="${audioUrl}" download="stable-audio-3.${extension}" class="btn">Download</a>
+                    `;
+                    showStatus(`Stable Audio generated in ${elapsed}s.`, 'success', 'stableAudioStatus');
+                    stableAudioModelsLoaded = false;
+                    loadStableAudioModels(true, { preserveControls: true });
+                } catch (error) {
+                    showStatus(`Stable Audio error: ${error.message}`, 'error', 'stableAudioStatus');
+                }
             }
 
             function getSelectedDownloadedVideoId() {
@@ -3998,6 +4364,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     const response = await fetch(ENDPOINTS.AUDIO_ROLES);
                     const data = await response.json();
                     const select = document.getElementById('speaker');
+                    const previousSpeaker = select ? select.value : '';
                     
                     // Clear existing options except first
                     select.innerHTML = '<option value="">Select a speaker...</option>';
@@ -4014,6 +4381,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             option.textContent = speaker;
                             select.appendChild(option);
                         });
+                        if (previousSpeaker && roles.includes(previousSpeaker)) {
+                            select.value = previousSpeaker;
+                        }
                         renderSpeakerAssignments();
                     }
                 } catch (error) {
@@ -4342,7 +4712,6 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     
                     if (result.success) {
                         showStatus(`Speaker "${speakerName}" added successfully!`, 'success', 'speakerStatus');
-                        this.reset();
                         loadSpeakerList();
                         loadSpeakers(); // Refresh dropdown
                     } else {
@@ -4957,7 +5326,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 if (pipelineValue === 'whisperx') {
                     items.push({
                         label: 'Model',
-                        value: selectedOptionLabel(translateTranslationLlmModel, 'Gemma 4'),
+                        value: selectedOptionLabel(translateTranslationLlmModel, 'Hy-MT2'),
                     });
                     items.push({
                         label: 'Refiner',
@@ -4969,7 +5338,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 } else if (pipelineValue === 'qwen_omnivad') {
                     items.push({
                         label: 'Model',
-                        value: selectedOptionLabel(translateTranslationLlmModel, 'Gemma 4'),
+                        value: selectedOptionLabel(translateTranslationLlmModel, 'Hy-MT2'),
                     });
                     items.push({
                         label: 'Diarization',
@@ -4998,7 +5367,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     });
                     items.push({
                         label: 'Translate',
-                        value: selectedOptionLabel(translateTranslationLlmModel, 'Gemma 4'),
+                        value: selectedOptionLabel(translateTranslationLlmModel, 'Hy-MT2'),
                     });
                 } else {
                     items.push({
@@ -10415,6 +10784,13 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             return;
                         }
                         streamingSettings.style.display = this.checked ? 'block' : 'none';
+                    });
+                }
+                const stableAudioForm = document.getElementById('stableAudioForm');
+                if (stableAudioForm) {
+                    stableAudioForm.addEventListener('submit', function (event) {
+                        event.preventDefault();
+                        generateStableAudio();
                     });
                 }
                 const loadInitialData = function () {

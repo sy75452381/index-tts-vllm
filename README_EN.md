@@ -16,7 +16,10 @@ pip install "nemo_toolkit[asr]"
 pip install json-repair
 git clone https://github.com/garyswansrs/index-tts-vllm
 cd index-tts-vllm
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 pip install -r requirements.txt
+pip install v-diffusion alias-free-torch dill einops-exts huggingface_hub importlib-resources nnAudio PyWavelets safetensors scipy soxr torchsde tqdm transformers v-diffusion-pytorch vector-quantize-pytorch
+pip install --no-deps --ignore-requires-python "git+https://github.com/Stability-AI/stable-audio-tools.git"
 pip install -U "yt-dlp[default]"
 pip install -U yt-dlp-ejs
 pip install -U bgutil-ytdlp-pot-provider
@@ -55,28 +58,33 @@ By leveraging vLLM's PagedAttention and continuous batching, this implementation
 ---
 
 ## Web UI Modules
-The modern Web UI [index_new.html](file:///d:/repo/index_tts_2/index-tts-vllm/index_new.html) is built around 6 key functional modules:
+The modern Web UI [index_new.html](file:///d:/repo/index_tts_2/index-tts-vllm/index_new.html) is built around 7 key functional modules:
 
 1. **🎵 Speech Synthesis (Voice Studio)**
    - Generate speech using registered speaker presets.
    - Adjust emotion text prompts (e.g., "excited", "whispering") and intensity weights (0.0 to 1.0).
    - Control diffusion quality steps and text splitting thresholds (`max_text_tokens_per_sentence`).
    - Listen to real-time audio playback or stream chunks instantly for low-latency feedback.
-2. **🌐 Translate & Edit**
+2. **Stable Audio 3 Music / SFX**
+   - Generate instrumental music, ambience, and sound effects from text prompts.
+   - Uses `stable-audio-3-medium` as the default model on high-VRAM RTX Pro 6000 Blackwell servers.
+   - Supports optional negative prompts, sampler controls, seed control, init audio, and inpainting inputs.
+   - Loads from `checkpoints/stable-audio-3/*` at runtime, so an HF token is not needed once checkpoints are downloaded.
+3. **🌐 Translate & Edit**
    - Translate speech audio or video into another language while preserving timing and speaker diarization.
    - **Interactive Segment Editor**: Inspect, tweak timings/transcriptions, assign different speaker presets to specific segments, and regenerate modified segments selectively.
    - Export generated subtitles as standard SRT files.
-3. **DL Video Download & replacement**
+4. **DL Video Download & replacement**
    - Download source videos from YouTube or other sites using `yt-dlp`.
    - Extract audio for translation and burn the translated audio/subtitles back into the original video with a single click.
-4. **🎭 Speaker Presets Library**
+5. **🎭 Speaker Presets Library**
    - Register new reference voices by uploading reference audio files.
    - **Smart Silence Trimming**: Automatically splits and trims long references at silence points to a 3-15 second sweet spot for optimal voice cloning.
    - **ClearVoice Enhancement**: Clean reference audio via speech enhancement (MossFormerGAN_SE_16K, FRCRN_SE_16K, MossFormer2_SE_48K) and 48kHz super-resolution.
-5. **🎨 Qwen3-TTS Voice Design**
+6. **🎨 Qwen3-TTS Voice Design**
    - Describe a voice in natural language (e.g., "A warm, deep male voice speaking calmly with a British accent").
    - Test-synthesize text and save the designed voice directly to the Preset Library.
-6. **📚 API Integration Docs**
+7. **📚 API Integration Docs**
    - Interactive, styled REST API documentation integrated right into the interface.
 
 ---
@@ -118,10 +126,18 @@ conda activate indextts
 ### 3. Python Dependencies
 Install the core requirements and specialized libraries for advanced features:
 ```bash
+# CUDA 13.0 / RTX Pro 6000 Blackwell torch stack
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+
 pip install -r requirements.txt
 
 # For optimized GPU inference
 pip install flashinfer-python flash-attn --no-build-isolation
+
+# For Stable Audio 3. Keep --no-deps so it does not downgrade torch/torchaudio.
+# The current GitHub source is required for SA3 configs that use local_add_cond_dim.
+pip install -U --force-reinstall --no-deps --ignore-requires-python "git+https://github.com/Stability-AI/stable-audio-tools.git"
+pip install alias-free-torch dill einops-exts huggingface_hub importlib-resources nnAudio PyWavelets safetensors scipy soxr torchsde tqdm transformers v-diffusion-pytorch vector-quantize-pytorch
 
 # For advanced audio features
 pip install audio-separator[gpu] clearvoice google-genai whisperx pydub
@@ -138,10 +154,18 @@ pip install -U "nemo_toolkit[asr]"
 > Do not install `qwen-asr` into the same environment as `qwen-tts` for now: current releases pin incompatible exact `transformers` versions (`qwen-tts` pins `4.57.3`, while `qwen-asr` pins `4.57.6`). Also do not install `qwen-asr[vllm]` into this environment; this project pins `vllm==0.10.2` for IndexTTS2.
 
 ### 4. Model Weights
-Download the pre-converted IndexTTS2 vLLM weights:
+Download the pre-converted IndexTTS2 vLLM weights and Stable Audio 3 checkpoints:
 ```bash
 huggingface-cli download garyswansrs/index_tts_2_vllm --local-dir checkpoints
+
+# Stable Audio 3 repos are gated. Accept the model terms on Hugging Face first,
+# then run `hf auth login` or `huggingface-cli login` before downloading.
+huggingface-cli download stabilityai/stable-audio-3-medium --local-dir checkpoints/stable-audio-3/medium
+huggingface-cli download stabilityai/stable-audio-3-small-music --local-dir checkpoints/stable-audio-3/small-music
+huggingface-cli download stabilityai/stable-audio-3-small-sfx --local-dir checkpoints/stable-audio-3/small-sfx
 ```
+
+The server loads Stable Audio 3 from these local folders first. Once the model files are present, runtime inference does not need `HF_TOKEN`.
 
 ---
 
@@ -209,6 +233,28 @@ OpenAI-compatible text-to-speech API.
   - `response_format` (string, optional): Output format (default: `mp3`).
   - `speed` (float, optional): Speed factor (default: `1.0`).
 - **Response**: Binary audio stream.
+
+---
+
+### Stable Audio 3 Music / SFX
+
+#### 1. GET `/api/stable-audio/models`
+List Stable Audio 3 variants, checkpoint readiness, and loaded model state.
+
+#### 2. POST `/api/stable-audio/generate`
+Generate music, ambience, or sound effects from a prompt. Defaults to `stable-audio-3-medium`.
+- **Request Body (`multipart/form-data` or JSON)**:
+  - `prompt` (string, required): Audio description.
+  - `variant_key` (string, optional): `medium`, `small-music`, or `small-sfx`.
+  - `negative_prompt` (string, optional): Concepts to avoid.
+  - `duration` (int, optional): Target length in seconds.
+  - `steps`, `cfg_scale`, `sampler_type`, `seed` (optional): Sampling controls.
+  - `init_audio_file`, `inpaint_audio_file` (files, optional): Audio-to-audio and inpainting inputs.
+  - `response_format` (string, optional): `mp3`, `wav`, `flac`, `ogg`, `opus`, `aac`, or `webm`.
+- **Response**: Binary audio data in the requested format.
+
+#### 3. POST `/api/stable-audio/unload`
+Unload Stable Audio 3 models from GPU memory. Pass `variant_key` to unload one model, or omit it to unload all.
 
 ---
 

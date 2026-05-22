@@ -10,7 +10,7 @@ import urllib.request
 import uuid
 from typing import List, Dict, Optional
 
-# Use CUDA 12.8.1 as requested
+# Use CUDA 13.0 for RTX Pro 6000 Blackwell.
 cuda_version = "13.0.0"
 flavor = "devel" 
 operating_sys = "ubuntu24.04"
@@ -75,6 +75,17 @@ image = (
     .run_commands(
         "cd /app/index-tts-vllm && pip install -r requirements.txt"
     )
+    .run_commands(
+        # The PyPI stable-audio-tools wheel is too old for Stable Audio 3
+        # configs and also pins older torch builds. Use current source and
+        # keep dependencies explicit so CUDA 13 torch stays installed.
+        "pip install -U --force-reinstall --no-deps --ignore-requires-python "
+        "git+https://github.com/Stability-AI/stable-audio-tools.git",
+        "pip install v-diffusion alias-free-torch dill einops-exts huggingface_hub "
+        "importlib-resources nnAudio PyWavelets safetensors scipy soxr "
+        "torchsde tqdm transformers v-diffusion-pytorch "
+        "vector-quantize-pytorch",
+    )
     .pip_install(
         "pydub",
         "flashinfer-python"
@@ -110,6 +121,8 @@ SNAPSHOT_STARTUP_TIMEOUT = 1800
 SNAPSHOT_REQUEST_TIMEOUT = 900
 INTERNAL_TOKEN_ENV = "INDEXTTS_INTERNAL_TOKEN"
 
+STABLE_AUDIO3_VARIANTS = ("medium", "small-music", "small-sfx")
+
 @app.function(
     image=image,
     timeout=3600,
@@ -125,8 +138,8 @@ def prepare_model():
     CPU function to:
     1. Copy the entire /app/index-tts-vllm to persistent storage
     2. Update the application with latest code from git (git pull origin)
-    3. Download the IndexTTS v2 model into the persistent checkpoints folder
-       (includes Qwen3-TTS Voice Design model)
+    3. Download the main model repo into the persistent checkpoints folder
+       (includes IndexTTS v2, Qwen3-TTS Voice Design, and Stable Audio 3)
     
     This is a one-time setup that creates a fully self-contained persistent app.
     """
@@ -225,7 +238,7 @@ def prepare_model():
         print("   Continuing with existing code...")
         repo_update_status["message"] = f"Git update exception: {str(e)}"
     
-    # Step 3: Download model directly into persistent checkpoints folder
+    # Step 3: Download model repo directly into persistent checkpoints folder
     checkpoints_dir = persistent_app_path / "checkpoints"
     checkpoints_dir.mkdir(exist_ok=True)
     
@@ -239,7 +252,7 @@ def prepare_model():
 from huggingface_hub import snapshot_download
 import os
 
-print("Downloading IndexTTS v2 model...")
+print("Downloading main IndexTTS v2 / Stable Audio 3 model repo...")
 snapshot_download(
     repo_id="garyswansrs/index_tts_2_vllm",
     local_dir="{checkpoints_dir}",
@@ -249,10 +262,15 @@ print("Model download completed!")
 """
         ], check=True, capture_output=True, text=True, cwd=str(persistent_app_path))
         
-        print("✅ IndexTTS model download completed successfully!")
+        print("✅ Main model repo download completed successfully!")
         
-        # Step 3b: Voice Design model is now included in the checkpoints directory
+        # Step 3b: Voice Design and Stable Audio 3 models are included in checkpoints
         voice_design_dir = checkpoints_dir / "Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+        stable_audio_root = checkpoints_dir / "stable-audio-3"
+        stable_audio_dirs = {
+            key: stable_audio_root / key
+            for key in STABLE_AUDIO3_VARIANTS
+        }
         
         # Step 4: List downloaded files for verification
         print("🔍 Listing downloaded model files...")
@@ -271,6 +289,13 @@ print("Model download completed!")
         else:
             print(f"   ⚠️ vLLM directory not found: {vllm_dir}")
         
+        print("   Stable Audio 3 checkpoint directories:")
+        for key, path in stable_audio_dirs.items():
+            config_path = path / "model_config.json"
+            ckpt_ready = (path / "model.safetensors").exists() or (path / "model.ckpt").exists()
+            status = "ready" if config_path.exists() and ckpt_ready else "missing"
+            print(f"      {key}: {path} ({status})")
+
         # Step 5: List complete application structure for verification
         print("\n📋 Persistent application structure:")
         def show_tree(path, prefix="", max_depth=3, current_depth=0):
@@ -295,12 +320,19 @@ print("Model download completed!")
         
         return {
             "status": "success",
-            "message": "IndexTTS v2 application and models prepared successfully",
+            "message": "IndexTTS v2 application, Stable Audio 3, and models prepared successfully",
             "app_dir": str(persistent_app_path),
             "model_dir": str(checkpoints_dir),
             "voice_design_dir": str(voice_design_dir),
+            "stable_audio3_root": str(stable_audio_root),
+            "stable_audio3_dirs": {key: str(path) for key, path in stable_audio_dirs.items()},
             "vllm_ready": vllm_dir.exists(),
             "voice_design_ready": voice_design_dir.exists(),
+            "stable_audio3_ready": {
+                key: (path / "model_config.json").exists()
+                and ((path / "model.safetensors").exists() or (path / "model.ckpt").exists())
+                for key, path in stable_audio_dirs.items()
+            },
             "repo_update": repo_update_status
         }
         
@@ -596,6 +628,16 @@ def legacy_serve_without_snapshot():
         print(f"   ⚠️ Voice Design model not found at {voice_design_model_path}, will use HuggingFace download")
     
     # ========================================================================
+    stable_audio_root = checkpoints_dir / "stable-audio-3"
+    print(f"   Stable Audio 3 root: {stable_audio_root}")
+    for key in STABLE_AUDIO3_VARIANTS:
+        path = stable_audio_root / key
+        ready = (
+            (path / "model_config.json").exists()
+            and ((path / "model.safetensors").exists() or (path / "model.ckpt").exists())
+        )
+        print(f"      {key}: {'ready' if ready else 'missing'} ({path})")
+
     # STEP 4: Start FastAPI Server
     # ========================================================================
     print("\n🚀 Starting FastAPI server...")
@@ -745,6 +787,17 @@ def _configure_persistent_runtime():
     voice_design_model_path = checkpoints_dir / "Qwen3-TTS-12Hz-1.7B-VoiceDesign"
     if voice_design_model_path.exists():
         os.environ["QWEN3_VOICE_DESIGN_MODEL"] = str(voice_design_model_path)
+
+    stable_audio_root = checkpoints_dir / "stable-audio-3"
+    stable_audio_ready = {}
+    for key in STABLE_AUDIO3_VARIANTS:
+        path = stable_audio_root / key
+        stable_audio_ready[key] = (
+            (path / "model_config.json").exists()
+            and ((path / "model.safetensors").exists() or (path / "model.ckpt").exists())
+        )
+    print(f"Stable Audio 3 root: {stable_audio_root}")
+    print(f"Stable Audio 3 readiness: {stable_audio_ready}")
 
     if not os.environ.get(INTERNAL_TOKEN_ENV):
         os.environ[INTERNAL_TOKEN_ENV] = uuid.uuid4().hex

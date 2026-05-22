@@ -57,6 +57,7 @@ import subprocess
 import urllib.request
 import hashlib
 import zipfile
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import copy
 from dataclasses import dataclass, field
@@ -140,6 +141,13 @@ _load_project_env_files()
 from indextts.infer_vllm_v2 import IndexTTS2
 from speaker_preset_manager import SpeakerPresetManager, initialize_preset_manager
 from qwen3_tts_manager import Qwen3VoiceDesignManager, Qwen3TTSConfig, DesignedVoiceResult
+from stable_audio3_manager import (
+    STABLE_AUDIO3_DEFAULT_VARIANT,
+    STABLE_AUDIO3_OUTPUT_FORMATS,
+    STABLE_AUDIO3_SAMPLERS,
+    StableAudio3GenerateOptions,
+    StableAudio3Manager,
+)
 
 # WhisperX local transcription pipeline (optional)
 try:
@@ -621,13 +629,13 @@ def _normalize_gemini_model_name(gemini_model_value: Optional[str]) -> str:
 
 
 ALLOWED_TRANSLATION_LLM_MODELS: Tuple[str, ...] = (
+    "tencent/Hy-MT2-1.8B",
     "lightning-ai/gemma-4-31B-it",
     "lightning-ai/gpt-oss-20b",
     "lightning-ai/gpt-oss-120b",
     "lightning-ai/minimax-m2.5",
-    "tencent/HY-MT1.5-1.8B",
 )
-DEFAULT_TRANSLATION_LLM_MODEL = "lightning-ai/gemma-4-31B-it"
+DEFAULT_TRANSLATION_LLM_MODEL = "tencent/Hy-MT2-1.8B"
 
 
 def _normalize_translation_llm_model(model_value: Optional[str]) -> str:
@@ -3516,6 +3524,11 @@ AUDIO_SEPARATOR_CACHE_DIR = str((ROOT_OUTPUT_DIR / "audio_separator_cache").reso
 os.makedirs(AUDIO_SEPARATOR_CACHE_DIR, exist_ok=True)
 AUDIO_SEPARATOR_MODEL_DIR = str((Path(current_dir) / "checkpoints").resolve())
 os.makedirs(AUDIO_SEPARATOR_MODEL_DIR, exist_ok=True)
+_APP_MODEL_DIR = Path(SETTINGS.model_dir)
+if not _APP_MODEL_DIR.is_absolute():
+    _APP_MODEL_DIR = APP_DIR / _APP_MODEL_DIR
+STABLE_AUDIO3_CHECKPOINT_DIR = str((_APP_MODEL_DIR / "stable-audio-3").resolve())
+stable_audio3_manager = StableAudio3Manager(STABLE_AUDIO3_CHECKPOINT_DIR)
 GEMINI_CACHE_DIR = str((ROOT_OUTPUT_DIR / "gemini_cache").resolve())
 os.makedirs(GEMINI_CACHE_DIR, exist_ok=True)
 SPLIT_AUDIO_CACHE_DIR = str((ROOT_OUTPUT_DIR / "split_audio_cache").resolve())
@@ -4497,7 +4510,7 @@ async def _normalize_uploaded_audio(source_path: str) -> str:
     return normalized_path
 
 
-INVALID_FILENAME_CHARS = set('<>:"/\\|?*')
+MAX_SAFE_BASE_FILENAME_LENGTH = 180
 LANGUAGE_CODE_OVERRIDES = {
     "chinese": "chn",
     "zh": "chn",
@@ -4526,16 +4539,35 @@ def _sanitize_base_filename(raw_name: Optional[str]) -> Optional[str]:
     base_name = os.path.splitext(os.path.basename(str(raw_name)))[0].strip().strip(".")
     if not base_name:
         return None
-    sanitized_chars: List[str] = []
-    for ch in base_name:
-        if ch in INVALID_FILENAME_CHARS or ord(ch) < 32:
-            sanitized_chars.append("_")
-        else:
-            sanitized_chars.append(ch)
-    sanitized = "".join(sanitized_chars).strip()
-    sanitized = re.sub(r"\s+", " ", sanitized)
+    readable_replacements = str.maketrans(
+        {
+            "\u2010": "-",
+            "\u2011": "-",
+            "\u2012": "-",
+            "\u2013": "-",
+            "\u2014": "-",
+            "\u2015": "-",
+            "\u2212": "-",
+            "\uff0d": "-",
+            "\u3000": " ",
+            "&": " and ",
+            "\uff06": " and ",
+            "\u2018": "'",
+            "\u2019": "'",
+            "\u201c": '"',
+            "\u201d": '"',
+        }
+    )
+    normalized = unicodedata.normalize("NFKD", base_name.translate(readable_replacements))
+    ascii_name = normalized.encode("ascii", "ignore").decode("ascii")
+    sanitized = re.sub(r"[^0-9A-Za-z._-]+", "_", ascii_name)
     sanitized = re.sub(r"_+", "_", sanitized)
-    sanitized = sanitized.strip(" _")
+    sanitized = sanitized.strip(" ._-")
+    if len(sanitized) > MAX_SAFE_BASE_FILENAME_LENGTH:
+        tail_length = 40
+        head_length = MAX_SAFE_BASE_FILENAME_LENGTH - tail_length - 1
+        sanitized = f"{sanitized[:head_length].rstrip('._-')}_{sanitized[-tail_length:].lstrip('._-')}"
+        sanitized = sanitized.strip(" ._-")
     return sanitized or None
 
 
@@ -4599,7 +4631,9 @@ def _determine_output_base_name(
         if normalized:
             return normalized
     if reuse_session and reuse_session.source_base_name:
-        return reuse_session.source_base_name
+        normalized = _sanitize_base_filename(reuse_session.source_base_name)
+        if normalized:
+            return normalized
     return _normalize_base_filename(None)
 
 
@@ -10294,9 +10328,10 @@ class TranslateRequest(BaseModel):
         default=None,
         description=(
             "Translation model for local transcription pipelines: "
-            "lightning-ai/gemma-4-31B-it, lightning-ai/gpt-oss-20b, "
+            "tencent/Hy-MT2-1.8B, lightning-ai/gemma-4-31B-it, "
+            "lightning-ai/gpt-oss-20b, "
             "lightning-ai/gpt-oss-120b, lightning-ai/minimax-m2.5, "
-            "or tencent/HY-MT1.5-1.8B."
+            "or another allowed local/API model."
         ),
     )
     force_gemini_regenerate: Optional[bool] = Field(
@@ -10936,6 +10971,161 @@ async def api_prompt_templates():
         "transcription": TRANSCRIPTION_PROMPT_TEMPLATE,
         "ignore_non_speech_instruction": IGNORE_NON_SPEECH_PROMPT_SUFFIX,
     }
+
+
+def _normalize_stable_audio_output_format(value: Any) -> str:
+    audio_format = str(value or "mp3").strip().lower()
+    return audio_format if audio_format in STABLE_AUDIO3_OUTPUT_FORMATS else "mp3"
+
+
+async def _save_stable_audio_upload(upload: Any, prefix: str) -> Optional[str]:
+    if upload is None or not hasattr(upload, "read"):
+        return None
+    filename = getattr(upload, "filename", "") or ""
+    suffix = Path(filename).suffix or ".wav"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, prefix=prefix) as tmp:
+        tmp_path = tmp.name
+    try:
+        data = await upload.read()
+        await async_write_file(tmp_path, data)
+        return tmp_path
+    finally:
+        close_fn = getattr(upload, "close", None)
+        if close_fn is not None:
+            result = close_fn()
+            if asyncio.iscoroutine(result):
+                await result
+
+
+async def _parse_stable_audio_generate_request(
+    request: Request,
+) -> Tuple[StableAudio3GenerateOptions, str, List[str]]:
+    content_type = (request.headers.get("content-type") or "").lower()
+    temp_paths: List[str] = []
+    payload: Dict[str, Any] = {}
+    init_upload = None
+    inpaint_upload = None
+
+    if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+        form = await request.form()
+        for key, value in form.multi_items():
+            if hasattr(value, "read"):
+                continue
+            payload[key] = value
+        init_upload = form.get("init_audio_file") or form.get("init_audio")
+        inpaint_upload = form.get("inpaint_audio_file") or form.get("inpaint_audio")
+    else:
+        try:
+            raw_payload = await request.json()
+        except Exception:
+            raw_payload = {}
+        if isinstance(raw_payload, dict):
+            payload = raw_payload
+
+    init_audio_path = await _save_stable_audio_upload(init_upload, "stable_audio_init_")
+    if init_audio_path:
+        temp_paths.append(init_audio_path)
+    inpaint_audio_path = await _save_stable_audio_upload(inpaint_upload, "stable_audio_inpaint_")
+    if inpaint_audio_path:
+        temp_paths.append(inpaint_audio_path)
+
+    variant_key = stable_audio3_manager.normalize_variant_key(payload.get("variant_key") or payload.get("model"))
+    variant_info = next(
+        (model for model in stable_audio3_manager.list_models() if model.get("key") == variant_key),
+        None,
+    )
+    default_duration = int((variant_info or {}).get("default_duration") or 60)
+    output_format = _normalize_stable_audio_output_format(payload.get("response_format") or payload.get("output_format"))
+
+    options = StableAudio3GenerateOptions(
+        variant_key=variant_key,
+        prompt=str(payload.get("prompt") or ""),
+        negative_prompt=str(payload.get("negative_prompt") or ""),
+        duration=_coerce_positive_int(payload.get("duration"), default_duration, min_value=1, max_value=3600),
+        steps=_coerce_positive_int(payload.get("steps"), 8, min_value=1, max_value=500),
+        cfg_scale=_coerce_positive_float(payload.get("cfg_scale"), 1.0, min_value=0.0, max_value=25.0),
+        sampler_type=stable_audio3_manager.normalize_sampler(payload.get("sampler_type")),
+        seed=_coerce_positive_int(payload.get("seed"), 0, min_value=0),
+        sigma_max=_coerce_positive_float(payload.get("sigma_max"), 1.0, min_value=0.0, max_value=1.0),
+        apg_scale=_coerce_positive_float(payload.get("apg_scale"), 1.0, min_value=0.0, max_value=1.0),
+        duration_padding_sec=_coerce_positive_float(
+            payload.get("duration_padding_sec"),
+            6.0,
+            min_value=0.0,
+            max_value=30.0,
+        ),
+        cut_to_seconds_total=_coerce_to_bool(payload.get("cut_to_seconds_total", True)),
+        init_audio_path=init_audio_path,
+        init_noise_level=_coerce_positive_float(payload.get("init_noise_level"), 0.9, min_value=0.01, max_value=1.0),
+        inpaint_audio_path=inpaint_audio_path,
+        mask_start_sec=_coerce_positive_float(payload.get("mask_start_sec"), 0.0, min_value=0.0),
+        mask_end_sec=_coerce_positive_float(payload.get("mask_end_sec"), 0.0, min_value=0.0),
+        output_dir=str((ROOT_OUTPUT_DIR / "stable_audio").resolve()),
+    )
+    return options, output_format, temp_paths
+
+
+@app.get("/api/stable-audio/status")
+async def api_stable_audio_status():
+    """API: Stable Audio 3 dependency, checkpoint, and loaded-model status."""
+    return JSONResponse(content={"status": "success", **stable_audio3_manager.status()})
+
+
+@app.get("/api/stable-audio/models")
+async def api_stable_audio_models():
+    """API: List Stable Audio 3 variants and checkpoint readiness."""
+    return JSONResponse(
+        content={
+            "status": "success",
+            "default_variant": STABLE_AUDIO3_DEFAULT_VARIANT,
+            "samplers": list(STABLE_AUDIO3_SAMPLERS),
+            "models": stable_audio3_manager.list_models(),
+        }
+    )
+
+
+@app.post("/api/stable-audio/unload")
+async def api_stable_audio_unload(request: Request):
+    """API: Unload Stable Audio 3 models from GPU memory."""
+    payload: Dict[str, Any] = {}
+    if _request_has_json_body(request):
+        try:
+            raw_payload = await request.json()
+            if isinstance(raw_payload, dict):
+                payload = raw_payload
+        except Exception:
+            payload = {}
+    removed = await _run_blocking(stable_audio3_manager.unload, payload.get("variant_key"))
+    return JSONResponse(content={"status": "success", "unloaded": removed})
+
+
+@app.post("/api/stable-audio/generate")
+async def api_stable_audio_generate(request: Request):
+    """API: Generate music or sound effects with Stable Audio 3."""
+    temp_paths: List[str] = []
+    try:
+        options, response_format, temp_paths = await _parse_stable_audio_generate_request(request)
+        print(
+            f"[stable-audio] Generating {options.variant_key} "
+            f"{options.duration}s/{options.steps} steps: {options.prompt[:80]!r}"
+        )
+        result = await _run_blocking(stable_audio3_manager.generate, options)
+        filename_stem = f"stable_audio_{result.variant_key}_{int(time.time())}"
+        return await _generated_audio_attachment_response(
+            result.output_path,
+            response_format,
+            filename_stem=filename_stem,
+        )
+    except Exception as exc:
+        print(f"Stable Audio 3 generation failed: {exc}")
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(exc)},
+        )
+    finally:
+        for temp_path in temp_paths:
+            await async_remove_file(temp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -11926,12 +12116,14 @@ async def api_translate_split_audio(
                         use_cached_chunks = True
                         cached_manifests = cached_split_data.get("chunk_sessions") or []
                         # Use cached base name for artifact discovery if available
-                        cached_base_name = cached_split_data.get("base_output_name")
+                        cached_base_name = _sanitize_base_filename(cached_split_data.get("base_output_name"))
                         if cached_base_name:
                             resolved_base_name = cached_base_name
                             print(f"♻️ Using cached base name for artifact discovery: {resolved_base_name}")
                         elif cached_manifests and cached_manifests[0].get("source_base_name"):
-                            resolved_base_name = cached_manifests[0]["source_base_name"]
+                            manifest_base_name = _sanitize_base_filename(cached_manifests[0].get("source_base_name"))
+                            if manifest_base_name:
+                                resolved_base_name = manifest_base_name
                             print(f"♻️ Using manifest base name for artifact discovery: {resolved_base_name}")
                         if cached_manifests:
                             manifest_lang = (cached_manifests[0].get("dest_language") or "").strip().lower()
@@ -16123,6 +16315,9 @@ async def server_info():
                 "parakeet_available": is_parakeet_available(),
                 "translation_llm_default": DEFAULT_TRANSLATION_LLM_MODEL,
                 "translation_llm_models": list(ALLOWED_TRANSLATION_LLM_MODELS),
+                "stable_audio_available": stable_audio3_manager.status().get("available", False),
+                "stable_audio_default": STABLE_AUDIO3_DEFAULT_VARIANT,
+                "stable_audio_checkpoints": STABLE_AUDIO3_CHECKPOINT_DIR,
             }
         })
         
