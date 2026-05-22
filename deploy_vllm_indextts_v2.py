@@ -79,13 +79,14 @@ image = (
         # The PyPI stable-audio-tools wheel is too old for Stable Audio 3
         # configs and also pins older torch builds. Use current source and
         # keep dependencies explicit so CUDA 13 torch stays installed.
-        "pip install -U --force-reinstall --no-deps --ignore-requires-python "
+        "pip install --force-reinstall --no-deps --ignore-requires-python "
         "git+https://github.com/Stability-AI/stable-audio-tools.git",
-        "pip install v-diffusion alias-free-torch dill einops-exts huggingface_hub "
+        "pip install alias-free-torch dill einops-exts huggingface_hub "
         "importlib-resources nnAudio PyWavelets safetensors scipy soxr "
         "torchsde tqdm transformers v-diffusion-pytorch "
         "vector-quantize-pytorch",
     )
+    .pip_install("alias_free_torch")
     .pip_install(
         "pydub",
         "flashinfer-python"
