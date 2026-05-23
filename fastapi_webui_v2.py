@@ -11140,16 +11140,8 @@ async def api_stable_audio_generate(request: Request):
             replace(options, seed=(base_seed + idx if base_seed > 0 else 0))
             for idx in range(batch_count)
         ]
-        tasks = [
-            asyncio.create_task(_run_blocking(stable_audio3_manager.generate, item_options))
-            for item_options in generation_options
-        ]
-        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-        failures = [item for item in raw_results if isinstance(item, Exception)]
-        results = [item for item in raw_results if not isinstance(item, Exception)]
+        results = await _run_blocking(stable_audio3_manager.generate_many, generation_options)
         generated_paths = [result.output_path for result in results]
-        if failures:
-            raise failures[0]
 
         if batch_count == 1:
             filename_stem = f"stable_audio_{results[0].variant_key}_{int(time.time())}"

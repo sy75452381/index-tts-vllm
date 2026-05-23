@@ -258,8 +258,36 @@ class StableAudio3Manager:
         if not prompt:
             raise ValueError("Prompt is required.")
 
-        loaded = self.load_variant(options.variant_key)
-        return self._generate_locked(loaded, options)
+        with self._generation_lock:
+            loaded = self.load_variant(options.variant_key)
+            return self._generate_locked(loaded, options)
+
+    def generate_many(
+        self,
+        options_list: List[StableAudio3GenerateOptions],
+    ) -> List[StableAudio3GenerationResult]:
+        """Generate multiple clips in one locked backend job.
+
+        Stable Audio / PyTorch CUDA inference is not safe to call concurrently
+        against the same loaded model from multiple Python threads. Keep the
+        request batched at the API layer while serializing model access here.
+        """
+        if not options_list:
+            return []
+        with self._generation_lock:
+            loaded_by_key: Dict[str, StableAudio3LoadedVariant] = {}
+            results: List[StableAudio3GenerationResult] = []
+            for options in options_list:
+                prompt = (options.prompt or "").strip()
+                if not prompt:
+                    raise ValueError("Prompt is required.")
+                variant_key = self.normalize_variant_key(options.variant_key)
+                loaded = loaded_by_key.get(variant_key)
+                if loaded is None:
+                    loaded = self.load_variant(variant_key)
+                    loaded_by_key[variant_key] = loaded
+                results.append(self._generate_locked(loaded, options))
+            return results
 
     def _generate_locked(
         self,
