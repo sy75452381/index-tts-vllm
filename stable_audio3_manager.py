@@ -258,9 +258,8 @@ class StableAudio3Manager:
         if not prompt:
             raise ValueError("Prompt is required.")
 
-        with self._generation_lock:
-            loaded = self.load_variant(options.variant_key)
-            return self._generate_locked(loaded, options)
+        loaded = self.load_variant(options.variant_key)
+        return self._generate_locked(loaded, options)
 
     def _generate_locked(
         self,

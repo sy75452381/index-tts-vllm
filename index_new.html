@@ -1887,6 +1887,10 @@
                                     </select>
                                 </div>
                             </div>
+                            <div class="form-group">
+                                <label for="stableAudioBatchCount">Generate: <span id="stableAudioBatchCountValue">1</span></label>
+                                <input type="range" id="stableAudioBatchCount" min="1" max="4" step="1" value="1" class="range-full">
+                            </div>
 
                             <div class="form-group">
                                 <label for="stableAudioPrompt">Prompt:</label>
@@ -2776,6 +2780,7 @@
                                             <div class="api-param-group">
                                                 <div class="api-param-group-title">Optional</div>
                                                 <div class="api-param"><span class="api-param-name">variant_key</span> <span class="api-param-type">string</span> <span class="api-param-desc">- medium, small-music, or small-sfx</span></div>
+                                                <div class="api-param"><span class="api-param-name">batch_count</span> <span class="api-param-type">int</span> <span class="api-param-desc">- Generate 1-4 clips in parallel. Count 1 returns an audio attachment; counts 2-4 return JSON with base64 audio items.</span></div>
                                                 <div class="api-param"><span class="api-param-name">duration</span>, <span class="api-param-name">steps</span>, <span class="api-param-name">cfg_scale</span>, <span class="api-param-name">sampler_type</span>, <span class="api-param-name">seed</span> <span class="api-param-desc">- Sampling controls</span></div>
                                                 <div class="api-param"><span class="api-param-name">init_audio_file</span>, <span class="api-param-name">inpaint_audio_file</span> <span class="api-param-type">file</span> <span class="api-param-desc">- Optional audio-to-audio and inpainting inputs</span></div>
                                             </div>
@@ -2783,7 +2788,11 @@
                                         <div class="api-response">
                                             <div class="api-response-title">Response</div>
                                             <div class="api-code">Content-Type: audio/mpeg
-Content-Disposition: attachment; filename=stable_audio_medium.mp3</div>
+Content-Disposition: attachment; filename=stable_audio_medium.mp3
+
+For batch_count 2-4:
+Content-Type: application/json
+{ "status": "success", "items": [{ "filename": "...", "media_type": "audio/mpeg", "audio_base64": "..." }] }</div>
                                         </div>
                                     </div>
                                 </div>
@@ -3528,6 +3537,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     ['emotionWeight', 'emotionWeightValue'],
                     ['diffusionSteps', 'diffusionStepsValue'],
                     ['maxTextTokens', 'maxTextTokensValue'],
+                    ['stableAudioBatchCount', 'stableAudioBatchCountValue'],
                     ['stableAudioDuration', 'stableAudioDurationValue'],
                     ['stableAudioSteps', 'stableAudioStepsValue'],
                     ['stableAudioCfg', 'stableAudioCfgValue'],
@@ -3846,10 +3856,12 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
 
                 const startTime = performance.now();
                 const outputFormat = document.getElementById('stableAudioOutputFormat').value || 'mp3';
+                const batchCount = Math.min(4, Math.max(1, Number(document.getElementById('stableAudioBatchCount').value || 1)));
                 const formData = new FormData();
                 formData.append('variant_key', document.getElementById('stableAudioModel').value || 'medium');
                 formData.append('prompt', prompt);
                 formData.append('negative_prompt', document.getElementById('stableAudioNegativePrompt').value || '');
+                formData.append('batch_count', String(batchCount));
                 formData.append('duration', document.getElementById('stableAudioDuration').value || '60');
                 formData.append('steps', document.getElementById('stableAudioSteps').value || '8');
                 formData.append('cfg_scale', document.getElementById('stableAudioCfg').value || '1.0');
@@ -3873,8 +3885,14 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     formData.append('inpaint_audio_file', inpaintFile);
                 }
 
-                showStatus('Generating Stable Audio 3 output...', 'info', 'stableAudioStatus');
-                document.getElementById('stableAudioResult').innerHTML = '';
+                const generateButton = document.querySelector('[data-action="stable-audio-generate"]');
+                if (generateButton) {
+                    generateButton.disabled = true;
+                    generateButton.textContent = batchCount > 1 ? `Generating ${batchCount} audios...` : 'Generating audio...';
+                }
+                showStatus(batchCount > 1 ? `Generating ${batchCount} Stable Audio 3 outputs in parallel...` : 'Generating Stable Audio 3 output...', 'info', 'stableAudioStatus');
+                const resultEl = document.getElementById('stableAudioResult');
+                resultEl.innerHTML = '';
                 try {
                     const response = await fetch(ENDPOINTS.STABLE_AUDIO_GENERATE, {
                         method: 'POST',
@@ -3883,21 +3901,55 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     if (!response.ok) {
                         throw new Error(await parseHttpError(response, 'Stable Audio generation failed'));
                     }
-                    const blob = await response.blob();
-                    const audioUrl = URL.createObjectURL(blob);
                     const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
                     const extension = outputFormat === 'mp3' ? 'mp3' : outputFormat;
-                    document.getElementById('stableAudioResult').innerHTML = `
-                        <h3>Generated Audio (${elapsed}s)</h3>
-                        <audio controls autoplay preload="none" style="width: 100%; margin: 10px 0;" src="${audioUrl}"></audio>
-                        <br>
-                        <a href="${audioUrl}" download="stable-audio-3.${extension}" class="btn">Download</a>
-                    `;
-                    showStatus(`Stable Audio generated in ${elapsed}s.`, 'success', 'stableAudioStatus');
+                    const contentType = response.headers.get('content-type') || '';
+                    if (contentType.includes('application/json')) {
+                        const data = await response.json();
+                        const items = Array.isArray(data.items) ? data.items : [];
+                        if (!items.length) {
+                            throw new Error('Stable Audio generation returned no audio.');
+                        }
+                        resultEl.innerHTML = `
+                            <h3>Generated Audio (${items.length} clips, ${elapsed}s)</h3>
+                            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:10px;">
+                                ${items.map((item, index) => {
+                                    const metadata = item.metadata || {};
+                                    const seedLabel = metadata.seed && metadata.seed > 0 ? `Seed ${metadata.seed}` : 'Random seed';
+                                    const audioUrl = `data:${item.media_type || `audio/${extension}`};base64,${item.audio_base64 || ''}`;
+                                    const filename = item.filename || `stable-audio-3-${index + 1}.${extension}`;
+                                    return `
+                                        <div class="segment-card" style="padding:14px;">
+                                            <div class="segment-header" style="margin-bottom:8px;">Clip ${index + 1}</div>
+                                            <small style="color:var(--text-muted);">${escapeHtml(seedLabel)}${metadata.elapsed_seconds ? ` - ${Number(metadata.elapsed_seconds).toFixed(2)}s backend` : ''}</small>
+                                            <audio controls preload="none" style="width:100%;margin:10px 0;" src="${audioUrl}"></audio>
+                                            <a href="${audioUrl}" download="${escapeHtml(filename)}" class="btn btn-secondary" style="padding:8px 12px;font-size:0.82rem;">Download</a>
+                                        </div>
+                                    `;
+                                }).join('')}
+                            </div>
+                        `;
+                        showStatus(`Generated ${items.length} Stable Audio clips in ${elapsed}s.`, 'success', 'stableAudioStatus');
+                    } else {
+                        const blob = await response.blob();
+                        const audioUrl = URL.createObjectURL(blob);
+                        resultEl.innerHTML = `
+                            <h3>Generated Audio (${elapsed}s)</h3>
+                            <audio controls autoplay preload="none" style="width: 100%; margin: 10px 0;" src="${audioUrl}"></audio>
+                            <br>
+                            <a href="${audioUrl}" download="stable-audio-3.${extension}" class="btn">Download</a>
+                        `;
+                        showStatus(`Stable Audio generated in ${elapsed}s.`, 'success', 'stableAudioStatus');
+                    }
                     stableAudioModelsLoaded = false;
                     loadStableAudioModels(true, { preserveControls: true });
                 } catch (error) {
                     showStatus(`Stable Audio error: ${error.message}`, 'error', 'stableAudioStatus');
+                } finally {
+                    if (generateButton) {
+                        generateButton.disabled = false;
+                        generateButton.textContent = 'Generate Audio';
+                    }
                 }
             }
 

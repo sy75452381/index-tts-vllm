@@ -60,7 +60,7 @@ import zipfile
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 # yt_dlp is imported lazily via _ensure_yt_dlp() to prevent its compat_utils
 # module patching from interfering with torch.compile / torch._inductor code
@@ -10999,7 +10999,7 @@ async def _save_stable_audio_upload(upload: Any, prefix: str) -> Optional[str]:
 
 async def _parse_stable_audio_generate_request(
     request: Request,
-) -> Tuple[StableAudio3GenerateOptions, str, List[str]]:
+) -> Tuple[StableAudio3GenerateOptions, str, List[str], int]:
     content_type = (request.headers.get("content-type") or "").lower()
     temp_paths: List[str] = []
     payload: Dict[str, Any] = {}
@@ -11036,6 +11036,12 @@ async def _parse_stable_audio_generate_request(
     )
     default_duration = int((variant_info or {}).get("default_duration") or 60)
     output_format = _normalize_stable_audio_output_format(payload.get("response_format") or payload.get("output_format"))
+    batch_count = _coerce_positive_int(
+        payload.get("batch_count") or payload.get("num_outputs") or payload.get("count"),
+        1,
+        min_value=1,
+        max_value=4,
+    )
 
     options = StableAudio3GenerateOptions(
         variant_key=variant_key,
@@ -11062,7 +11068,26 @@ async def _parse_stable_audio_generate_request(
         mask_end_sec=_coerce_positive_float(payload.get("mask_end_sec"), 0.0, min_value=0.0),
         output_dir=str((ROOT_OUTPUT_DIR / "stable_audio").resolve()),
     )
-    return options, output_format, temp_paths
+    return options, output_format, temp_paths, batch_count
+
+
+async def _stable_audio_generation_to_payload(
+    result_path: str,
+    response_format: str,
+    filename_stem: str,
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    try:
+        audio_bytes = await _read_generated_audio_bytes(result_path, response_format)
+    finally:
+        await async_remove_file(result_path)
+    encoded_audio = base64.b64encode(audio_bytes).decode("ascii")
+    return {
+        "filename": f"{filename_stem}.{response_format}",
+        "media_type": _audio_media_type(response_format),
+        "audio_base64": encoded_audio,
+        "metadata": metadata,
+    }
 
 
 @app.get("/api/stable-audio/status")
@@ -11103,18 +11128,66 @@ async def api_stable_audio_unload(request: Request):
 async def api_stable_audio_generate(request: Request):
     """API: Generate music or sound effects with Stable Audio 3."""
     temp_paths: List[str] = []
+    generated_paths: List[str] = []
     try:
-        options, response_format, temp_paths = await _parse_stable_audio_generate_request(request)
+        options, response_format, temp_paths, batch_count = await _parse_stable_audio_generate_request(request)
         print(
-            f"[stable-audio] Generating {options.variant_key} "
+            f"[stable-audio] Generating {batch_count}x {options.variant_key} "
             f"{options.duration}s/{options.steps} steps: {options.prompt[:80]!r}"
         )
-        result = await _run_blocking(stable_audio3_manager.generate, options)
-        filename_stem = f"stable_audio_{result.variant_key}_{int(time.time())}"
-        return await _generated_audio_attachment_response(
-            result.output_path,
-            response_format,
-            filename_stem=filename_stem,
+        base_seed = int(options.seed or 0)
+        generation_options = [
+            replace(options, seed=(base_seed + idx if base_seed > 0 else 0))
+            for idx in range(batch_count)
+        ]
+        tasks = [
+            asyncio.create_task(_run_blocking(stable_audio3_manager.generate, item_options))
+            for item_options in generation_options
+        ]
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+        failures = [item for item in raw_results if isinstance(item, Exception)]
+        results = [item for item in raw_results if not isinstance(item, Exception)]
+        generated_paths = [result.output_path for result in results]
+        if failures:
+            raise failures[0]
+
+        if batch_count == 1:
+            filename_stem = f"stable_audio_{results[0].variant_key}_{int(time.time())}"
+            generated_paths = []
+            return await _generated_audio_attachment_response(
+                results[0].output_path,
+                response_format,
+                filename_stem=filename_stem,
+            )
+
+        generated_at = int(time.time())
+        payload_items = []
+        for idx, result in enumerate(results, start=1):
+            filename_stem = f"stable_audio_{result.variant_key}_{generated_at}_{idx}"
+            payload_items.append(
+                await _stable_audio_generation_to_payload(
+                    result.output_path,
+                    response_format,
+                    filename_stem,
+                    {
+                        "index": idx,
+                        "variant_key": result.variant_key,
+                        "duration_seconds": result.duration_seconds,
+                        "elapsed_seconds": result.elapsed_seconds,
+                        "seed": result.seed,
+                        "source": result.source,
+                    },
+                )
+            )
+            generated_paths = [path for path in generated_paths if path != result.output_path]
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "count": len(payload_items),
+                "response_format": response_format,
+                "items": payload_items,
+            }
         )
     except Exception as exc:
         print(f"Stable Audio 3 generation failed: {exc}")
@@ -11126,6 +11199,9 @@ async def api_stable_audio_generate(request: Request):
     finally:
         for temp_path in temp_paths:
             await async_remove_file(temp_path)
+        for generated_path in generated_paths:
+            if generated_path and os.path.exists(generated_path):
+                await async_remove_file(generated_path)
 
 
 # ---------------------------------------------------------------------------
