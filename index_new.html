@@ -427,6 +427,10 @@
                 gap: 14px;
                 margin-bottom: 14px;
             }
+            .video-download-fields {
+                grid-template-columns: minmax(280px, 1fr) minmax(220px, 320px);
+                align-items: end;
+            }
             .form-row-3 {
                 display: grid;
                 grid-template-columns: repeat(3, 1fr);
@@ -446,6 +450,9 @@
             }
             @media (max-width: 600px) {
                 .form-row-2, .form-row-3, .form-row-4 {
+                    grid-template-columns: 1fr;
+                }
+                .video-download-fields {
                     grid-template-columns: 1fr;
                 }
             }
@@ -701,6 +708,7 @@
             textarea,
             input[type="file"],
             input[type="text"],
+            input[type="url"],
             input[type="password"],
             input[type="number"],
             select {
@@ -1997,7 +2005,7 @@
                             Download a source video with yt-dlp, then use it directly in Translate/Edit.
                         </p>
                         <form id="videoDownloadForm">
-                            <div class="form-row-2">
+                            <div class="form-row-2 video-download-fields">
                                 <div class="form-group">
                                     <label for="videoDownloadUrl">Video URL:</label>
                                     <input type="url" id="videoDownloadUrl" placeholder="https://..." required>
