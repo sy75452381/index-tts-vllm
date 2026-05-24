@@ -4,6 +4,7 @@ matplotlib==3.8.2
 omegaconf
 sentencepiece
 librosa
+pedalboard
 gradio
 ninja
 modelscope

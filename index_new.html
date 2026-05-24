@@ -471,6 +471,49 @@
                 font-weight: 400;
                 white-space: nowrap;
             }
+            .speaker-effects-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+                gap: 8px;
+                max-height: 172px;
+                overflow: auto;
+                padding: 8px;
+                border: 1px solid var(--border);
+                border-radius: 10px;
+                background: rgba(15, 23, 42, 0.35);
+            }
+            .speaker-effect-option {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                min-width: 0;
+                padding: 8px 10px;
+                border: 1px solid rgba(148, 163, 184, 0.16);
+                border-radius: 8px;
+                background: rgba(30, 41, 59, 0.55);
+                color: var(--text-secondary);
+                cursor: pointer;
+                margin: 0;
+            }
+            .speaker-effect-option:hover {
+                border-color: var(--border-bright);
+                color: var(--text-primary);
+            }
+            .speaker-effect-option input {
+                width: auto;
+                flex: 0 0 auto;
+            }
+            .speaker-effect-name {
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .speaker-effects-empty {
+                color: var(--text-muted);
+                font-size: 0.85rem;
+                padding: 6px 2px;
+            }
             /* Compact form section */
             .form-section-compact {
                 padding: 18px;
@@ -1801,6 +1844,13 @@
                                     </select>
                                 </div>
                             </div>
+
+                            <div class="form-group">
+                                <label>Speaker Effects (optional):</label>
+                                <div id="speakerEffectsList" class="speaker-effects-grid">
+                                    <div class="speaker-effects-empty">Loading effects...</div>
+                                </div>
+                            </div>
                             
                             <div class="checkbox-group" style="margin-bottom: 14px;">
                                 <label style="cursor: pointer;">
@@ -2740,6 +2790,11 @@
                                 </div>
                                 <div class="api-quick-ref-item">
                                     <span class="method get">GET</span>
+                                    <span class="path">/speaker_effects</span>
+                                    <span class="desc">Effect list</span>
+                                </div>
+                                <div class="api-quick-ref-item">
+                                    <span class="method get">GET</span>
                                     <span class="path">/server_info</span>
                                     <span class="desc">Server status</span>
                                 </div>
@@ -2822,7 +2877,7 @@ Content-Type: application/json
                                         <span class="api-path">/speak</span>
                                     </div>
                                     <div class="api-endpoint-body">
-                                        <p class="api-desc">Generate speech using a registered speaker preset. Supports emotion control and text splitting.</p>
+                                        <p class="api-desc">Generate speech using a registered speaker preset. Supports emotion control, text splitting, and optional stacked speaker effects.</p>
                                         <div class="api-params">
                                             <div class="api-param-group">
                                                 <div class="api-param-group-title">Required Parameters</div>
@@ -2835,6 +2890,7 @@ Content-Type: application/json
                                                 <div class="api-param"><span class="api-param-name">emotion_weight</span> <span class="api-param-type">float</span> <span class="api-param-desc">— Emotion intensity 0.0-1.0 (default: 0.6)</span></div>
                                                 <div class="api-param"><span class="api-param-name">diffusion_steps</span> <span class="api-param-type">int</span> <span class="api-param-desc">— Quality steps (default: 10)</span></div>
                                                 <div class="api-param"><span class="api-param-name">max_text_tokens_per_sentence</span> <span class="api-param-type">int</span> <span class="api-param-desc">— Text splitting threshold 80-200 (default: 120)</span></div>
+                                                <div class="api-param"><span class="api-param-name">speaker_effects</span> <span class="api-param-type">string[]</span> <span class="api-param-desc">— Optional ordered effects, e.g. ["phone_call", "reverb_small_room"]</span></div>
                                             </div>
                                         </div>
                                         <div class="api-response">
@@ -2861,7 +2917,7 @@ Binary MP3 audio data</div>
                                             </div>
                                             <div class="api-param-group">
                                                 <div class="api-param-group-title">Optional Parameters</div>
-                                                <div class="api-param"><span class="api-param-name">emotion_text</span>, <span class="api-param-name">emotion_weight</span>, <span class="api-param-name">diffusion_steps</span>, <span class="api-param-name">max_text_tokens_per_sentence</span> <span class="api-param-desc">— Same as /speak</span></div>
+                                                <div class="api-param"><span class="api-param-name">emotion_text</span>, <span class="api-param-name">emotion_weight</span>, <span class="api-param-name">diffusion_steps</span>, <span class="api-param-name">max_text_tokens_per_sentence</span>, <span class="api-param-name">speaker_effects</span> <span class="api-param-desc">— Same as /speak</span></div>
                                             </div>
                                         </div>
                                     </div>
@@ -2885,7 +2941,7 @@ Binary MP3 audio data</div>
                                             <div class="api-response-title">Streaming Response Format</div>
                                             <div class="api-code">CHUNK:{idx}:{size}:{status}\n{audio_bytes}
 
-Status: CONTINUE (more chunks) or LAST (final chunk)</div>
+Status: MORE (more chunks) or LAST (final chunk)</div>
                                         </div>
                                     </div>
                                 </div>
@@ -2898,6 +2954,17 @@ Status: CONTINUE (more chunks) or LAST (final chunk)</div>
                                     </div>
                                     <div class="api-endpoint-body">
                                         <p class="api-desc">Clone voice with streaming output. Same parameters as /clone_voice, same streaming format as /speak_stream.</p>
+                                    </div>
+                                </div>
+
+                                <!-- /speaker_effects -->
+                                <div class="api-endpoint">
+                                    <div class="api-endpoint-header">
+                                        <span class="api-method get">GET</span>
+                                        <span class="api-path">/speaker_effects</span>
+                                    </div>
+                                    <div class="api-endpoint-body">
+                                        <p class="api-desc">List optional speaker effect IDs, names, descriptions, and availability for the Speak tab and API clients.</p>
                                     </div>
                                 </div>
                             </div>
@@ -3416,7 +3483,8 @@ response = requests.post("http://localhost:8080/speak", json={
     "text": "Hello, how are you today?",
     "name": "speaker1",
     "emotion_text": "cheerful and friendly",
-    "emotion_weight": 0.7
+    "emotion_weight": 0.7,
+    "speaker_effects": ["phone_call", "reverb_small_room"]
 })
 
 with open("output.mp3", "wb") as f:
@@ -3490,6 +3558,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 AUDIO_ROLES: '/audio_roles',
                 ADD_SPEAKER: '/add_speaker',
                 DELETE_SPEAKER: '/delete_speaker',
+                SPEAKER_EFFECTS: '/speaker_effects',
                 SPEAK: '/speak',
                 CLONE_VOICE: '/clone_voice',
                 TRANSLATE_AUDIO: '/api/translate_audio',
@@ -4451,6 +4520,64 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 }
             }
 
+            function renderSpeakerEffects(effects) {
+                const container = document.getElementById('speakerEffectsList');
+                if (!container) {
+                    return;
+                }
+                if (!Array.isArray(effects) || !effects.length) {
+                    container.innerHTML = '<div class="speaker-effects-empty">No speaker effects available.</div>';
+                    return;
+                }
+                container.innerHTML = effects.map(effect => {
+                    const id = String(effect.id || '').trim();
+                    if (!id) {
+                        return '';
+                    }
+                    const name = effect.name || id.replace(/_/g, ' ');
+                    const description = effect.description || effect.use_case || '';
+                    return `
+                        <label class="speaker-effect-option" title="${escapeHtml(description)}">
+                            <input type="checkbox" name="speakerEffects" value="${escapeHtml(id)}">
+                            <span class="speaker-effect-name">${escapeHtml(name)}</span>
+                        </label>
+                    `;
+                }).join('');
+            }
+
+            async function loadSpeakerEffects() {
+                const container = document.getElementById('speakerEffectsList');
+                if (!container) {
+                    return;
+                }
+                try {
+                    const response = await fetch(ENDPOINTS.SPEAKER_EFFECTS);
+                    const data = await response.json();
+                    if (data.available && Array.isArray(data.effects)) {
+                        renderSpeakerEffects(data.effects);
+                    } else {
+                        const message = data.error ? `Speaker effects unavailable: ${data.error}` : 'Speaker effects unavailable.';
+                        container.innerHTML = `<div class="speaker-effects-empty">${escapeHtml(message)}</div>`;
+                    }
+                } catch (error) {
+                    console.error('Failed to load speaker effects:', error);
+                    container.innerHTML = '<div class="speaker-effects-empty">Speaker effects unavailable.</div>';
+                }
+            }
+
+            function getSelectedSpeakerEffects() {
+                return Array.from(document.querySelectorAll('input[name="speakerEffects"]:checked'))
+                    .map(input => input.value)
+                    .filter(Boolean);
+            }
+
+            function formatSpeakerEffectsStatus(effectIds) {
+                if (!Array.isArray(effectIds) || !effectIds.length) {
+                    return '';
+                }
+                return ` Effects: ${effectIds.map(id => id.replace(/_/g, ' ')).join(' + ')}`;
+            }
+
             async function loadSpeakerList() {
                 try {
                     const response = await fetch(ENDPOINTS.AUDIO_ROLES);
@@ -4799,6 +4926,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     const diffusionSteps = parseInt(document.getElementById('diffusionSteps').value);
                     const maxTextTokens = parseInt(document.getElementById('maxTextTokens').value);
                     const streamingMode = document.getElementById('streamingMode').checked;
+                    const speakerEffects = getSelectedSpeakerEffects();
                     
                     if (!text.trim()) {
                         showStatus('Please enter some text to synthesize.', 'error');
@@ -4815,10 +4943,10 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         
                         if (streamingMode) {
                             // Streaming mode
-                            await handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, formData, startTime);
+                            await handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, speakerEffects, formData, startTime);
                         } else {
                             // Regular mode
-                            await handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, formData, startTime);
+                            await handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, speakerEffects, formData, startTime);
                         }
                     } catch (error) {
                         showStatus(`Network error: ${error.message}`, 'error');
@@ -10498,7 +10626,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 }
             }
 
-            async function handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, formData, startTime) {
+            async function handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, speakerEffects, formData, startTime) {
                     let response;
                     const voiceFiles = document.getElementById('voice_files').files;
                     
@@ -10512,6 +10640,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             speech_length: parseInt(document.getElementById('speechLength').value) || 0,
                             diffusion_steps: diffusionSteps,
                             max_text_tokens_per_sentence: maxTextTokens,
+                            speaker_effects: speakerEffects,
                             response_format: "mp3"
                         };
                         
@@ -10530,6 +10659,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         cloneFormData.append('speech_length', (parseInt(document.getElementById('speechLength').value) || 0).toString());
                         cloneFormData.append('diffusion_steps', diffusionSteps.toString());
                         cloneFormData.append('max_text_tokens_per_sentence', maxTextTokens.toString());
+                        cloneFormData.append('speaker_effects', JSON.stringify(speakerEffects || []));
                         cloneFormData.append('response_format', 'mp3');
                         
                         response = await fetch(ENDPOINTS.CLONE_VOICE, {
@@ -10561,6 +10691,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         if (emotionText && emotionText.trim()) {
                             statusMessage += ` 😊 Emotion: "${emotionText}" (${emotionWeight})`;
                         }
+                        statusMessage += formatSpeakerEffectsStatus(speakerEffects);
                         showStatus(statusMessage, 'success');
                     } else {
                         const error = await response.text();
@@ -10568,7 +10699,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     }
             }
 
-            async function handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, formData, startTime) {
+            async function handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, speakerEffects, formData, startTime) {
                 showStatus('⚡ Streaming: Waiting for first chunk...', 'success');
                 
                 // Get first chunk size setting
@@ -10592,6 +10723,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             speech_length: parseInt(document.getElementById('speechLength').value) || 0,
                             diffusion_steps: diffusionSteps,
                             max_text_tokens_per_sentence: maxTextTokens,
+                            speaker_effects: speakerEffects,
                             response_format: "mp3"
                         })
                     };
@@ -10606,6 +10738,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     cloneFormData.append('speech_length', (parseInt(document.getElementById('speechLength').value) || 0).toString());
                     cloneFormData.append('diffusion_steps', diffusionSteps.toString());
                     cloneFormData.append('max_text_tokens_per_sentence', maxTextTokens.toString());
+                    cloneFormData.append('speaker_effects', JSON.stringify(speakerEffects || []));
                     cloneFormData.append('response_format', 'mp3');
                     requestOptions = {
                         method: 'POST',
@@ -10818,6 +10951,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             if (emotionText && emotionText.trim()) {
                                 statusMessage += ` 😊 Emotion: "${emotionText}" (${emotionWeight})`;
                             }
+                            statusMessage += formatSpeakerEffectsStatus(speakerEffects);
                             showStatus(statusMessage, 'success');
                             return;
                         }
@@ -10855,6 +10989,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 }
                 const loadInitialData = function () {
                     loadSpeakers();
+                    loadSpeakerEffects();
                     loadDownloadedVideos();
                 };
                 if (document.readyState === 'loading') {

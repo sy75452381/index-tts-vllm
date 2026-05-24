@@ -149,6 +149,14 @@ from stable_audio3_manager import (
     StableAudio3Manager,
 )
 
+try:
+    from speaker_effects import EffectType, SoundEffectApplier
+    SPEAKER_EFFECTS_IMPORT_ERROR: Optional[str] = None
+except Exception as exc:
+    EffectType = None  # type: ignore[assignment]
+    SoundEffectApplier = None  # type: ignore[assignment]
+    SPEAKER_EFFECTS_IMPORT_ERROR = str(exc)
+
 # WhisperX local transcription pipeline (optional)
 try:
     from whisperx_pipeline import (
@@ -3731,6 +3739,166 @@ async def async_audio_read(file_path: str):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, sf.read, file_path)
 
+
+_speaker_effect_applier: Optional[Any] = None
+
+
+def _normalize_speaker_effect_names(raw_effects: Any) -> List[str]:
+    """Normalize optional speaker effect input from JSON or form payloads."""
+    if raw_effects is None:
+        return []
+    if isinstance(raw_effects, str):
+        stripped = raw_effects.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("["):
+            try:
+                parsed = json.loads(stripped)
+                return _normalize_speaker_effect_names(parsed)
+            except Exception:
+                pass
+        raw_values: List[Any] = re.split(r"[,;\n]+", stripped)
+    elif isinstance(raw_effects, (list, tuple, set)):
+        raw_values = list(raw_effects)
+    else:
+        raw_values = [raw_effects]
+
+    normalized: List[str] = []
+    seen: Set[str] = set()
+    for raw_value in raw_values:
+        effect_name = str(raw_value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if not effect_name or effect_name in seen:
+            continue
+        normalized.append(effect_name)
+        seen.add(effect_name)
+    return normalized
+
+
+def _get_speaker_effect_applier() -> Any:
+    """Return the lazily initialized speaker effect applier."""
+    global _speaker_effect_applier
+    if SoundEffectApplier is None or EffectType is None:
+        reason = SPEAKER_EFFECTS_IMPORT_ERROR or "speaker_effects could not be imported"
+        raise RuntimeError(f"Speaker effects are unavailable: {reason}")
+    if _speaker_effect_applier is None:
+        _speaker_effect_applier = SoundEffectApplier()
+    return _speaker_effect_applier
+
+
+def _coerce_speaker_effect_type(effect_name: str) -> Any:
+    if EffectType is None:
+        reason = SPEAKER_EFFECTS_IMPORT_ERROR or "speaker_effects could not be imported"
+        raise RuntimeError(f"Speaker effects are unavailable: {reason}")
+    normalized = str(effect_name or "").strip().lower().replace("-", "_").replace(" ", "_")
+    try:
+        return EffectType(normalized)
+    except ValueError:
+        valid_effects = ", ".join(effect.value for effect in EffectType)
+        raise ValueError(f"Unknown speaker effect '{effect_name}'. Valid effects: {valid_effects}")
+
+
+def _speaker_effects_metadata() -> Tuple[bool, List[Dict[str, Any]], Optional[str]]:
+    if SoundEffectApplier is None or EffectType is None:
+        return False, [], SPEAKER_EFFECTS_IMPORT_ERROR or "speaker_effects could not be imported"
+    try:
+        applier = _get_speaker_effect_applier()
+        effects: List[Dict[str, Any]] = []
+        for effect_type in applier.get_available_effects():
+            info = applier.get_preset_info(effect_type)
+            effects.append(
+                {
+                    "id": effect_type.value,
+                    "name": info.get("name") or effect_type.value.replace("_", " ").title(),
+                    "description": info.get("description") or "",
+                    "use_case": info.get("use_case") or "",
+                    "parameters": info.get("parameters") or {},
+                }
+            )
+        return True, effects, None
+    except Exception as exc:
+        return False, [], str(exc)
+
+
+def _to_soundfile_audio_shape(audio_data: Any) -> np.ndarray:
+    audio = np.asarray(audio_data)
+    if audio.ndim == 2 and audio.shape[0] <= 8 and audio.shape[0] < audio.shape[1]:
+        return audio.T
+    return audio
+
+
+def _to_float_unit_audio(audio_data: Any) -> np.ndarray:
+    audio = np.asarray(audio_data)
+    if np.issubdtype(audio.dtype, np.integer):
+        info = np.iinfo(audio.dtype)
+        return audio.astype(np.float32) / max(float(info.max), 1.0)
+
+    audio = audio.astype(np.float32)
+    audio = np.nan_to_num(audio, nan=0.0, posinf=32767.0, neginf=-32767.0)
+    max_abs = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if max_abs > 1.5:
+        audio = audio / 32767.0
+    return np.clip(audio, -0.95, 0.95)
+
+
+def _to_int16_audio(audio_data: Any) -> np.ndarray:
+    audio = np.asarray(audio_data)
+    if np.issubdtype(audio.dtype, np.integer):
+        if audio.dtype == np.int16:
+            return audio
+        info = np.iinfo(audio.dtype)
+        audio = audio.astype(np.float32) / max(float(info.max), 1.0)
+    else:
+        audio = audio.astype(np.float32)
+    audio = np.nan_to_num(audio, nan=0.0, posinf=0.95, neginf=-0.95)
+    max_abs = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if max_abs > 1.5:
+        return np.clip(audio, -32767.0, 32767.0).astype(np.int16)
+    audio = np.clip(audio, -0.95, 0.95)
+    return (audio * 32767.0).astype(np.int16)
+
+
+def _apply_speaker_effects_to_audio_sync(
+    audio_data: Any,
+    sample_rate: int,
+    effect_names: Any,
+) -> np.ndarray:
+    effect_chain = _normalize_speaker_effect_names(effect_names)
+    if not effect_chain:
+        return _to_soundfile_audio_shape(audio_data)
+
+    applier = _get_speaker_effect_applier()
+    processed = _to_float_unit_audio(audio_data)
+
+    for effect_name in effect_chain:
+        effect_type = _coerce_speaker_effect_type(effect_name)
+        processed = applier.apply_effect(processed, sample_rate, effect_type)
+
+    return _to_soundfile_audio_shape(processed)
+
+
+async def _apply_speaker_effects_to_file(result_path: str, effect_names: Any) -> None:
+    effect_chain = _normalize_speaker_effect_names(effect_names)
+    if not effect_chain:
+        return
+    audio_data, sample_rate = await async_audio_read(result_path)
+    processed = await _run_blocking(
+        _apply_speaker_effects_to_audio_sync,
+        audio_data,
+        sample_rate,
+        effect_chain,
+    )
+    await _run_blocking(sf.write, result_path, processed, sample_rate)
+
+
+def _numpy_from_wav_cpu(wav_cpu: Any) -> np.ndarray:
+    if hasattr(wav_cpu, "detach"):
+        wav_cpu = wav_cpu.detach()
+    if hasattr(wav_cpu, "cpu"):
+        wav_cpu = wav_cpu.cpu()
+    if hasattr(wav_cpu, "numpy"):
+        return wav_cpu.numpy()
+    return np.asarray(wav_cpu)
+
 async def async_cut_audio_to_duration(input_path: str, max_duration: float = 10.0):
     """Async wrapper for smart audio cutting at silence intervals"""
     loop = asyncio.get_event_loop()
@@ -5558,10 +5726,20 @@ async def _generated_audio_attachment_response(
     )
 
 
-def _encode_streaming_audio_chunk(wav_cpu: Any, response_format: str) -> bytes:
-    wav_data = wav_cpu.numpy().astype(np.int16)
+def _encode_streaming_audio_chunk(
+    wav_cpu: Any,
+    response_format: str,
+    speaker_effects: Any = None,
+) -> bytes:
+    wav_array = _numpy_from_wav_cpu(wav_cpu)
+    effect_chain = _normalize_speaker_effect_names(speaker_effects)
+    if effect_chain:
+        wav_array = _apply_speaker_effects_to_audio_sync(wav_array, 22050, effect_chain)
+    else:
+        wav_array = _to_soundfile_audio_shape(wav_array)
+    wav_data = _to_int16_audio(wav_array)
     with BytesIO() as wav_buffer:
-        sf.write(wav_buffer, wav_data.T, 22050, format="WAV")
+        sf.write(wav_buffer, wav_data, 22050, format="WAV")
         wav_bytes = wav_buffer.getvalue()
 
     if response_format == "wav":
@@ -10668,10 +10846,15 @@ class CloneRequest(BaseModel):
     speech_length: int = Field(default=0, description="Target audio duration in milliseconds. If 0, uses default duration calculation.")
     diffusion_steps: int = Field(default=10, description="Number of diffusion steps for mel-spectrogram generation (1-50). Higher values improve quality but increase latency.")
     max_text_tokens_per_sentence: int = Field(default=120, ge=80, le=200, description="Maximum tokens per sentence for text splitting (80-200). Higher values = longer sentences but may impact quality.")
+    speaker_effects: List[str] = Field(default_factory=list, description="Optional ordered list of speaker effects to apply after speech generation.")
 
     @validator("response_format", pre=True, always=True)
     def _force_mp3(cls, value: Optional[str]) -> str:
         return "mp3"
+
+    @validator("speaker_effects", pre=True, always=True)
+    def _normalize_effects(cls, value: Any) -> List[str]:
+        return _normalize_speaker_effect_names(value)
 
 class SpeakRequest(BaseModel):
     text: str = Field(..., description="The text to generate audio for.")
@@ -10692,10 +10875,15 @@ class SpeakRequest(BaseModel):
     speech_length: int = Field(default=0, description="Target audio duration in milliseconds. If 0, uses default duration calculation.")
     diffusion_steps: int = Field(default=10, description="Number of diffusion steps for mel-spectrogram generation (1-50). Higher values improve quality but increase latency.")
     max_text_tokens_per_sentence: int = Field(default=120, ge=80, le=200, description="Maximum tokens per sentence for text splitting (80-200). Higher values = longer sentences but may impact quality.")
+    speaker_effects: List[str] = Field(default_factory=list, description="Optional ordered list of speaker effects to apply after speech generation.")
 
     @validator("response_format", pre=True, always=True)
     def _force_mp3(cls, value: Optional[str]) -> str:
         return "mp3"
+
+    @validator("speaker_effects", pre=True, always=True)
+    def _normalize_effects(cls, value: Any) -> List[str]:
+        return _normalize_speaker_effect_names(value)
 
 async def warmup_model():
     """Run warmup inferences to fully preload the model"""
@@ -15965,6 +16153,20 @@ async def api_speaker_preview(speaker_name: str):
     )
 
 
+@app.get("/speaker_effects")
+async def speaker_effects():
+    """API: List optional post-generation speaker effects."""
+    available, effects, error = _speaker_effects_metadata()
+    return JSONResponse(
+        content={
+            "success": available,
+            "available": available,
+            "effects": effects,
+            "error": error,
+        }
+    )
+
+
 # ============================================================================
 # Qwen3-TTS Voice Design API Endpoints
 # ============================================================================
@@ -16264,6 +16466,7 @@ async def speak(req: SpeakRequest):
             verbose=SETTINGS.verbose
         )
         
+        await _apply_speaker_effects_to_file(result, req.speaker_effects)
         response = await _generated_audio_attachment_response(result, req.response_format)
         print(f"✅ API: Generated {len(response.body or b'')} bytes of {req.response_format.upper()} audio")
         return response
@@ -16295,6 +16498,7 @@ def parse_clone_form(
     emotion_weight: float = Form(0.6),
     diffusion_steps: int = Form(10),
     max_text_tokens_per_sentence: int = Form(120),
+    speaker_effects: Optional[str] = Form(None),
 ):
     return CloneRequest(
         text=text, reference_audio=reference_audio, reference_text=reference_text,
@@ -16303,7 +16507,8 @@ def parse_clone_form(
         length_threshold=length_threshold, window_size=window_size,
         stream=stream, response_format=response_format,
         emotion_text=emotion_text, emotion_weight=emotion_weight,
-        diffusion_steps=diffusion_steps, max_text_tokens_per_sentence=max_text_tokens_per_sentence
+        diffusion_steps=diffusion_steps, max_text_tokens_per_sentence=max_text_tokens_per_sentence,
+        speaker_effects=_normalize_speaker_effect_names(speaker_effects)
     )
 
 @app.post("/clone_voice")
@@ -16345,6 +16550,7 @@ async def clone_voice(
                 verbose=SETTINGS.verbose
             )
             
+            await _apply_speaker_effects_to_file(result, req.speaker_effects)
             response = await _generated_audio_attachment_response(result, req.response_format)
             print(f"✅ API: Cloned voice - {len(response.body or b'')} bytes of {req.response_format.upper()}")
             return response
@@ -16378,6 +16584,7 @@ async def server_info():
                 "chinese_support": True,
                 "speaker_presets": True,
                 "speaker_manager": "SpeakerPresetManager",
+                "speaker_effects_available": SoundEffectApplier is not None and EffectType is not None,
                 "whisperx_available": is_whisperx_available(),
                 "qwen_omnivad_available": is_qwen_omnivad_available(),
                 "parakeet_available": is_parakeet_available(),
@@ -16426,7 +16633,7 @@ async def speak_stream(req: SpeakRequest):
                 ):
                     chunk_count += 1
                     print(f"🎵 Streaming chunk {chunk_idx} (is_last={is_last})")
-                    audio_bytes = _encode_streaming_audio_chunk(wav_cpu, req.response_format)
+                    audio_bytes = _encode_streaming_audio_chunk(wav_cpu, req.response_format, req.speaker_effects)
                     yield _streaming_audio_frame(chunk_idx, audio_bytes, is_last)
                 
                 print(f"✅ Streaming complete: {chunk_count} chunks sent")
@@ -16492,7 +16699,7 @@ async def clone_voice_stream(
                 ):
                     chunk_count += 1
                     print(f"🎵 Streaming chunk {chunk_idx} (is_last={is_last})")
-                    audio_bytes = _encode_streaming_audio_chunk(wav_cpu, req.response_format)
+                    audio_bytes = _encode_streaming_audio_chunk(wav_cpu, req.response_format, req.speaker_effects)
                     yield _streaming_audio_frame(chunk_idx, audio_bytes, is_last)
                 
                 print(f"✅ Streaming complete: {chunk_count} chunks sent")
