@@ -106,6 +106,7 @@ image = (
         "n 22",
         "node --version",
     )
+    .pip_install("pedalboard")
 )
 
 app = modal.App("vllm-indextts-v2", image=image)
@@ -360,7 +361,7 @@ print("Model download completed!")
 
 @app.function(
     image=image,
-    timeout=600,
+    timeout=180,
     volumes={
         PERSISTENT_APP_DIR: app_storage,
         PERSISTENT_CACHE_DIR: cache_storage

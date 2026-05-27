@@ -8727,6 +8727,45 @@ def _list_downloaded_video_entries() -> List[Dict[str, Any]]:
     return entries
 
 
+def _translated_video_entry(path: str) -> Dict[str, Any]:
+    safe_name = os.path.basename(path)
+    stat = os.stat(path)
+    duration_seconds = _ffprobe_duration_seconds(path)
+    encoded_name = quote(safe_name, safe="")
+    return {
+        "id": safe_name,
+        "filename": safe_name,
+        "title": os.path.splitext(safe_name)[0],
+        "extension": os.path.splitext(safe_name)[1].lstrip(".").lower(),
+        "size_bytes": int(stat.st_size),
+        "size_mb": _format_size_mb(stat.st_size),
+        "mtime": stat.st_mtime,
+        "mtime_label": time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime)),
+        "duration_seconds": duration_seconds,
+        "duration_label": _format_video_duration(duration_seconds),
+        "url": f"/api/translate_outputs/{encoded_name}",
+        "poster_url": f"/api/translate_outputs/{encoded_name}/snapshot",
+    }
+
+
+def _list_translated_video_entries() -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    if not os.path.exists(TRANSLATE_OUTPUT_DIR):
+        return entries
+    for entry in os.scandir(TRANSLATE_OUTPUT_DIR):
+        if not entry.is_file():
+            continue
+        ext = os.path.splitext(entry.name)[1].lstrip(".").lower()
+        if ext not in VIDEO_DOWNLOAD_EXTENSIONS:
+            continue
+        try:
+            entries.append(_translated_video_entry(entry.path))
+        except Exception as exc:
+            print(f"⚠️ Failed to inspect translated video '{entry.name}': {exc}")
+    entries.sort(key=lambda item: item.get("mtime") or 0, reverse=True)
+    return entries
+
+
 def _find_recent_downloaded_video(start_time: float, info: Optional[Dict[str, Any]] = None) -> Optional[str]:
     candidates: List[str] = []
     video_id = str((info or {}).get("id") or "").strip()
@@ -10339,6 +10378,46 @@ class SpeakerAPIWrapper:
             
         except Exception as e:
             return {"status": "error", "message": f"Failed to delete speaker: {str(e)}"}
+
+    async def delete_all_speakers(self) -> Dict[str, Any]:
+        """Delete every speaker preset currently registered."""
+        try:
+            loop = asyncio.get_event_loop()
+            presets = await loop.run_in_executor(executor, self.preset_manager.list_presets)
+            speaker_names = list(presets.keys())
+            deleted: List[str] = []
+            errors: List[Dict[str, str]] = []
+
+            for speaker_name in speaker_names:
+                result = await self.delete_speaker(speaker_name)
+                if result.get("status") == "success":
+                    deleted.append(speaker_name)
+                else:
+                    errors.append(
+                        {
+                            "name": speaker_name,
+                            "message": result.get("message", "Delete failed"),
+                        }
+                    )
+
+            if errors:
+                return {
+                    "status": "partial" if deleted else "error",
+                    "message": f"Removed {len(deleted)} of {len(speaker_names)} speakers.",
+                    "deleted": deleted,
+                    "deleted_count": len(deleted),
+                    "errors": errors,
+                }
+
+            return {
+                "status": "success",
+                "message": f"Removed {len(deleted)} speakers.",
+                "deleted": deleted,
+                "deleted_count": len(deleted),
+                "errors": [],
+            }
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to delete speakers: {str(e)}"}
     
     async def list_speakers(self) -> Dict[str, Any]:
         """List all speakers with metadata"""
@@ -11631,6 +11710,18 @@ async def api_downloaded_videos():
             "status": "ok",
             "videos": _list_downloaded_video_entries(),
             "download_dir": VIDEO_DOWNLOAD_DIR,
+        }
+    )
+
+
+@app.get("/api/translated_videos")
+async def api_translated_videos():
+    """API: List rendered video outputs created by the translate workflow."""
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "videos": _list_translated_video_entries(),
+            "output_dir": TRANSLATE_OUTPUT_DIR,
         }
     )
 
@@ -16107,6 +16198,36 @@ async def delete_speaker(
         error_msg = f"Failed to delete speaker '{name}': {str(e)}"
         print(f"❌ API: {error_msg}")
         return _success_error(error_msg)
+
+
+@app.post("/delete_all_speakers")
+async def delete_all_speakers():
+    """API: Delete all speakers."""
+    try:
+        print("🗑️ API: Deleting all speakers")
+
+        if not speaker_api:
+            return _success_error("Speaker manager not initialized")
+
+        result = await speaker_api.delete_all_speakers()
+        if result["status"] in {"success", "partial"}:
+            return JSONResponse(
+                content={
+                    "success": True,
+                    "partial": result["status"] == "partial",
+                    "message": result.get("message", "Speakers removed."),
+                    "deleted": result.get("deleted", []),
+                    "deleted_count": result.get("deleted_count", 0),
+                    "errors": result.get("errors", []),
+                }
+            )
+        return _success_error(result.get("message", "Failed to delete speakers"))
+
+    except Exception as e:
+        error_msg = f"Failed to delete speakers: {str(e)}"
+        print(f"❌ API: {error_msg}")
+        return _success_error(error_msg)
+
 
 @app.get("/audio_roles")
 async def audio_roles():

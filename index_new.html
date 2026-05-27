@@ -1743,7 +1743,7 @@
                     <div class="hero-card" data-tab="translate" role="button" tabindex="0">
                         <div class="hero-card-header">
                             <span class="icon">🌐</span>
-                            <strong>Speech Translate</strong>
+                            <strong>Edit &amp; Translate</strong>
                         </div>
                         <div class="hero-card-features">
                             <span class="hero-card-feature highlight">🧠 Gemini / Local ASR</span>
@@ -1761,7 +1761,7 @@
                             <span class="hero-card-feature highlight">yt-dlp</span>
                             <span class="hero-card-feature">Cookie Support</span>
                             <span class="hero-card-feature">Use in Translate</span>
-                            <span class="hero-card-feature">Download Library</span>
+                            <span class="hero-card-feature">Translated Library</span>
                         </div>
                     </div>
                     <div class="hero-card" data-tab="speakers" role="button" tabindex="0">
@@ -2136,12 +2136,19 @@
                         <h3>Downloaded Videos</h3>
                         <div id="downloadedVideoList" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px;"></div>
                     </div>
+                    <div class="form-section">
+                        <div style="display: flex; justify-content: space-between; gap: 12px; align-items: center; flex-wrap: wrap;">
+                            <h3 style="margin-bottom: 0;">Translated Videos</h3>
+                            <button type="button" class="btn btn-secondary" id="translatedVideosRefreshBtn" style="padding: 6px 12px; font-size: 0.82rem;">Refresh</button>
+                        </div>
+                        <div id="translatedVideoList" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-top: 14px;"></div>
+                    </div>
                 </div>
 
-                <!-- Speech Translation Tab -->
+                <!-- Edit & Translate Tab -->
                 <div id="translate" class="tab-content">
                     <div class="form-section">
-                        <h3>🌐 Speech Translate/Edit</h3>
+                        <h3>🌐 Edit &amp; Translate</h3>
                         <p style="color: var(--text-muted); margin-bottom: 20px;">
                             Upload source speech audio, pick a destination language, and optionally enter advanced mode to audition Gemini segments, tweak timings/text, and regenerate only the pieces you need.
                         </p>
@@ -2675,7 +2682,10 @@
 
                     <div class="form-section">
                         <h3>🎭 Manage Speakers</h3>
-                        <button type="button" class="btn" data-action="refresh-speakers">🔄 Refresh Speaker List</button>
+                        <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+                            <button type="button" class="btn" data-action="refresh-speakers">🔄 Refresh Speaker List</button>
+                            <button type="button" class="btn btn-danger" data-action="delete-all-speakers">🗑️ Remove All Speakers</button>
+                        </div>
                         <div id="speakerList" class="speaker-list"></div>
                     </div>
                 </div>
@@ -3558,6 +3568,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 AUDIO_ROLES: '/audio_roles',
                 ADD_SPEAKER: '/add_speaker',
                 DELETE_SPEAKER: '/delete_speaker',
+                DELETE_ALL_SPEAKERS: '/delete_all_speakers',
                 SPEAKER_EFFECTS: '/speaker_effects',
                 SPEAK: '/speak',
                 CLONE_VOICE: '/clone_voice',
@@ -3569,6 +3580,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 TRANSLATE_SPLIT_AUDIO: '/api/translate_split_audio',
                 TRANSLATE_SEGMENT_PREVIEW: '/api/translate_segment_preview',
                 DOWNLOADED_VIDEOS: '/api/downloaded_videos',
+                TRANSLATED_VIDEOS: '/api/translated_videos',
                 VIDEO_INFO: '/api/video_info',
                 VIDEO_DOWNLOAD: '/api/video_download',
                 VIDEO_REPLACE_AUDIO: '/api/video_replace_audio',
@@ -3675,6 +3687,10 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         loadSpeakerList();
                         return;
                     }
+                    if (action === 'delete-all-speakers') {
+                        deleteAllSpeakers();
+                        return;
+                    }
                     if (action === 'voice-design-generate') {
                         generateVoiceDesign();
                         return;
@@ -3749,6 +3765,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 }
                 if (tabName === 'video-download') {
                     loadDownloadedVideos();
+                    loadTranslatedVideos();
                     loadCookieSites();
                 }
                 if (tabName === 'stable-audio') {
@@ -4133,6 +4150,60 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     const list = document.getElementById('downloadedVideoList');
                     if (list) {
                         list.innerHTML = '<div class="segment-empty">Failed to load downloaded videos.</div>';
+                    }
+                }
+            }
+
+            function renderTranslatedVideoList() {
+                const list = document.getElementById('translatedVideoList');
+                if (!list) {
+                    return;
+                }
+                if (!translatedVideos.length) {
+                    list.innerHTML = '<div class="segment-empty">No translated videos yet.</div>';
+                    return;
+                }
+                list.innerHTML = translatedVideos.map(video => {
+                    const id = video.id || video.filename || '';
+                    const title = escapeHtml(video.title || video.filename || 'Translated video');
+                    const size = typeof video.size_mb === 'number' ? `${video.size_mb} MB` : '';
+                    const duration = video.duration_label ? ` • ${escapeHtml(video.duration_label)}` : '';
+                    const url = video.url || `/api/translate_outputs/${encodeURIComponent(video.filename || id)}`;
+                    const posterUrl = video.poster_url || `${url}/snapshot`;
+                    const extension = escapeHtml(video.extension || 'video').toUpperCase();
+                    const createdLabel = video.mtime_label ? ` • ${escapeHtml(video.mtime_label)}` : '';
+                    return `
+                        <div class="segment-card" data-translated-video-id="${escapeHtml(id)}" style="padding: 14px;">
+                            <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+                                <div style="min-width:0;">
+                                    <div class="segment-header" title="${title}">${title}</div>
+                                    <small style="color:var(--text-muted);">${extension}${size ? ` • ${size}` : ''}${duration}${createdLabel}</small>
+                                </div>
+                            </div>
+                            ${lazyVideoMarkup(url, posterUrl, '220px')}
+                            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
+                                <a class="btn btn-secondary" href="${escapeHtml(url)}" download="${escapeHtml(video.filename || id)}" style="padding:6px 12px;font-size:0.82rem;">Download</a>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+                bindLazyVideos(list);
+            }
+
+            async function loadTranslatedVideos() {
+                const list = document.getElementById('translatedVideoList');
+                try {
+                    const response = await fetch(ENDPOINTS.TRANSLATED_VIDEOS, { cache: 'no-cache' });
+                    const data = await response.json();
+                    if (!response.ok || data.status === 'error') {
+                        throw new Error(data.message || 'Failed to load translated videos');
+                    }
+                    translatedVideos = Array.isArray(data.videos) ? data.videos : [];
+                    renderTranslatedVideoList();
+                } catch (error) {
+                    console.warn('Failed to load translated videos', error);
+                    if (list) {
+                        list.innerHTML = '<div class="segment-empty">Failed to load translated videos.</div>';
                     }
                 }
             }
@@ -4651,6 +4722,32 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     }
                 } catch (error) {
                     showStatus(`Error deleting speaker: ${error.message}`, 'error', 'speakerStatus');
+                }
+            }
+
+            async function deleteAllSpeakers() {
+                const currentCount = availableSpeakerPresets.length || Object.keys(speakerPresetMeta || {}).length;
+                const countLabel = currentCount ? ` ${currentCount}` : '';
+                if (!confirm(`Remove all${countLabel} speakers from the speaker library? This cannot be undone.`)) {
+                    return;
+                }
+
+                try {
+                    const response = await fetch(ENDPOINTS.DELETE_ALL_SPEAKERS, {
+                        method: 'POST',
+                    });
+                    const result = await response.json();
+                    if (!response.ok || result.success === false) {
+                        throw new Error(result.error || result.message || 'Failed to remove speakers');
+                    }
+                    const deletedCount = typeof result.deleted_count === 'number' ? result.deleted_count : 0;
+                    const message = result.message || `Removed ${deletedCount} speakers.`;
+                    const statusType = result.partial ? 'error' : 'success';
+                    showStatus(message, statusType, 'speakerStatus');
+                    await loadSpeakerList();
+                    await loadSpeakers();
+                } catch (error) {
+                    showStatus(`Error removing speakers: ${error.message}`, 'error', 'speakerStatus');
                 }
             }
 
@@ -5334,6 +5431,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             let currentTranslateSessionId = null;
             let currentTranslateSegments = [];
             let downloadedVideos = [];
+            let translatedVideos = [];
             let selectedDownloadedVideoId = '';
             let activeSyncedAudio = null;
             let translateSpeakerProfiles = [];
@@ -5747,7 +5845,14 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             }
             const refreshDownloadedVideosBtn = document.getElementById('refreshDownloadedVideosBtn');
             if (refreshDownloadedVideosBtn) {
-                refreshDownloadedVideosBtn.addEventListener('click', () => loadDownloadedVideos());
+                refreshDownloadedVideosBtn.addEventListener('click', () => {
+                    loadDownloadedVideos();
+                    loadTranslatedVideos();
+                });
+            }
+            const translatedVideosRefreshBtn = document.getElementById('translatedVideosRefreshBtn');
+            if (translatedVideosRefreshBtn) {
+                translatedVideosRefreshBtn.addEventListener('click', loadTranslatedVideos);
             }
             const cookieImportBtn = document.getElementById('cookieImportBtn');
             if (cookieImportBtn) {
@@ -7423,6 +7528,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         throw new Error(data.message || data.error || `Video render failed (${response.status})`);
                     }
                     renderTranslatedVideoPreview(container, data);
+                    loadTranslatedVideos();
                     showStatus(data.message || 'Video created.', 'success', 'translateStatus');
                 } catch (error) {
                     showStatus(`Video render failed: ${error.message}`, 'error', 'translateStatus');
