@@ -813,9 +813,9 @@ def _configure_persistent_runtime():
     image=image,
     gpu="RTX-PRO-6000",  # 96GB Blackwell; use "L40S" if you want Ada/L40S instead.
     cpu=4.0,
-    memory=32768,
+    memory=8124,
     timeout=3600,
-    scaledown_window=600,
+    scaledown_window=300,
     volumes={
         PERSISTENT_APP_DIR: app_storage,
         PERSISTENT_CACHE_DIR: cache_storage,

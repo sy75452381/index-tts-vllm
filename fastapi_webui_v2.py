@@ -8550,6 +8550,42 @@ def _candidate_cookie_dirs() -> List[str]:
     return result
 
 
+def _normalize_cookie_domain(domain: str) -> str:
+    normalized = (domain or "").strip().lower()
+    if normalized.startswith("www."):
+        normalized = normalized[4:]
+    normalized = normalized.strip(".")
+    if not normalized:
+        raise ValueError("Domain is required.")
+    if not re.fullmatch(r"[a-z0-9.-]+", normalized):
+        raise ValueError("Invalid domain.")
+    return normalized
+
+
+def _cookie_filename_for_domain(domain: str) -> str:
+    normalized = _normalize_cookie_domain(domain)
+    return normalized.replace(".", "_") + "_cookies.txt"
+
+
+def _cookie_path_for_domain(domain: str, cookies_dir: str = COOKIES_DIR) -> str:
+    filename = _cookie_filename_for_domain(domain)
+    root = os.path.abspath(cookies_dir)
+    path = os.path.abspath(os.path.join(root, filename))
+    if os.path.commonpath([root, path]) != root:
+        raise ValueError("Invalid cookie path.")
+    return path
+
+
+def _find_saved_cookie_file_for_domain(domain: str) -> Tuple[str, str]:
+    filename = _cookie_filename_for_domain(domain)
+    for cookies_dir in _candidate_cookie_dirs():
+        root = os.path.abspath(cookies_dir)
+        path = os.path.abspath(os.path.join(root, filename))
+        if os.path.commonpath([root, path]) == root and os.path.exists(path):
+            return path, _normalize_cookie_domain(domain)
+    raise FileNotFoundError("No cookies found for this domain.")
+
+
 def _get_cookie_file_for_url(url: str) -> Optional[str]:
     """Get the appropriate cookie file for a given video URL."""
     domain = _extract_domain_from_url(url)
@@ -8618,6 +8654,20 @@ def _downloaded_video_path(video_id_or_filename: str) -> str:
     root = os.path.abspath(VIDEO_DOWNLOAD_DIR)
     if os.path.commonpath([root, path]) != root:
         raise ValueError("Invalid video path.")
+    return path
+
+
+def _translated_video_path(filename: str) -> str:
+    safe_name = os.path.basename(filename or "")
+    if not safe_name or safe_name != filename:
+        raise ValueError("Invalid translated video filename.")
+    ext = os.path.splitext(safe_name)[1].lstrip(".").lower()
+    if ext not in VIDEO_DOWNLOAD_EXTENSIONS:
+        raise ValueError("Only translated video outputs can be deleted.")
+    path = os.path.abspath(os.path.join(TRANSLATE_OUTPUT_DIR, safe_name))
+    root = os.path.abspath(TRANSLATE_OUTPUT_DIR)
+    if os.path.commonpath([root, path]) != root:
+        raise ValueError("Invalid translated video path.")
     return path
 
 
@@ -11478,9 +11528,32 @@ async def api_cookies_list():
     sites = _get_saved_cookie_sites()
     return JSONResponse(content={
         "status": "ok",
-        "sites": {domain: {"count": count} for domain, count in sites.items()},
+        "sites": {
+            domain: {
+                "count": count,
+                "download_url": f"/api/cookies/{quote(domain, safe='')}/download",
+            }
+            for domain, count in sites.items()
+        },
         "cookie_dirs": _candidate_cookie_dirs(),
     })
+
+
+@app.get("/api/cookies/{domain}/download")
+async def api_cookies_download(domain: str):
+    """API: Download a saved cookies.txt backup for a specific domain."""
+    try:
+        filepath, normalized_domain = _find_saved_cookie_file_for_domain(domain)
+    except ValueError as exc:
+        return _status_error(str(exc), status_code=400)
+    except FileNotFoundError:
+        return _status_error(f"No cookies found for {domain}.", status_code=404)
+    return FileResponse(
+        filepath,
+        media_type="text/plain",
+        filename=_cookie_filename_for_domain(normalized_domain),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/video_ytdlp_diagnostics")
@@ -11603,6 +11676,10 @@ async def api_cookies_import_curl(payload: CookieImportCurlRequest):
         domain = _extract_domain_from_curl(curl_text)
     if domain == "unknown":
         return _status_error("Could not detect domain. Please provide it explicitly.")
+    try:
+        domain = _normalize_cookie_domain(domain)
+    except ValueError as exc:
+        return _status_error(str(exc), status_code=400)
 
     cookies = _parse_curl_cookies(curl_text)
     if not cookies:
@@ -11618,8 +11695,7 @@ async def api_cookies_import_curl(payload: CookieImportCurlRequest):
         for name, value in cookies.items():
             cookie_lines.append(f".{domain}\tTRUE\t/\tTRUE\t0\t{name}\t{value}")
 
-        filename = domain.replace(".", "_") + "_cookies.txt"
-        filepath = os.path.join(COOKIES_DIR, filename)
+        filepath = _cookie_path_for_domain(domain)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write("\n".join(cookie_lines))
 
@@ -11641,11 +11717,10 @@ async def api_cookies_upload(
     domain: str = Form(...),
 ):
     """API: Upload a cookies.txt file directly and save for the specified domain."""
-    domain = (domain or "").strip().lower()
-    if not domain:
-        return _status_error("Domain is required.")
-    if domain.startswith("www."):
-        domain = domain[4:]
+    try:
+        domain = _normalize_cookie_domain(domain)
+    except ValueError as exc:
+        return _status_error(str(exc), status_code=400)
 
     try:
         content_bytes = await file.read()
@@ -11657,8 +11732,7 @@ async def api_cookies_upload(
         return _status_error("Uploaded file is empty.")
 
     try:
-        filename = domain.replace(".", "_") + "_cookies.txt"
-        filepath = os.path.join(COOKIES_DIR, filename)
+        filepath = _cookie_path_for_domain(domain)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
 
@@ -11679,11 +11753,11 @@ async def api_cookies_upload(
 @app.delete("/api/cookies/{domain}")
 async def api_cookies_delete(domain: str):
     """API: Delete saved cookies for a specific domain."""
-    domain = (domain or "").strip().lower()
-    if not domain:
-        return _status_error("Domain is required.")
-    filename = domain.replace(".", "_") + "_cookies.txt"
-    filepath = os.path.join(COOKIES_DIR, filename)
+    try:
+        domain = _normalize_cookie_domain(domain)
+        filepath = _cookie_path_for_domain(domain)
+    except ValueError as exc:
+        return _status_error(str(exc), status_code=400)
     if not os.path.exists(filepath):
         return _status_error(f"No cookies found for {domain}.", status_code=404)
     try:
@@ -11724,6 +11798,36 @@ async def api_translated_videos():
             "output_dir": TRANSLATE_OUTPUT_DIR,
         }
     )
+
+
+@app.delete("/api/translated_videos/{filename}")
+async def api_delete_translated_video(filename: str):
+    """API: Delete a rendered translated video output."""
+    try:
+        file_path = _translated_video_path(filename)
+    except ValueError as exc:
+        return _status_error(str(exc), status_code=400)
+    if not os.path.exists(file_path):
+        return _status_error("Translated video not found.", status_code=404)
+    try:
+        safe_name = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        snapshot_cache_path: Optional[str] = None
+        try:
+            snapshot_cache_path = _video_snapshot_cache_path(file_path)
+        except Exception:
+            snapshot_cache_path = None
+        os.remove(file_path)
+        _safe_remove_file(snapshot_cache_path)
+        return JSONResponse(content={
+            "status": "ok",
+            "message": f"Deleted {safe_name}.",
+            "filename": safe_name,
+            "freed_mb": round(file_size / (1024 * 1024), 2),
+        })
+    except Exception as exc:
+        traceback.print_exc()
+        return _status_error(f"Failed to delete translated video: {str(exc)}", status_code=500)
 
 
 @app.delete("/api/downloaded_videos/{filename}")

@@ -4172,8 +4172,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     const posterUrl = video.poster_url || `${url}/snapshot`;
                     const extension = escapeHtml(video.extension || 'video').toUpperCase();
                     const createdLabel = video.mtime_label ? ` • ${escapeHtml(video.mtime_label)}` : '';
+                    const encodedId = encodeURIComponent(id);
                     return `
-                        <div class="segment-card" data-translated-video-id="${escapeHtml(id)}" style="padding: 14px;">
+                        <div class="segment-card" data-translated-video-id="${encodedId}" style="padding: 14px;">
                             <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
                                 <div style="min-width:0;">
                                     <div class="segment-header" title="${title}">${title}</div>
@@ -4183,11 +4184,24 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             ${lazyVideoMarkup(url, posterUrl, '220px')}
                             <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
                                 <a class="btn btn-secondary" href="${escapeHtml(url)}" download="${escapeHtml(video.filename || id)}" style="padding:6px 12px;font-size:0.82rem;">Download</a>
+                                <button type="button" class="btn btn-danger translated-video-delete" data-video-id="${encodedId}" style="padding:6px 12px;font-size:0.82rem;">🗑️ Delete</button>
                             </div>
                         </div>
                     `;
                 }).join('');
                 bindLazyVideos(list);
+                list.querySelectorAll('.translated-video-delete').forEach(button => {
+                    button.addEventListener('click', () => {
+                        let videoId = button.dataset.videoId || '';
+                        try {
+                            videoId = decodeURIComponent(videoId);
+                        } catch (error) {
+                            console.warn('Failed to decode translated video id', error);
+                        }
+                        const video = translatedVideos.find(item => (item.id || item.filename || '') === videoId);
+                        deleteTranslatedVideo(videoId, video ? (video.title || video.filename || '') : '');
+                    });
+                });
             }
 
             async function loadTranslatedVideos() {
@@ -4421,13 +4435,17 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         container.innerHTML = '<span style="color: var(--text-muted); font-size: 0.85rem;">No cookies saved yet.</span>';
                         return;
                     }
-                    container.innerHTML = Object.entries(data.sites).map(([domain, info]) => `
-                        <div style="display: flex; align-items: center; gap: 8px; padding: 4px 0;">
-                            <span style="color: #51cf66; font-size: 0.88rem;">✓ ${escapeHtml(domain)}</span>
-                            <span style="color: var(--text-muted); font-size: 0.8rem;">(${info.count} cookies)</span>
-                            <button type="button" class="btn btn-danger cookie-delete-btn" data-domain="${escapeHtml(domain)}" style="padding: 2px 8px; font-size: 0.75rem; margin-left: auto;">✕</button>
-                        </div>
-                    `).join('');
+                    container.innerHTML = Object.entries(data.sites).map(([domain, info]) => {
+                        const downloadUrl = info.download_url || `${ENDPOINTS.COOKIES_LIST}/${encodeURIComponent(domain)}/download`;
+                        return `
+                            <div style="display: flex; align-items: center; gap: 8px; padding: 4px 0;">
+                                <span style="color: #51cf66; font-size: 0.88rem;">✓ ${escapeHtml(domain)}</span>
+                                <span style="color: var(--text-muted); font-size: 0.8rem;">(${info.count} cookies)</span>
+                                <a class="btn btn-secondary" href="${escapeHtml(downloadUrl)}" download style="padding: 2px 8px; font-size: 0.75rem; margin-left: auto;">Backup</a>
+                                <button type="button" class="btn btn-danger cookie-delete-btn" data-domain="${escapeHtml(domain)}" style="padding: 2px 8px; font-size: 0.75rem;">✕</button>
+                            </div>
+                        `;
+                    }).join('');
                     container.querySelectorAll('.cookie-delete-btn').forEach(btn => {
                         btn.addEventListener('click', () => deleteCookieSite(btn.dataset.domain));
                     });
@@ -4554,6 +4572,25 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     }
                     showStatus(data.message || 'Video deleted.', 'success', 'videoDownloadStatus');
                     await loadDownloadedVideos();
+                } catch (error) {
+                    showStatus(`Delete failed: ${error.message}`, 'error', 'videoDownloadStatus');
+                }
+            }
+
+            async function deleteTranslatedVideo(videoId, videoTitle) {
+                if (!videoId) return;
+                const displayName = videoTitle || videoId;
+                if (!confirm(`Delete translated video "${displayName}"? This cannot be undone.`)) return;
+                try {
+                    const response = await fetch(`${ENDPOINTS.TRANSLATED_VIDEOS}/${encodeURIComponent(videoId)}`, {
+                        method: 'DELETE',
+                    });
+                    const data = await response.json();
+                    if (!response.ok || data.status === 'error') {
+                        throw new Error(data.message || 'Delete failed');
+                    }
+                    showStatus(data.message || 'Translated video deleted.', 'success', 'videoDownloadStatus');
+                    await loadTranslatedVideos();
                 } catch (error) {
                     showStatus(`Delete failed: ${error.message}`, 'error', 'videoDownloadStatus');
                 }
